@@ -1,0 +1,120 @@
+/* SOT: design-tokens, black-theme, heroui-theme-override, typography, density, syntax-colours */
+@import "tailwindcss";
+@import "@heroui/styles";
+
+/*
+ WHAT:  HeroUI v3 theme, forced to a pure-black palette (the app is dark-only).
+        Components use HeroUI semantic utilities (bg-background, bg-surface,
+        text-foreground, text-muted, border-border, bg-accent…) plus the few
+        app-specific tokens declared in @theme below.
+ WHY:   One token system: HeroUI components and hand-built views (grid, editor)
+        read the same variables, so nothing drifts.
+ HOW:   HeroUI defines its variables in `layer(theme)`; the overrides below sit
+        in `layer(base)`, which wins by layer order.
+ WHERE: scripts/guardrail.py bans raw palette classes (bg-zinc-900, #hex) in JSX.
+*/
+@theme static {
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --color-env-local: oklch(0.72 0.19 150);
+  --color-env-staging: oklch(0.78 0.16 72);
+  --color-env-production: oklch(0.64 0.22 26);
+  --color-selection: oklch(0.62 0.19 255 / 0.35);
+  --color-series-1: #3987e5;
+  --color-series-2: #d95926;
+  --color-series-3: #199e70;
+  --color-series-4: #c98500;
+  --color-series-5: #d55181;
+  --color-series-6: #008300;
+  --color-series-7: #9085e9;
+  --color-grid-line: oklch(0.22 0 0);
+  --color-syntax-keyword: oklch(0.82 0.11 300);
+  --color-syntax-string: oklch(0.85 0.14 150);
+  --color-syntax-number: oklch(0.83 0.13 60);
+  --color-syntax-comment: oklch(0.55 0 0);
+  --color-syntax-operator: oklch(0.8 0.1 240);
+  --color-syntax-type: oklch(0.85 0.1 200);
+}
+
+@layer base {
+  :root,
+  [data-theme="dark"] {
+    color-scheme: dark;
+    --radius: 0.5rem;
+    --field-radius: calc(var(--radius) * 1);
+    --background: oklch(0.11 0 0);
+    --foreground: oklch(0.93 0 0);
+    --surface: oklch(0.145 0 0);
+    --surface-foreground: var(--foreground);
+    --surface-secondary: oklch(0.175 0 0);
+    --surface-secondary-foreground: var(--foreground);
+    --surface-tertiary: oklch(0.21 0 0);
+    --surface-tertiary-foreground: var(--foreground);
+    --overlay: oklch(0.165 0 0);
+    --overlay-foreground: var(--foreground);
+    --muted: oklch(0.64 0 0);
+    --default: oklch(0.22 0 0);
+    --default-foreground: var(--foreground);
+    --accent: oklch(0.6 0.2 258);
+    --accent-foreground: oklch(0.99 0 0);
+    --field-background: oklch(0.13 0 0);
+    --field-foreground: var(--foreground);
+    --field-placeholder: oklch(0.5 0 0);
+    --field-border: oklch(0.27 0 0);
+    --field-border-width: 1px;
+    --segment: oklch(0.26 0 0);
+    --segment-foreground: var(--foreground);
+    --border: oklch(0.24 0 0);
+    --separator: oklch(0.21 0 0);
+    --success: oklch(0.72 0.19 150);
+    --success-foreground: oklch(0.15 0 0);
+    --warning: oklch(0.8 0.15 75);
+    --warning-foreground: oklch(0.15 0 0);
+    --danger: oklch(0.63 0.21 25);
+    --danger-foreground: oklch(0.99 0 0);
+    --focus: var(--accent);
+    --link: var(--accent);
+    --backdrop: rgba(0, 0, 0, 0.7);
+    --surface-shadow: 0 0 0 0 transparent inset;
+    --overlay-shadow: 0 0 0 1px oklch(0.25 0 0), 0 12px 32px rgba(0, 0, 0, 0.6);
+    --field-shadow: 0 0 0 0 transparent inset;
+    --tooltip-delay: 400ms;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+  body {
+    background: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    user-select: none;
+  }
+  input,
+  textarea,
+  .cm-editor,
+  .selectable {
+    user-select: text;
+  }
+}
+
+@utility grid-bg {
+  background-color: var(--background);
+  background-image:
+    linear-gradient(var(--color-grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--color-grid-line) 1px, transparent 1px);
+  background-size: 40px 40px;
+  background-position: -1px -1px;
+}
+
+@utility drag-region {
+  -webkit-app-region: drag;
+}
