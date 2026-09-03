@@ -33,7 +33,7 @@ pub async fn table_page(ctx: &SessionCtx, table: &TableRef, query: &PageQuery) -
         (Some(ctx.integration.count(table, &query.filters).await?), true)
     } else if query.offset == 0 {
         match ctx.integration.row_estimate(table).await.unwrap_or(None) {
-            Some(n) => (Some(n), ctx.integration.engine() == crate::model::Engine::Sqlite),
+            Some(n) => (Some(n), ctx.integration.capabilities().exact_estimate),
             None => (None, false),
         }
     } else {

@@ -2,7 +2,7 @@
 
 use crate::error::{AppError, AppResult};
 use crate::guard::SessionCtx;
-use crate::model::{AiProvider, AiReply, AiSettings, Engine, PlanReport, StatementResult, Value};
+use crate::model::{AiProvider, AiReply, AiSettings, Engine, Family, PlanReport, StatementResult, Value};
 use std::time::Duration;
 
 // WHAT:  Bring-your-own-key assistant: schema-aware NL→SQL and plan explanations.
@@ -18,74 +18,166 @@ pub struct AiRequest<'a> {
 }
 
 fn engine_label(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Postgres => "PostgreSQL",
-        Engine::Mysql => "MySQL",
-        Engine::Mariadb => "MariaDB",
-        Engine::Mssql => "SQL Server",
-        Engine::Sqlite => "SQLite",
-        Engine::Clickhouse => "ClickHouse",
-        Engine::Redis => "Redis",
-        Engine::Mongodb => "MongoDB",
-        Engine::Libsql => "LibSQL / Turso",
-        Engine::ValTown => "Val Town",
-        Engine::CloudflareD1 => "Cloudflare D1",
-        Engine::Supabase => "Supabase",
-        Engine::Planetscale => "PlanetScale",
-        Engine::Neon => "Neon",
-    }
+    engine.label()
 }
 
+// WHAT:  Dialect rules the assistant follows, keyed by adapter family so every
+//        wire-compatible engine (Supabase, Neon, TimescaleDB…) inherits them.
 fn engine_guidelines(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Postgres | Engine::Supabase | Engine::Neon => {
+    match engine.family() {
+        Family::Postgres => {
             "PostgreSQL Dialect Rules:\n\
              - Use standard PostgreSQL SQL syntax (double-quoted identifiers for mixed-case/reserved names, single quotes for strings).\n\
              - Standard schema is usually 'public'; qualify table names if non-default schema.\n\
              - Use ILIKE for case-insensitive text matching, ::type for casting, and NOW() for current timestamps.\n\
              - Supports CTEs (WITH), window functions, JSONB operators (->, ->>), and RETURNING clauses."
         }
-        Engine::Mysql | Engine::Planetscale => {
+        Family::Mysql => {
             "MySQL Dialect Rules:\n\
-             - Use standard MySQL SQL syntax with backticks (`table`, `column`) for identifiers when necessary.\n\
+             - Use standard MySQL / MariaDB SQL syntax with backticks (`table`, `column`) for identifiers when necessary.\n\
              - Use standard MySQL functions: CONCAT(), DATE_SUB(), NOW(), IFNULL(), COALESCE().\n\
-             - Use LIMIT [offset,] count or LIMIT count OFFSET offset for pagination."
-        }
-        Engine::Mariadb => {
-            "MariaDB Dialect Rules:\n\
-             - Use standard MariaDB SQL syntax with backticks (`table`, `column`) for identifiers when necessary.\n\
-             - Use standard MariaDB/MySQL functions: CONCAT(), NOW(), IFNULL(), COALESCE().\n\
              - Use LIMIT count OFFSET offset for pagination."
         }
-        Engine::Mssql => {
+        Family::Mssql => {
             "SQL Server (T-SQL) Dialect Rules:\n\
              - Use standard T-SQL syntax with square brackets ([schema].[table], [column]) for identifiers when necessary.\n\
              - Use TOP (n) or OFFSET x ROWS FETCH NEXT y ROWS ONLY for pagination (requires ORDER BY).\n\
              - Use T-SQL functions: GETDATE(), ISNULL(), COALESCE(), LEN(), SUBSTRING(), CHARINDEX().\n\
              - Standard schema is usually 'dbo'."
         }
-        Engine::Sqlite | Engine::Libsql | Engine::ValTown | Engine::CloudflareD1 => {
+        Family::Oracle => {
+            "Oracle Dialect Rules:\n\
+             - Use Oracle SQL: double-quoted identifiers are case-sensitive, unquoted are upper-cased.\n\
+             - Use FETCH FIRST n ROWS ONLY / OFFSET n ROWS for pagination, SYSDATE / SYSTIMESTAMP for now, NVL() for null defaults.\n\
+             - Do not terminate statements with a semicolon."
+        }
+        Family::Sqlite | Family::Libsql | Family::ValTown | Family::CloudflareD1 => {
             "SQLite Dialect Rules:\n\
              - Use standard SQLite SQL syntax. SQLite uses dynamic typing.\n\
              - Use SQLite date/time functions: datetime('now'), strftime(), coalesce(), instr().\n\
              - Avoid FULL OUTER JOIN or RIGHT JOIN (unsupported in older versions); use LEFT JOIN or UNION ALL if needed.\n\
              - Use LIMIT count OFFSET offset for pagination."
         }
-        Engine::Clickhouse => {
+        Family::Duckdb => {
+            "DuckDB Dialect Rules:\n\
+             - Use DuckDB SQL (Postgres-like). Supports QUALIFY, EXCLUDE/REPLACE in SELECT *, list/struct types, read_csv()/read_parquet().\n\
+             - Use LIMIT count OFFSET offset for pagination; ILIKE is available."
+        }
+        Family::Clickhouse => {
             "ClickHouse Dialect Rules:\n\
              - Use ClickHouse SQL syntax. Tables may require FINAL modifier if using ReplacingMergeTree.\n\
              - Use ClickHouse functions: formatDateTime(), toDate(), toDateTime(), and specialized array/tuple functions.\n\
              - Identifiers are case-sensitive. Use backticks or double quotes if needed."
         }
-        Engine::Redis => {
+        Family::Druid => {
+            "Apache Druid SQL Rules:\n\
+             - Use Druid SQL (Calcite). Time column is __time; use TIME_FLOOR() for bucketing and double quotes for identifiers.\n\
+             - No UPDATE/DELETE; queries are read-only analytics."
+        }
+        Family::Snowflake => {
+            "Snowflake SQL Rules:\n\
+             - Use Snowflake SQL: unquoted identifiers are upper-cased, qualify as DATABASE.SCHEMA.TABLE.\n\
+             - Use ILIKE, QUALIFY, FLATTEN() for semi-structured VARIANT data, and LIMIT count OFFSET offset."
+        }
+        Family::Bigquery => {
+            "BigQuery SQL Rules:\n\
+             - Use GoogleSQL (standard SQL). Qualify tables as `project.dataset.table` with backticks.\n\
+             - Use STRING/INT64/FLOAT64 types, UNNEST() for arrays, and LIMIT count OFFSET offset."
+        }
+        Family::Cassandra => {
+            "Cassandra CQL Rules:\n\
+             - Output CQL, not SQL. Every SELECT must restrict on the partition key or use ALLOW FILTERING (avoid on large tables).\n\
+             - No JOINs, no OFFSET, no arbitrary ORDER BY (only clustering columns). Use LIMIT n."
+        }
+        Family::Immudb => {
+            "immudb SQL Rules:\n\
+             - Use immudb SQL (a SQL subset). Supports SELECT/INSERT/UPSERT, no DELETE of history; tables are append-only and cryptographically verified."
+        }
+        Family::Qldb => {
+            "Amazon QLDB PartiQL Rules:\n\
+             - Output PartiQL. Documents are Ion; use SELECT * FROM table BY id for document ids, and history(table) for audit trails."
+        }
+        Family::Surrealdb => {
+            "SurrealQL Rules:\n\
+             - Output SurrealQL. Records are addressed as table:id; use SELECT * FROM table WHERE …, RELATE for graph edges, and FETCH for joins."
+        }
+        Family::Orientdb => {
+            "OrientDB SQL Rules:\n\
+             - Output OrientDB SQL. Classes act as tables (SELECT FROM Class WHERE …), @rid identifies records, TRAVERSE and MATCH walk graph edges."
+        }
+        Family::Influxdb => {
+            "InfluxDB Rules:\n\
+             - Output InfluxQL or SQL (v3): SELECT … FROM measurement WHERE time > now() - 1h. Tags are indexed, fields are values. Never output relational DDL."
+        }
+        Family::Prometheus => {
+            "PromQL Rules:\n\
+             - Output a PromQL expression, not SQL (e.g. rate(http_requests_total[5m]), sum by (job) (up))."
+        }
+        Family::Rocksdb => {
+            "RocksDB Command Rules:\n\
+             - RocksDB is an embedded key-value store. Output commands: GET key, PUT key value, DELETE key, SCAN prefix [limit], KEYS [prefix]. Never output SQL."
+        }
+        Family::Redis | Family::Memcached => {
             "Redis Command Rules:\n\
              - Redis is a key-value store, NOT a relational SQL database. Never output SQL statements.\n\
              - Output valid single or multi-line Redis CLI commands (e.g. GET key, SET key val, HGETALL key, LRANGE key 0 -1, SCAN 0 MATCH pattern COUNT 100, ZREVRANGEBYSCORE key +inf -inf WITHSCORES LIMIT 0 10)."
         }
-        Engine::Mongodb => {
+        Family::Mongodb => {
             "MongoDB Command Rules:\n\
              - MongoDB is a document store, NOT a SQL database. Never output SQL statements.\n\
              - Output either a MongoDB shell command (e.g. db.collection.find({...}).sort({...}).limit(10)) or a valid JSON query / aggregation pipeline document."
+        }
+        Family::Couchdb => {
+            "CouchDB Mango Rules:\n\
+             - Output a Mango selector JSON document ({\"selector\": {...}, \"limit\": 10, \"sort\": [...]}) for _find. Never output SQL."
+        }
+        Family::Firestore => {
+            "Firestore Rules:\n\
+             - Output a structured query as JSON (collection, where: [[field, op, value]], orderBy, limit). Never output SQL."
+        }
+        Family::Dynamodb => {
+            "DynamoDB PartiQL Rules:\n\
+             - Output PartiQL for DynamoDB: SELECT * FROM \"table\" WHERE pk = 'value'. Filters on non-key attributes scan the table."
+        }
+        Family::Hbase => {
+            "HBase Rules:\n\
+             - Output HBase shell-style commands (scan 'table', get 'table', 'row', put 'table', 'row', 'cf:col', 'value'). Never output SQL."
+        }
+        Family::Neo4j | Family::Tigergraph => {
+            "Cypher Rules:\n\
+             - Output Cypher (MATCH (n:Label)-[:REL]->(m) WHERE … RETURN … LIMIT 25). Never output SQL."
+        }
+        Family::Arangodb => {
+            "AQL Rules:\n\
+             - Output AQL (FOR doc IN collection FILTER … SORT … LIMIT 25 RETURN doc). Never output SQL."
+        }
+        Family::Qdrant | Family::Milvus | Family::Weaviate | Family::Pinecone | Family::Chroma => {
+            "Vector Database Rules:\n\
+             - Output a JSON request body for the engine's search / scroll API (filter, limit, with_payload, optional vector). Never output SQL."
+        }
+        Family::Elasticsearch => {
+            "Elasticsearch Query DSL Rules:\n\
+             - Output a JSON Query DSL body for _search ({\"query\": {...}, \"size\": 10, \"sort\": [...]}) or an ES|SQL statement. Never output relational DDL."
+        }
+        Family::Meilisearch | Family::Typesense => {
+            "Search Engine Rules:\n\
+             - Output a JSON search request ({\"q\": \"…\", \"filter\": \"…\", \"limit\": 20}). Never output SQL."
+        }
+        Family::Kafka => {
+            "Kafka Rules:\n\
+             - Output a consume request as JSON ({\"topic\": \"…\", \"partition\": 0, \"offset\": \"latest\", \"limit\": 100}). Never output SQL."
+        }
+        Family::Objectdb => {
+            "JPQL Rules:\n\
+             - Output JPQL (SELECT e FROM Entity e WHERE e.field = :value). Never output relational DDL."
+        }
+        Family::Sparql => {
+            "SPARQL Rules:\n\
+             - Output SPARQL 1.1 (SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 25) with PREFIX declarations. Never output SQL."
+        }
+        Family::Basex | Family::Existdb => {
+            "XQuery Rules:\n\
+             - Output XQuery 3.1 (for $x in db:open('db')//item where … return $x). Never output SQL."
         }
     }
 }
@@ -284,12 +376,16 @@ pub async fn generate(
 
 pub async fn explain(ctx: &SessionCtx, req: &AiRequest<'_>, sql: &str, max_rows: usize) -> AppResult<PlanReport> {
     let engine = ctx.connection.engine;
-    let explain_sql = match engine {
-        Engine::Postgres | Engine::Supabase | Engine::Neon => format!("EXPLAIN (FORMAT TEXT) {sql}"),
-        Engine::Sqlite | Engine::Libsql | Engine::ValTown | Engine::CloudflareD1 => format!("EXPLAIN QUERY PLAN {sql}"),
-        Engine::Mysql | Engine::Mariadb | Engine::Planetscale | Engine::Clickhouse => format!("EXPLAIN {sql}"),
-        Engine::Mssql => format!("SET SHOWPLAN_TEXT ON;\n{sql};\nSET SHOWPLAN_TEXT OFF;"),
-        Engine::Redis | Engine::Mongodb => return Err(AppError::invalid_input("Execution plans are only available for SQL engines.")),
+    let explain_sql = match engine.family() {
+        Family::Postgres | Family::Duckdb => format!("EXPLAIN (FORMAT TEXT) {sql}"),
+        Family::Sqlite | Family::Libsql | Family::ValTown | Family::CloudflareD1 => format!("EXPLAIN QUERY PLAN {sql}"),
+        Family::Mysql | Family::Clickhouse | Family::Druid | Family::Snowflake | Family::Bigquery | Family::Surrealdb | Family::Orientdb | Family::Influxdb => format!("EXPLAIN {sql}"),
+        Family::Oracle => format!("EXPLAIN PLAN FOR {sql}"),
+        Family::Mssql => format!("SET SHOWPLAN_TEXT ON;\n{sql};\nSET SHOWPLAN_TEXT OFF;"),
+        Family::Cassandra => format!("TRACING ON; {sql}"),
+        Family::Neo4j | Family::Tigergraph => format!("EXPLAIN {sql}"),
+        Family::Arangodb => format!("EXPLAIN {sql}"),
+        _ => return Err(AppError::invalid_input("Execution plans are only available for SQL and Cypher engines.")),
     };
     let results = ctx.integration.execute(&explain_sql, max_rows).await?;
     let mut plan = String::new();

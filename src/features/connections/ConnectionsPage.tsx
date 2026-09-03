@@ -7,6 +7,7 @@ import { IconButton } from "@/components/global/Button";
 import { EnvBadge, EnvDot } from "@/components/global/Badge";
 import { EmptyState } from "@/components/global/EmptyState";
 import { Icon } from "@/lib/icons";
+import { EngineIcon } from "@/components/global/EngineIcon";
 
 // WHAT:  Home: saved connections. Click a row to connect and enter the workspace.
 export function ConnectionsPage() {
@@ -61,15 +62,15 @@ export function ConnectionsPage() {
             {connections.map((c) => {
               const live = sessions.includes(c.id);
               const meta = engineMeta(c.engine);
-              const target = meta.fileBased ? (c.filePath ?? "") : `${c.host ?? ""}${c.port !== null ? `:${c.port}` : ""}${c.database ? `/${c.database}` : ""}`;
+              const target = (meta.form === "file") ? (c.filePath ?? "") : `${c.host ?? ""}${c.port !== null ? `:${c.port}` : ""}${c.database ? `/${c.database}` : ""}`;
               return (
                 <Card
                   key={c.id}
                   className="group relative flex flex-row items-center gap-3.5 rounded-xl glass-card px-4 py-3.5 glass-card-hover border-border/40"
                 >
                   <Card.Content className="flex flex-row items-center gap-3.5 w-full p-0">
-                    <span className="flex size-10 items-center justify-center rounded-xl bg-surface-tertiary/70 text-accent shadow-xs border border-border/40 shrink-0">
-                      <Icon name={meta.fileBased ? "file" : "database"} size={18} />
+                    <span className="flex size-10 items-center justify-center overflow-hidden rounded-xl bg-surface-tertiary/70 text-accent shadow-xs border border-border/40 shrink-0">
+                      <EngineIcon engine={c.engine} size={26} />
                     </span>
                     <Button
                       variant="ghost"

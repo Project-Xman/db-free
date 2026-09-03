@@ -431,7 +431,7 @@ impl Integration for MongoIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { sql: false, namespaces: true, fixed_columns: false, paging: true, row_estimate: true, views: false }
+        Capabilities { sql: false, namespaces: true, fixed_columns: false, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: false }
     }
 
     async fn ping(&self) -> AppResult<()> {

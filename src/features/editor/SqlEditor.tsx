@@ -53,22 +53,30 @@ function dialectFor(engine: Engine): SQLDialect {
     case "postgres":
     case "supabase":
     case "neon":
+    case "timescaledb":
+    case "questdb":
+    case "pgvector":
+    case "postgis":
+    case "cockroachdb":
+    case "yugabytedb":
+    case "duckdb":
+    case "ibm_ims":
+    case "raima_rdm":
       return PostgreSQL;
     case "mysql":
     case "planetscale":
+    case "tidb":
       return MySQL;
     case "mariadb":
       return MariaSQL;
     case "mssql":
       return MSSQL;
     case "sqlite":
+    case "spatialite":
     case "libsql":
     case "val_town":
     case "cloudflare_d1":
       return SQLite;
-    case "clickhouse":
-    case "redis":
-    case "mongodb":
     default:
       return StandardSQL;
   }

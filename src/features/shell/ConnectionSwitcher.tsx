@@ -43,7 +43,7 @@ export function ConnectionSwitcher({ caption }: { caption: string }) {
           <Dropdown.Section>
             {connections.map((c) => {
               const meta = engineMeta(c.engine);
-              const target = meta.fileBased ? (c.filePath ?? "") : `${c.host ?? ""}${c.port !== null ? `:${c.port}` : ""}${c.database ? `/${c.database}` : ""}`;
+              const target = (meta.form === "file") ? (c.filePath ?? "") : `${c.host ?? ""}${c.port !== null ? `:${c.port}` : ""}${c.database ? `/${c.database}` : ""}`;
               return (
                 <Dropdown.Item key={c.id} id={c.id} textValue={`${c.name} ${target}`}>
                   <EnvDot environment={c.environment} live={sessions.includes(c.id)} />

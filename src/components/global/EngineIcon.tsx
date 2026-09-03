@@ -225,7 +225,7 @@ export const EngineIcon: FC<EngineIconProps> = ({ engine, size = 28, className =
       );
 
     case "sqlite":
-    default:
+    case "spatialite":
       return (
         <svg width={size} height={size} viewBox="0 0 48 48" fill="none" className={className}>
           <rect width="48" height="48" rx="10" fill="#003B57" />
@@ -239,5 +239,145 @@ export const EngineIcon: FC<EngineIconProps> = ({ engine, size = 28, className =
           />
         </svg>
       );
+
+    case "qdrant":
+      return (
+        <svg width={size} height={size} viewBox="0 0 48 48" fill="none" className={className}>
+          <rect width="48" height="48" rx="10" fill="#24386C" />
+          <path d="M24 9l13 7.5v15L24 39l-13-7.5v-15L24 9Z" fill="#DC244C" />
+          <path d="M24 9v30l13-7.5v-15L24 9Z" fill="#B2103A" />
+          <path d="M24 17l7 4v8l-7 4-7-4v-8l7-4Z" fill="#FFFFFF" opacity={0.92} />
+        </svg>
+      );
+
+    case "elasticsearch":
+      return (
+        <svg width={size} height={size} viewBox="0 0 48 48" fill="none" className={className}>
+          <rect width="48" height="48" rx="10" fill="#1C1E23" />
+          <path d="M10 18h22a10 10 0 0 1 0 6H10a12 12 0 0 1 0-6Z" fill="#FEC514" />
+          <path d="M12 26h20a10 10 0 0 1-4 6H14a12 12 0 0 1-2-6Z" fill="#00BFB3" />
+          <path d="M14 16h14a10 10 0 0 0-4-6H16a12 12 0 0 0-2 6Z" fill="#F04E98" />
+        </svg>
+      );
+
+    case "cassandra":
+    case "scylladb":
+      return (
+        <svg width={size} height={size} viewBox="0 0 48 48" fill="none" className={className}>
+          <rect width="48" height="48" rx="10" fill={normalized === "scylladb" ? "#2E3440" : "#1287B1"} />
+          <circle cx="24" cy="24" r="11" fill="none" stroke="#FFFFFF" strokeWidth="3" />
+          <circle cx="24" cy="24" r="4" fill={normalized === "scylladb" ? "#57D1F5" : "#FFFFFF"} />
+          <path d="M24 13v4M24 31v4M13 24h4M31 24h4" stroke="#FFFFFF" strokeWidth="2.5" strokeLinecap="round" />
+        </svg>
+      );
+
+    case "neo4j":
+      return (
+        <svg width={size} height={size} viewBox="0 0 48 48" fill="none" className={className}>
+          <rect width="48" height="48" rx="10" fill="#014063" />
+          <circle cx="17" cy="30" r="5" fill="#018BFF" />
+          <circle cx="31" cy="30" r="5" fill="#018BFF" />
+          <circle cx="24" cy="16" r="5" fill="#018BFF" />
+          <path d="M20 19l-1 6M28 19l1 6M22 30h4" stroke="#FFFFFF" strokeWidth="2" strokeLinecap="round" />
+        </svg>
+      );
+
+    case "kafka":
+    case "redpanda":
+      return (
+        <svg width={size} height={size} viewBox="0 0 48 48" fill="none" className={className}>
+          <rect width="48" height="48" rx="10" fill={normalized === "redpanda" ? "#E3252B" : "#231F20"} />
+          <circle cx="24" cy="12" r="4" fill="#FFFFFF" />
+          <circle cx="24" cy="36" r="4" fill="#FFFFFF" />
+          <circle cx="14" cy="24" r="4" fill="#FFFFFF" />
+          <circle cx="34" cy="24" r="4" fill="#FFFFFF" />
+          <path d="M24 16v16M18 24h12" stroke="#FFFFFF" strokeWidth="2.5" />
+        </svg>
+      );
+
+    case "duckdb":
+      return (
+        <svg width={size} height={size} viewBox="0 0 48 48" fill="none" className={className}>
+          <rect width="48" height="48" rx="10" fill="#FFF000" />
+          <circle cx="22" cy="24" r="11" fill="#1A1A1A" />
+          <path d="M31 21h9a2 2 0 0 1 0 4h-9v-4Z" fill="#1A1A1A" />
+          <circle cx="18" cy="21" r="2" fill="#FFF000" />
+        </svg>
+      );
+
+    case "snowflake":
+      return (
+        <svg width={size} height={size} viewBox="0 0 48 48" fill="none" className={className}>
+          <rect width="48" height="48" rx="10" fill="#29B5E8" />
+          <path d="M24 10v28M12 17l24 14M12 31l24-14" stroke="#FFFFFF" strokeWidth="3" strokeLinecap="round" />
+          <path d="M20 12l4 4 4-4M20 36l4-4 4 4M10 20l5 2-1 5M38 20l-5 2 1 5M10 28l5-2-1-5M38 28l-5-2 1-5" stroke="#FFFFFF" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
+
+    default:
+      return <Monogram engine={normalized} size={size} className={className} />;
   }
 };
+
+// WHAT:  Brand-coloured monogram tile for engines without a bespoke glyph.
+// WHY:   Sixty-plus engines; every one still gets a distinct, recognisable tile.
+const BRAND: Record<string, { bg: string; fg: string; text: string }> = {
+  oracle: { bg: "#C74634", fg: "#FFFFFF", text: "O" },
+  couchdb: { bg: "#E42528", fg: "#FFFFFF", text: "Cdb" },
+  firestore: { bg: "#FFA000", fg: "#1F1F1F", text: "Fs" },
+  valkey: { bg: "#6C3AD4", fg: "#FFFFFF", text: "Vk" },
+  dynamodb: { bg: "#2E27AD", fg: "#FFFFFF", text: "Dy" },
+  hbase: { bg: "#BA160C", fg: "#FFFFFF", text: "Hb" },
+  memgraph: { bg: "#FB6E00", fg: "#FFFFFF", text: "Mg" },
+  tigergraph: { bg: "#F58020", fg: "#1F1F1F", text: "Tg" },
+  timescaledb: { bg: "#FDB515", fg: "#1F1F1F", text: "Ts" },
+  influxdb: { bg: "#22ADF6", fg: "#FFFFFF", text: "Ifx" },
+  victoriametrics: { bg: "#621773", fg: "#FFFFFF", text: "VM" },
+  prometheus: { bg: "#E6522C", fg: "#FFFFFF", text: "Pr" },
+  questdb: { bg: "#D14671", fg: "#FFFFFF", text: "Qd" },
+  milvus: { bg: "#00A1EA", fg: "#FFFFFF", text: "Mv" },
+  weaviate: { bg: "#61BD73", fg: "#1F1F1F", text: "Wv" },
+  pinecone: { bg: "#1C17FF", fg: "#FFFFFF", text: "Pc" },
+  chroma: { bg: "#FFDE59", fg: "#1F1F1F", text: "Ch" },
+  pgvector: { bg: "#336791", fg: "#FFFFFF", text: "pgv" },
+  opensearch: { bg: "#005EB8", fg: "#FFFFFF", text: "Os" },
+  meilisearch: { bg: "#FF5CAA", fg: "#FFFFFF", text: "Me" },
+  typesense: { bg: "#D52783", fg: "#FFFFFF", text: "Ty" },
+  arangodb: { bg: "#DDE072", fg: "#1F1F1F", text: "Ar" },
+  surrealdb: { bg: "#FF00A0", fg: "#FFFFFF", text: "Su" },
+  orientdb: { bg: "#F26722", fg: "#FFFFFF", text: "Or" },
+  postgis: { bg: "#2F8F4E", fg: "#FFFFFF", text: "GIS" },
+  memcached: { bg: "#3C7A3A", fg: "#FFFFFF", text: "Mc" },
+  dragonfly: { bg: "#FF6A00", fg: "#FFFFFF", text: "Df" },
+  druid: { bg: "#29F1FB", fg: "#1F1F1F", text: "Dr" },
+  bigquery: { bg: "#4285F4", fg: "#FFFFFF", text: "BQ" },
+  cockroachdb: { bg: "#6933FF", fg: "#FFFFFF", text: "Cr" },
+  tidb: { bg: "#E30C34", fg: "#FFFFFF", text: "Ti" },
+  yugabytedb: { bg: "#FF6E42", fg: "#FFFFFF", text: "Yb" },
+  rocksdb: { bg: "#FFA400", fg: "#1F1F1F", text: "Rk" },
+  immudb: { bg: "#2E8BC0", fg: "#FFFFFF", text: "Im" },
+  qldb: { bg: "#8C4FFF", fg: "#FFFFFF", text: "Ql" },
+  objectdb: { bg: "#3F51B5", fg: "#FFFFFF", text: "Ob" },
+  ibm_ims: { bg: "#0F62FE", fg: "#FFFFFF", text: "IMS" },
+  raima_rdm: { bg: "#00629B", fg: "#FFFFFF", text: "RDM" },
+  basex: { bg: "#3B6EA5", fg: "#FFFFFF", text: "Bx" },
+  existdb: { bg: "#5A9E3A", fg: "#FFFFFF", text: "eX" },
+  apache_jena: { bg: "#4B8B3B", fg: "#FFFFFF", text: "Je" },
+  graphdb: { bg: "#04AA6D", fg: "#FFFFFF", text: "Gd" },
+  stardog: { bg: "#6B2C91", fg: "#FFFFFF", text: "Sd" },
+  blazegraph: { bg: "#D9481C", fg: "#FFFFFF", text: "Bz" },
+  virtuoso: { bg: "#1B4F72", fg: "#FFFFFF", text: "Vi" },
+};
+
+function Monogram({ engine, size, className }: { engine: string; size: number; className: string }) {
+  const brand = BRAND[engine] ?? { bg: "#3A3A3F", fg: "#FFFFFF", text: engine.slice(0, 2) };
+  const fontSize = brand.text.length >= 3 ? 15 : 19;
+  return (
+    <svg width={size} height={size} viewBox="0 0 48 48" fill="none" className={className} aria-hidden="true">
+      <rect width="48" height="48" rx="10" fill={brand.bg} />
+      <text x="24" y="31" fontFamily="system-ui, -apple-system, sans-serif" fontSize={fontSize} fontWeight="bold" letterSpacing="-0.5" fill={brand.fg} textAnchor="middle">
+        {brand.text}
+      </text>
+    </svg>
+  );
+}

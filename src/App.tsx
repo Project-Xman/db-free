@@ -1,6 +1,7 @@
 // SOT: app-shell, layout, page-routing, tab-routing, settings-css-vars
 import { useEffect } from "react";
 import { useActiveConnection, useActiveTab, useWorkspace } from "@/stores/workspace";
+import { isKeyValueEngine } from "@/lib/engines";
 import { IconRail } from "@/features/shell/IconRail";
 import { Sidebar } from "@/features/shell/Sidebar";
 import { TabBar } from "@/features/shell/TabBar";
@@ -83,7 +84,7 @@ export function App() {
                 {tab === null ? (
                   <EmptyState icon="table" title="Pick a table" body="Select a table on the left to browse it, or open a query tab. Run with" action={<RunShortcut />} />
                 ) : tab.kind === "table" ? (
-                  connection.engine === "redis" ? <KeyTab key={tab.id} connectionId={tab.connectionId} table={tab.table} /> : <TableTab key={`${tab.id}:${tab.filterKey}`} connectionId={tab.connectionId} table={tab.table} initialFilters={tab.initialFilters} />
+                  isKeyValueEngine(connection.engine) ? <KeyTab key={tab.id} connectionId={tab.connectionId} table={tab.table} /> : <TableTab key={`${tab.id}:${tab.filterKey}`} connectionId={tab.connectionId} table={tab.table} initialFilters={tab.initialFilters} />
                 ) : tab.kind === "query" ? (
                   <QueryPane key={tab.id} tabId={tab.id} connection={connection} seedSql={tab.seedSql} />
                 ) : tab.kind === "history" ? (

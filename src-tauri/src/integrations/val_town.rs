@@ -156,6 +156,8 @@ impl Integration for ValTownIntegration {
             paging: true,
             row_estimate: true,
             views: true,
+            transactions: false,
+            exact_estimate: true,
         }
     }
 

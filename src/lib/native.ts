@@ -4,7 +4,11 @@ import type { TransferFormat } from "./bindings";
 
 // WHAT:  Native pickers. Wrapped so components never import a Tauri plugin directly.
 export async function pickSqliteFile(): Promise<string | null> {
-  const picked = await open({ multiple: false, directory: false, filters: [{ name: "SQLite database", extensions: ["db", "sqlite", "sqlite3", "db3"] }] });
+  const picked = await open({
+    multiple: false,
+    directory: false,
+    filters: [{ name: "Database file", extensions: ["db", "sqlite", "sqlite3", "db3", "duckdb", "ddb", "gpkg"] }],
+  });
   return typeof picked === "string" ? picked : null;
 }
 

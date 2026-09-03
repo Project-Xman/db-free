@@ -165,7 +165,7 @@ impl Integration for SqliteIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { sql: true, namespaces: false, fixed_columns: true, paging: true, row_estimate: true, views: true }
+        Capabilities { sql: true, namespaces: false, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: true, exact_estimate: true }
     }
 
     async fn server_version(&self) -> AppResult<Option<String>> {

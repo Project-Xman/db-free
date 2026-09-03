@@ -100,6 +100,7 @@ mod export_bindings {
             crate::commands::query::BufferIdRequest::export_all(&cfg),
             crate::integrations::SessionInfo::export_all(&cfg),
             crate::model::EngineKind::export_all(&cfg),
+            crate::model::FormKind::export_all(&cfg),
             crate::model::ConnectionSummary::export_all(&cfg),
             crate::model::SchemaCatalog::export_all(&cfg),
             crate::model::TablePage::export_all(&cfg),

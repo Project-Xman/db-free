@@ -73,10 +73,7 @@ pub async fn connect(conn: &ResolvedConnection) -> AppResult<Arc<dyn Integration
         .acquire_timeout(Duration::from_secs(15))
         .connect_with(opts)
         .await?;
-    let engine = match s.engine {
-        Engine::Mariadb => Engine::Mariadb,
-        _ => Engine::Mysql,
-    };
+    let engine = s.engine;
     Ok(Arc::new(MysqlIntegration { pool, engine, database }))
 }
 
@@ -279,7 +276,7 @@ impl Integration for MysqlIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { sql: true, namespaces: false, fixed_columns: true, paging: true, row_estimate: true, views: true }
+        Capabilities { sql: true, namespaces: false, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: true, exact_estimate: false }
     }
 
     async fn ping(&self) -> AppResult<()> {

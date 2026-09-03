@@ -10,8 +10,8 @@ pub mod transfer;
 pub mod value;
 
 pub use connection::{
-    ConnectionInput, ConnectionRecord, ConnectionSummary, Engine, EngineKind, Environment,
-    ResolvedConnection, SslMode,
+    ConnectionInput, ConnectionRecord, ConnectionSummary, Engine, EngineKind, Environment, Family,
+    FormKind, ResolvedConnection, SslMode,
 };
 pub use changes::{CellValue, ChangePreview, StagedChange};
 pub use documents::{

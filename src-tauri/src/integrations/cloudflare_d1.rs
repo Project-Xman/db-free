@@ -193,6 +193,8 @@ impl Integration for CloudflareD1Integration {
             paging: true,
             row_estimate: true,
             views: true,
+            transactions: false,
+            exact_estimate: true,
         }
     }
 

@@ -53,13 +53,16 @@ pub async fn import_file(state: State<'_, AppState>, req: ImportRequest) -> AppR
     }
     let engine = services::connection::engine_of(&state, &req.connection_id)?;
     let table = req.table.clone();
-    let known = guard::session(&state, &req.connection_id, |ctx| async move { ctx.integration.columns(&table).await }).await?;
+    let (known, transactional) = guard::session(&state, &req.connection_id, |ctx| async move {
+        let cols = ctx.integration.columns(&table).await?;
+        Ok((cols, ctx.integration.capabilities().transactions))
+    })
+    .await?;
     if let Some(missing) = columns.iter().find(|c| !known.iter().any(|k| &k.name == *c)) {
         return Err(AppError::invalid_input(format!("Column \"{missing}\" does not exist on {}.", req.table.name)));
     }
     let batches = services::changes::insert_batches(engine, &req.table, &columns, &rows, 200);
     let statements = batches.len() as u64;
-    let transactional = !matches!(engine, crate::model::Engine::Clickhouse);
     let mut script = String::new();
     if transactional {
         script.push_str("BEGIN;\n");

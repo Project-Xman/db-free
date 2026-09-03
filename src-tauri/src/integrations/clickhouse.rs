@@ -325,7 +325,7 @@ impl Integration for ClickhouseIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { sql: true, namespaces: true, fixed_columns: true, paging: true, row_estimate: true, views: true }
+        Capabilities { sql: true, namespaces: true, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: false, exact_estimate: false }
     }
 
     async fn ping(&self) -> AppResult<()> {

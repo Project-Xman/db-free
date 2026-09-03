@@ -583,7 +583,7 @@ impl Integration for RedisIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { sql: false, namespaces: false, fixed_columns: false, paging: true, row_estimate: true, views: false }
+        Capabilities { sql: false, namespaces: false, fixed_columns: false, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: true }
     }
 
     async fn ping(&self) -> AppResult<()> {

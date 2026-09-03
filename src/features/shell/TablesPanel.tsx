@@ -3,6 +3,7 @@ import { useState } from "react";
 import { Button, Chip, ScrollShadow, SearchField, Separator, Skeleton, Spinner } from "@heroui/react";
 import type { ColumnInfo, TableInfo, TableRef } from "@/lib/bindings";
 import { formatCount } from "@/lib/format";
+import { collectionNoun, isKeyValueEngine, supportsErd } from "@/lib/engines";
 import { Icon, typeIcon } from "@/lib/icons";
 import { normalizeError } from "@/lib/ipc";
 import { tableKey, useActiveConnection, useWorkspace } from "@/stores/workspace";
@@ -49,13 +50,13 @@ export function TablesPanel() {
   return (
     <aside className="flex h-full w-full min-w-0 flex-col glass-sidebar select-none">
       <div className="drag-region flex h-11 shrink-0 items-center gap-1.5 px-3 border-b border-border/40" data-tauri-drag-region>
-        <ConnectionSwitcher caption={connection.engine === "redis" ? "Keys" : connection.engine === "mongodb" ? "Collections" : "Tables"} />
+        <ConnectionSwitcher caption={collectionNoun(connection.engine)} />
         {connection.readOnly ? <EnvBadge environment="none" readOnly /> : null}
         <div className="drag-region h-full min-w-4 flex-1" data-tauri-drag-region />
         <span className="flex items-center gap-0.5">
           <IconButton icon="refresh" label="Refresh schema" onPress={() => void loadCatalog(id)} />
           <IconButton icon="plus" label="New query" onPress={() => openQuery(id)} />
-          <IconButton icon="view" label="ER diagram" isDisabled={connection.engine === "redis" || connection.engine === "mongodb"} onPress={() => openErd(id, schemaFilter)} />
+          <IconButton icon="view" label="ER diagram" isDisabled={!supportsErd(connection.engine)} onPress={() => openErd(id, schemaFilter)} />
           <IconButton icon="search" label="Search tables" active={searchOpen} onPress={() => setSearchOpen((v) => !v)} />
         </span>
       </div>
@@ -98,7 +99,7 @@ export function TablesPanel() {
           </div>
         ) : visible.length === 0 ? (
           <p className="px-3 py-3 text-xs text-muted">{needle.length > 0 ? "No tables match." : "No tables in this database yet. Create one from a query tab and refresh."}</p>
-        ) : connection.engine === "redis" ? (
+        ) : isKeyValueEngine(connection.engine) ? (
           <KeyTree connectionId={id} keys={visible.flatMap((s) => s.tables)} />
         ) : (
           visible.map((schema) => (

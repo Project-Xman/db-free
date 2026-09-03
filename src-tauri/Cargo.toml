@@ -35,6 +35,17 @@ redis = { version = "1", default-features = false, features = ["tokio-comp", "to
 mongodb = { version = "3", features = ["compat-3-3-0", "bson-3"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tiberius = { version = "0.12", default-features = false, features = ["rustls", "tds73", "chrono"] }
+scylla = { version = "1", features = ["rustls-023", "chrono-04"] }
+neo4rs = "0.8"
+rskafka = { version = "0.6", features = ["transport-tls"] }
+duckdb = { version = "1.4", features = ["bundled"] }
+rocksdb = { version = "0.24", default-features = false, features = ["lz4", "zstd", "snappy"] }
+oracle = "0.6"
+jsonwebtoken = "9"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+url = "2"
 csv = "1"
 aes-gcm = "0.10"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }

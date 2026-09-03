@@ -3,7 +3,7 @@
 use crate::error::{AppError, AppResult};
 use crate::integrations::sql::quote_literal;
 use crate::integrations::{qualified_name_for, quote_ident_for};
-use crate::model::{CellValue, ChangePreview, Engine, StagedChange, TableRef, Value};
+use crate::model::{CellValue, ChangePreview, Engine, Family, StagedChange, TableRef, Value};
 use base64::Engine as _;
 
 // WHAT:  Renders a cell Value as an SQL literal for the given engine.
@@ -14,12 +14,13 @@ use base64::Engine as _;
 pub fn literal(engine: Engine, value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
-        Value::Bool(b) => match engine {
-            Engine::Sqlite
-            | Engine::Libsql
-            | Engine::ValTown
-            | Engine::CloudflareD1
-            | Engine::Mssql => {
+        Value::Bool(b) => match engine.family() {
+            Family::Sqlite
+            | Family::Libsql
+            | Family::ValTown
+            | Family::CloudflareD1
+            | Family::Mssql
+            | Family::Oracle => {
                 if *b { "1" } else { "0" }.to_string()
             }
             _ => {
@@ -46,18 +47,20 @@ pub fn literal(engine: Engine, value: &Value) -> String {
         Value::Bytes(b64) => {
             let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap_or_default();
             let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            match engine {
-                Engine::Postgres | Engine::Supabase | Engine::Neon => format!("'\\x{hex}'::bytea"),
-                Engine::Mysql
-                | Engine::Mariadb
-                | Engine::Planetscale
-                | Engine::Sqlite
-                | Engine::Libsql
-                | Engine::ValTown
-                | Engine::CloudflareD1 => format!("X'{hex}'"),
-                Engine::Mssql => format!("0x{hex}"),
-                Engine::Clickhouse => format!("unhex('{hex}')"),
-                Engine::Redis | Engine::Mongodb => quote_literal(b64),
+            match engine.family() {
+                Family::Postgres => format!("'\\x{hex}'::bytea"),
+                Family::Mysql
+                | Family::Sqlite
+                | Family::Duckdb
+                | Family::Libsql
+                | Family::ValTown
+                | Family::CloudflareD1
+                | Family::Snowflake => format!("X'{hex}'"),
+                Family::Mssql | Family::Cassandra => format!("0x{hex}"),
+                Family::Clickhouse => format!("unhex('{hex}')"),
+                Family::Oracle => format!("HEXTORAW('{hex}')"),
+                Family::Bigquery => format!("FROM_HEX('{hex}')"),
+                _ => quote_literal(b64),
             }
         }
     }

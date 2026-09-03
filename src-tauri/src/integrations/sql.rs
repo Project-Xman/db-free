@@ -2,7 +2,7 @@
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::quote_ident_for;
-use crate::model::{ColumnInfo, Engine, FilterOp, FilterRule, SortRule};
+use crate::model::{ColumnInfo, Engine, Family, FilterOp, FilterRule, SortRule};
 
 // WHAT:  Builds WHERE / ORDER BY fragments for the table browser.
 // WHY:   Both SQL engines share the syntax; one builder means one set of tests.
@@ -54,35 +54,18 @@ pub fn order_clause(engine: Engine, sort: &[SortRule]) -> String {
 fn predicate(engine: Engine, rule: &FilterRule) -> String {
     let col = quote_ident_for(engine, &rule.column);
     // MySQL has no TEXT cast target; CHAR is the portable spelling there.
-    let text_type = match engine {
-        Engine::Mysql | Engine::Mariadb | Engine::Planetscale => "CHAR",
-        Engine::Mssql => "NVARCHAR(MAX)",
-        Engine::Postgres
-        | Engine::Sqlite
-        | Engine::Clickhouse
-        | Engine::Redis
-        | Engine::Mongodb
-        | Engine::Libsql
-        | Engine::ValTown
-        | Engine::CloudflareD1
-        | Engine::Supabase
-        | Engine::Neon => "TEXT",
+    let text_type = match engine.family() {
+        Family::Mysql => "CHAR",
+        Family::Mssql => "NVARCHAR(MAX)",
+        Family::Oracle => "VARCHAR2(4000)",
+        Family::Bigquery | Family::Snowflake | Family::Duckdb | Family::Clickhouse | Family::Druid => "STRING",
+        _ => "TEXT",
     };
     let text_col = format!("CAST({col} AS {text_type})");
     // Postgres LIKE is case-sensitive; every other SQL engine here is case-insensitive by default.
-    let like = match engine {
-        Engine::Postgres | Engine::Supabase | Engine::Neon => "ILIKE",
-        Engine::Mysql
-        | Engine::Mariadb
-        | Engine::Sqlite
-        | Engine::Clickhouse
-        | Engine::Redis
-        | Engine::Mongodb
-        | Engine::Mssql
-        | Engine::Libsql
-        | Engine::ValTown
-        | Engine::CloudflareD1
-        | Engine::Planetscale => "LIKE",
+    let like = match engine.family() {
+        Family::Postgres | Family::Duckdb | Family::Snowflake | Family::Cassandra => "ILIKE",
+        _ => "LIKE",
     };
     let value = rule.value.trim();
     match rule.op {

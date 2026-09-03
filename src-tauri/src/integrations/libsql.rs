@@ -202,6 +202,8 @@ impl Integration for LibsqlIntegration {
             paging: true,
             row_estimate: true,
             views: true,
+            transactions: true,
+            exact_estimate: true,
         }
     }
 
