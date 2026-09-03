@@ -1,6 +1,6 @@
 // SOT: results-pane, statement-tabs, query-result-grid
 import { useState } from "react";
-import { Chip } from "@heroui/react";
+import { Button, Chip } from "@heroui/react";
 import type { QueryOutcome } from "@/lib/bindings";
 import { DENSITIES, formatCount, formatMs } from "@/lib/format";
 import { useWorkspace } from "@/stores/workspace";
@@ -23,14 +23,15 @@ export function ResultsPane({ outcome }: { outcome: QueryOutcome | null }) {
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border bg-surface px-2 text-xs">
         {statements.map((s, i) => (
-          <button
+          <Button
             key={i}
-            type="button"
-            onClick={() => setActive(i)}
-            className={cn("rounded-md px-2 py-0.5", i === index ? "bg-surface-tertiary text-foreground" : "text-muted hover:text-foreground")}
+            size="sm"
+            variant={i === index ? "secondary" : "ghost"}
+            onPress={() => setActive(i)}
+            className={cn("h-6 rounded-md px-2 py-0.5 text-xs", i === index ? "text-foreground font-medium" : "text-muted hover:text-foreground")}
           >
             {s.kind === "rows" ? `Result ${i + 1} · ${formatCount(s.result.rows.length)} rows` : `Statement ${i + 1}`}
-          </button>
+          </Button>
         ))}
         <span className="ml-auto flex items-center gap-2">
           <Chip size="sm" color="success" variant="soft">

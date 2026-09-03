@@ -21,12 +21,17 @@ export function ConnectionSwitcher({ caption }: { caption: string }) {
 
   return (
     <Dropdown>
-      <Button variant="ghost" size="sm" className="h-7 min-w-0 gap-1.5 rounded-md px-1.5 text-sm font-medium text-foreground" aria-label={`${caption} — switch connection`}>
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-8 min-w-0 gap-2 rounded-lg px-2 text-sm font-semibold text-foreground glass-pill liquid-hover"
+        aria-label={`${caption} — switch connection`}
+      >
         <EnvDot environment={connection.environment} live />
-        <span className="truncate">{connection.name}</span>
-        <Icon name="chevron-down" size={12} className="text-muted" />
+        <span className="truncate max-w-[140px]">{connection.name}</span>
+        <Icon name="chevron-down" size={12} className="text-muted shrink-0" />
       </Button>
-      <Dropdown.Popover className="min-w-[300px]">
+      <Dropdown.Popover className="min-w-[320px] glass-modal rounded-xl">
         <Dropdown.Menu
           onAction={(key) => {
             const id = String(key);

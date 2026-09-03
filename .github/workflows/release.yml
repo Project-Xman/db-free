@@ -1,16 +1,27 @@
-# SOT: release-pipeline, cross-platform-bundles
-# WHAT:  Builds installers for macOS (universal), Windows (.msi/.exe) and Linux
-#        (.AppImage/.deb) and attaches them to a draft GitHub release.
-# WHY:   Portable single-artifact delivery per platform (PRD §6).
-# HOW:   tauri-action runs `pnpm tauri build` on each runner. Push a tag `v*`.
-name: release
+# SOT: release-pipeline, cross-platform-bundles, ci-cd
+# WHAT:  Runs code checks (guardrail, tsc, eslint, clippy, cargo test) on PRs/pushes,
+#        builds installers for macOS (universal), Windows (.msi/.exe) and Linux
+#        (.AppImage/.deb) on every commit to main (uploaded as artifacts), and
+#        attaches installers to a draft GitHub release on tagged versions (v*).
+# WHY:   Guarantees continuous integration quality, provides downloadable main/nightly
+#        installers, and automates cross-platform release delivery (PRD §6).
+# HOW:   Fast Ubuntu check job gates matrix build across macos-latest, ubuntu-22.04,
+#        and windows-latest using tauri-action and upload-artifact.
+name: CI/CD
 on:
   push:
+    branches: ["main"]
     tags: ["v*"]
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   check:
+    name: Check & Test
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -20,20 +31,27 @@ jobs:
         with: { node-version: 22, cache: pnpm }
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev pkg-config
+      - uses: swatinem/rust-cache@v2
+        with: { workspaces: src-tauri }
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
 
   bundle:
+    name: Build (${{ matrix.platform }})
     needs: check
+    if: github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: macos-latest
+            artifact-name: macos-universal
             args: --target universal-apple-darwin
           - platform: ubuntu-22.04
+            artifact-name: linux-x86_64
             args: ""
           - platform: windows-latest
+            artifact-name: windows-x64
             args: ""
     runs-on: ${{ matrix.platform }}
     steps:
@@ -50,7 +68,10 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with: { workspaces: src-tauri }
       - run: pnpm install --frozen-lockfile
-      - uses: tauri-apps/tauri-action@v0
+
+      - name: Build and draft release (tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -59,3 +80,23 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Build desktop app (main branch or manual dispatch)
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: ${{ matrix.args }}
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: db-free-${{ matrix.artifact-name }}
+          path: |
+            src-tauri/target/**/release/bundle/dmg/*.dmg
+            src-tauri/target/**/release/bundle/deb/*.deb
+            src-tauri/target/**/release/bundle/appimage/*.AppImage
+            src-tauri/target/**/release/bundle/msi/*.msi
+            src-tauri/target/**/release/bundle/nsis/*.exe
+          if-no-files-found: warn

@@ -28,7 +28,7 @@ pnpm tauri dev
 pnpm tauri build            # host platform: .dmg (macOS), .msi/.exe (Windows), .AppImage/.deb (Linux)
 ```
 
-Tagging `v*` runs `.github/workflows/release.yml`, which builds all three platforms and attaches them to a draft release.
+Pushing to `main` builds installers for all three platforms (macOS universal, Windows, Linux) and uploads them as workflow artifacts. Tagging `v*` attaches them to a draft GitHub release.
 
 ## Quality gate
 

@@ -1,5 +1,6 @@
 // SOT: data-grid, virtualized-grid, grid-cell-rendering, column-sort-header, row-selection, inline-cell-edit, foreign-key-link
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Button, Input } from "@heroui/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { SortRule, Value } from "@/lib/bindings";
 import { parseJson } from "@/lib/json";
@@ -117,11 +118,11 @@ export function DataGrid({
   };
 
   return (
-    <div ref={parentRef} className="relative h-full w-full overflow-auto bg-background font-mono text-[12px]">
+    <div ref={parentRef} className="relative h-full w-full overflow-auto bg-background/60 font-mono text-[12px] select-none">
       <div style={{ width: totalWidth + gutter, height: totalHeight + HEADER_HEIGHT, position: "relative" }}>
-        <div className="sticky top-0 z-20 flex border-b border-border bg-surface" style={{ height: HEADER_HEIGHT, width: totalWidth + gutter }}>
+        <div className="sticky top-0 z-20 flex border-b border-border/50 glass-header" style={{ height: HEADER_HEIGHT, width: totalWidth + gutter }}>
           {selectable ? (
-            <div className="sticky left-0 z-30 flex shrink-0 items-center justify-center border-r border-border bg-surface" style={{ width: CHECK_WIDTH }}>
+            <div className="sticky left-0 z-30 flex shrink-0 items-center justify-center border-r border-border/50 glass-header" style={{ width: CHECK_WIDTH }}>
               <Check label="Select all rows" checked={allSelected} indeterminate={someSelected} onChange={onToggleAll} />
             </div>
           ) : null}
@@ -131,20 +132,19 @@ export function DataGrid({
               if (!column) return null;
               const rule = sort.find((s) => s.column === column.name);
               return (
-                <button
-                  type="button"
+                <Button
+                  variant="ghost"
                   key={vc.key}
-                  disabled={onSortToggle === undefined}
-                  onClick={() => onSortToggle?.(column.name)}
-                  className={cn("absolute top-0 flex h-full items-center gap-1.5 truncate border-r border-border px-2 text-left font-sans", onSortToggle ? "hover:bg-surface-secondary" : "cursor-default")}
+                  isDisabled={onSortToggle === undefined}
+                  onPress={() => onSortToggle?.(column.name)}
+                  className={cn("absolute top-0 flex h-full items-center justify-start gap-1.5 truncate border-r border-border/40 px-2.5 text-left font-sans liquid-hover rounded-none", onSortToggle ? "hover:bg-surface-secondary/70" : "cursor-default")}
                   style={{ left: vc.start, width: vc.size }}
-                  title={`${column.name} · ${column.typeName}`}
                 >
                   <Icon name={column.linkTo !== undefined && !column.primaryKey ? "link" : typeIcon(column.typeName, column.primaryKey)} size={12} className={cn("shrink-0", column.primaryKey ? "text-warning" : column.linkTo !== undefined ? "text-accent" : "text-muted")} />
                   <span className="truncate text-[12px] font-medium text-foreground">{column.name}</span>
                   {column.linkTo !== undefined ? <span className="truncate text-[10px] text-muted">→ {column.linkTo}</span> : null}
                   {rule ? <Icon name={rule.desc ? "arrow-down" : "arrow-up"} size={11} className="ml-auto shrink-0 text-accent" /> : null}
-                </button>
+                </Button>
               );
             })}
           </div>
@@ -157,11 +157,14 @@ export function DataGrid({
           return (
             <div
               key={vr.key}
-              className={cn("absolute left-0 flex border-b border-separator", isChecked ? "bg-accent-soft/40" : isSelectedRow ? "bg-surface-secondary/60" : "")}
+              className={cn(
+                "absolute left-0 flex border-b border-separator/40 transition-colors duration-100",
+                isChecked ? "bg-accent/15" : isSelectedRow ? "bg-surface-secondary/80" : vr.index % 2 === 1 ? "bg-surface/20 hover:bg-surface-secondary/40" : "hover:bg-surface-secondary/40",
+              )}
               style={{ top: vr.start + HEADER_HEIGHT, height: vr.size, width: totalWidth + gutter }}
             >
               {selectable ? (
-                <div className="sticky left-0 z-10 flex shrink-0 items-center justify-center border-r border-separator bg-surface" style={{ width: CHECK_WIDTH }}>
+                <div className="sticky left-0 z-10 flex shrink-0 items-center justify-center border-r border-separator/40 bg-surface/70 backdrop-blur-sm" style={{ width: CHECK_WIDTH }}>
                   <Check label={`Select row ${vr.index + 1}`} checked={isChecked} onChange={() => onToggleRow(vr.index)} />
                 </div>
               ) : null}
@@ -187,16 +190,16 @@ export function DataGrid({
                           if (onCellEdit && value !== undefined && value.t !== "bytes" && value.t !== "bool") setEditing({ row: vr.index, col: vc.index, text: editText(value) });
                         }}
                         className={cn(
-                          "absolute top-0 flex h-full cursor-default items-center truncate border-r border-separator px-2",
+                          "absolute top-0 flex h-full cursor-default items-center truncate border-r border-separator/40 px-2",
                           formatted ? cellClass(formatted.kind) : "",
-                          isSelected ? "bg-accent-soft ring-1 ring-accent ring-inset" : "",
+                          isSelected ? "bg-accent/20 ring-1 ring-accent ring-inset" : "",
                           stagedValue !== undefined ? "bg-warning-soft text-warning" : "",
                         )}
                         style={{ left: vc.start, width: vc.size }}
                         title={formatted?.text}
                       >
                         {isEditing ? (
-                          <input
+                          <Input
                             autoFocus
                             value={editing.text}
                             onChange={(e) => setEditing({ ...editing, text: e.target.value })}
@@ -205,7 +208,7 @@ export function DataGrid({
                               if (e.key === "Escape") setEditing(null);
                             }}
                             onBlur={() => setEditing(null)}
-                            className="h-[calc(100%-4px)] w-full rounded-sm border border-accent bg-background px-1 font-mono text-[12px] text-foreground focus:outline-none"
+                            className="h-[calc(100%-4px)] w-full rounded-sm border border-accent bg-background px-1 font-mono text-[12px] text-foreground"
                             aria-label="Edit cell"
                           />
                         ) : value?.t === "bool" ? (
@@ -221,18 +224,18 @@ export function DataGrid({
                           <span className="truncate">{formatted?.text ?? ""}</span>
                         )}
                         {linked && !isEditing ? (
-                          <button
-                            type="button"
+                          <Button
+                            isIconOnly
+                            variant="ghost"
+                            size="sm"
                             aria-label={`Open ${columns[vc.index]?.linkTo ?? "related"} rows`}
-                            title={`Open ${columns[vc.index]?.linkTo ?? ""} where it matches this value`}
-                            onClick={(e) => {
-                              e.stopPropagation();
+                            onPress={() => {
                               onLinkOpen(vr.index, vc.index);
                             }}
-                            className="ml-auto shrink-0 rounded-sm p-0.5 text-accent opacity-60 hover:bg-accent-soft hover:opacity-100"
+                            className="ml-auto flex size-4.5 min-w-4.5 p-0 shrink-0 rounded-sm text-accent opacity-60 hover:bg-accent-soft hover:opacity-100"
                           >
                             <Icon name="link" size={11} />
-                          </button>
+                          </Button>
                         ) : null}
                       </div>
                     );

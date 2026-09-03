@@ -9,8 +9,8 @@ export function EnvBadge({ environment, readOnly = false }: { environment: Envir
   const meta = environmentMeta(environment);
   if (environment === "none" && !readOnly) return null;
   return (
-    <Chip size="sm" variant="soft" className={cn("gap-1.5", meta.text)}>
-      {environment !== "none" ? <span className={cn("size-1.5 rounded-full", meta.dot)} /> : null}
+    <Chip size="sm" variant="soft" className={cn("gap-1.5 rounded-full border border-border/60 backdrop-blur-sm", meta.text)}>
+      {environment !== "none" ? <span className={cn("size-1.5 rounded-full shadow-xs", meta.dot)} /> : null}
       {environment !== "none" ? meta.label : null}
       {readOnly ? <Icon name="lock" size={11} /> : null}
     </Chip>
@@ -19,5 +19,10 @@ export function EnvBadge({ environment, readOnly = false }: { environment: Envir
 
 export function EnvDot({ environment, live }: { environment: Environment; live: boolean }) {
   const meta = environmentMeta(environment);
-  return <span className={cn("inline-block size-2 shrink-0 rounded-full", meta.dot, live ? "" : "opacity-40")} title={`${meta.label}${live ? " · connected" : ""}`} />;
+  return (
+    <span
+      className={cn("inline-block size-2 shrink-0 rounded-full transition-opacity duration-200", meta.dot, live ? "shadow-xs opacity-100" : "opacity-35")}
+      title={`${meta.label}${live ? " · connected" : ""}`}
+    />
+  );
 }

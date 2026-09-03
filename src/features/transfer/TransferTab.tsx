@@ -1,6 +1,6 @@
 // SOT: transfer-tab, export-ui, import-ui, table-picker, export-preview
 import { useEffect, useMemo, useState } from "react";
-import { Button, Spinner } from "@heroui/react";
+import { Button, Chip, ScrollShadow, Separator, Spinner } from "@heroui/react";
 import type { TableRef, TablePage, TransferFormat } from "@/lib/bindings";
 import { ipc, normalizeError } from "@/lib/ipc";
 import { pickDirectory, pickImportFile } from "@/lib/native";
@@ -113,7 +113,7 @@ export function TransferTab({ connectionId }: { connectionId: string }) {
               <Icon name="download" size={13} />
               Export {selected.size > 0 ? `(${selected.size})` : ""}
             </Button>
-            <span className="h-5 w-px bg-separator" />
+            <Separator orientation="vertical" className="h-5 opacity-50" />
             <Segmented label="Format" value={format} onChange={setFormat} options={FORMATS} />
             <Toggle checked={includeSchema} onChange={setIncludeSchema} label="Include schema" />
           </>
@@ -131,27 +131,39 @@ export function TransferTab({ connectionId }: { connectionId: string }) {
       </div>
       {mode === "export" ? (
         <div className="flex min-h-0 flex-1">
-          <div className="flex w-[300px] shrink-0 flex-col border-r border-border">
+          <div className="flex w-[300px] shrink-0 flex-col border-r border-border/40">
             <div className="flex h-9 items-center px-3 text-xs text-muted">
-              <span>{tables.length} tables</span>
-              <button type="button" className="ml-auto text-accent" onClick={() => setSelected(selected.size === tables.length ? new Set() : new Set(tables.map(tableKey)))}>
+              <Chip size="sm" variant="soft" className="font-mono text-[10px]">
+                {tables.length} tables
+              </Chip>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="ml-auto h-6 px-1.5 text-xs text-accent"
+                onPress={() => setSelected(selected.size === tables.length ? new Set() : new Set(tables.map(tableKey)))}
+              >
                 {selected.size === tables.length ? "Clear" : "Select All"}
-              </button>
+              </Button>
             </div>
-            <div className="min-h-0 flex-1 overflow-y-auto">
+            <ScrollShadow className="min-h-0 flex-1">
               {tables.map((t) => {
                 const key = tableKey(t);
                 return (
                   <div key={key} className={cn("flex h-8 items-center gap-2 px-3 text-[13px]", previewKey === key ? "bg-surface-tertiary text-foreground" : "text-muted hover:bg-surface-secondary hover:text-foreground")}>
                     <Check label={`Select ${key}`} checked={selected.has(key)} onChange={() => toggle(key)} />
-                    <button type="button" className="flex min-w-0 flex-1 items-center gap-2 text-left" onClick={() => setPreviewKey(key)}>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="flex h-auto min-w-0 flex-1 items-center justify-start gap-2 p-0 text-left bg-transparent hover:bg-transparent"
+                      onPress={() => setPreviewKey(key)}
+                    >
                       <Icon name="table" size={13} className="shrink-0" />
                       <span className="truncate">{key}</span>
-                    </button>
+                    </Button>
                   </div>
                 );
               })}
-            </div>
+            </ScrollShadow>
           </div>
           <div className="flex min-w-0 flex-1 flex-col">
             <div className="flex h-9 items-center px-3 text-xs text-muted">Preview (first 50 rows per table){previewKey ? ` · ${previewKey}` : ""}</div>

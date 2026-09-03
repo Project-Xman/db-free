@@ -15,8 +15,16 @@ pub fn literal(engine: Engine, value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
         Value::Bool(b) => match engine {
-            Engine::Sqlite => if *b { "1" } else { "0" }.to_string(),
-            _ => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            Engine::Sqlite
+            | Engine::Libsql
+            | Engine::ValTown
+            | Engine::CloudflareD1
+            | Engine::Mssql => {
+                if *b { "1" } else { "0" }.to_string()
+            }
+            _ => {
+                if *b { "TRUE" } else { "FALSE" }.to_string()
+            }
         },
         Value::Int(i) => i.to_string(),
         Value::Float(f) => {
@@ -39,8 +47,15 @@ pub fn literal(engine: Engine, value: &Value) -> String {
             let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap_or_default();
             let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
             match engine {
-                Engine::Postgres => format!("'\\x{hex}'::bytea"),
-                Engine::Mysql | Engine::Mariadb | Engine::Sqlite => format!("X'{hex}'"),
+                Engine::Postgres | Engine::Supabase | Engine::Neon => format!("'\\x{hex}'::bytea"),
+                Engine::Mysql
+                | Engine::Mariadb
+                | Engine::Planetscale
+                | Engine::Sqlite
+                | Engine::Libsql
+                | Engine::ValTown
+                | Engine::CloudflareD1 => format!("X'{hex}'"),
+                Engine::Mssql => format!("0x{hex}"),
                 Engine::Clickhouse => format!("unhex('{hex}')"),
                 Engine::Redis | Engine::Mongodb => quote_literal(b64),
             }
@@ -99,17 +114,25 @@ pub fn preview(engine: Engine, changes: &[StagedChange]) -> AppResult<ChangePrev
         return Err(AppError::invalid_input("Inline editing is not available for this engine yet."));
     }
     let statements = changes.iter().map(|c| statement(engine, c)).collect::<AppResult<Vec<_>>>()?;
-    let transactional = !matches!(engine, Engine::Clickhouse);
+    let transactional = !matches!(engine, Engine::Clickhouse | Engine::CloudflareD1 | Engine::ValTown);
     let mut script = String::new();
     if transactional {
-        script.push_str("BEGIN;\n");
+        if engine == Engine::Mssql {
+            script.push_str("BEGIN TRANSACTION;\n");
+        } else {
+            script.push_str("BEGIN;\n");
+        }
     }
     for s in &statements {
         script.push_str(s);
         script.push_str(";\n");
     }
     if transactional {
-        script.push_str("COMMIT;");
+        if engine == Engine::Mssql {
+            script.push_str("COMMIT TRANSACTION;");
+        } else {
+            script.push_str("COMMIT;");
+        }
     }
     Ok(ChangePreview { statements, script })
 }

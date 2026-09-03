@@ -1,6 +1,6 @@
 // SOT: key-tab, redis-key-viewer, key-value-editor, ttl-editor
 import { useCallback, useEffect, useState } from "react";
-import { Button, Chip } from "@heroui/react";
+import { Button, Chip, TextArea } from "@heroui/react";
 import type { QueryOutcome, TablePage, TableRef } from "@/lib/bindings";
 import { ipc, normalizeError } from "@/lib/ipc";
 import { DENSITIES } from "@/lib/format";
@@ -18,7 +18,7 @@ const TTLS = [
   { value: "86400", label: "1 day" },
 ] satisfies readonly { value: string; label: string }[];
 
-// WHAT:  Redis key viewer (DB Pro layout): key, type badge, TTL, value editor for
+// WHAT:  Redis key viewer (DB Manager layout): key, type badge, TTL, value editor for
 //        strings, a grid for hashes/lists/sets/zsets/streams, Save / Refresh / Delete.
 // HOW:   Reads go through fetch_table_page (the Redis adapter maps a key to rows);
 //        writes are plain commands through execute_query so the guard applies.
@@ -113,7 +113,17 @@ export function KeyTab({ connectionId, table }: { connectionId: string; table: T
       </div>
       <div className="min-h-0 flex-1">
         {type === "string" ? (
-          <textarea value={text} onChange={(e) => { setText(e.target.value); setDirty(true); }} readOnly={readOnly} className="h-full w-full resize-none bg-background p-3 font-mono text-[12px] text-foreground focus:outline-none" aria-label="Value" spellCheck={false} />
+          <TextArea
+            value={text}
+            onChange={(e) => {
+              setText(e.target.value);
+              setDirty(true);
+            }}
+            readOnly={readOnly}
+            className="h-full w-full font-mono text-[12px]"
+            aria-label="Value"
+            spellCheck={false}
+          />
         ) : page ? (
           <DataGrid columns={page.columns.map((c) => ({ name: c.name, typeName: c.dataType, primaryKey: c.primaryKey }))} rowCount={page.rows.length} getRow={(i) => page.rows[i]} rowHeight={DENSITIES[density].rowHeight} />
         ) : null}

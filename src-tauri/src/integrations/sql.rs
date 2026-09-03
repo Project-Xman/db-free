@@ -55,14 +55,34 @@ fn predicate(engine: Engine, rule: &FilterRule) -> String {
     let col = quote_ident_for(engine, &rule.column);
     // MySQL has no TEXT cast target; CHAR is the portable spelling there.
     let text_type = match engine {
-        Engine::Mysql | Engine::Mariadb => "CHAR",
-        Engine::Postgres | Engine::Sqlite | Engine::Clickhouse | Engine::Redis | Engine::Mongodb => "TEXT",
+        Engine::Mysql | Engine::Mariadb | Engine::Planetscale => "CHAR",
+        Engine::Mssql => "NVARCHAR(MAX)",
+        Engine::Postgres
+        | Engine::Sqlite
+        | Engine::Clickhouse
+        | Engine::Redis
+        | Engine::Mongodb
+        | Engine::Libsql
+        | Engine::ValTown
+        | Engine::CloudflareD1
+        | Engine::Supabase
+        | Engine::Neon => "TEXT",
     };
     let text_col = format!("CAST({col} AS {text_type})");
     // Postgres LIKE is case-sensitive; every other SQL engine here is case-insensitive by default.
     let like = match engine {
-        Engine::Postgres => "ILIKE",
-        Engine::Mysql | Engine::Mariadb | Engine::Sqlite | Engine::Clickhouse | Engine::Redis | Engine::Mongodb => "LIKE",
+        Engine::Postgres | Engine::Supabase | Engine::Neon => "ILIKE",
+        Engine::Mysql
+        | Engine::Mariadb
+        | Engine::Sqlite
+        | Engine::Clickhouse
+        | Engine::Redis
+        | Engine::Mongodb
+        | Engine::Mssql
+        | Engine::Libsql
+        | Engine::ValTown
+        | Engine::CloudflareD1
+        | Engine::Planetscale => "LIKE",
     };
     let value = rule.value.trim();
     match rule.op {

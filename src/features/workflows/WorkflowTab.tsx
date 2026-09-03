@@ -1,6 +1,6 @@
 // SOT: workflow-tab, workflow-steps, workflow-runner-ui
 import { useState } from "react";
-import { Button, Chip } from "@heroui/react";
+import { Alert, Button, Card, Chip, Input, ScrollShadow } from "@heroui/react";
 import type { Document, WorkflowBody, WorkflowRunReport, WorkflowStep } from "@/lib/bindings";
 import { ipc, normalizeError } from "@/lib/ipc";
 import { formatMs } from "@/lib/format";
@@ -84,7 +84,15 @@ export function WorkflowTab({ document: doc }: { document: Document }) {
     <div className="flex h-full min-h-0">
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border bg-surface px-2">
-          <input value={name} onChange={(e) => { setName(e.target.value); setDirty(true); }} className="h-7 w-48 rounded-md border border-transparent bg-transparent px-2 text-sm text-foreground hover:border-border focus:border-accent focus:outline-none" aria-label="Workflow name" />
+          <Input
+            value={name}
+            onChange={(e) => {
+              setName(e.target.value);
+              setDirty(true);
+            }}
+            className="h-7 w-48 rounded-md bg-transparent text-sm text-foreground"
+            aria-label="Workflow name"
+          />
           <AppSelect ariaLabel="Default connection" value={connectionId} options={connOptions} onChange={(v) => { setConnectionId(v); setDirty(true); }} size="sm" className="w-56" icon="database" />
           <Button size="sm" isPending={running} onPress={() => void run()} isDisabled={steps.length === 0}>
             <Icon name="play" size={12} />
@@ -94,42 +102,56 @@ export function WorkflowTab({ document: doc }: { document: Document }) {
             <Button size="sm" onPress={() => void save()} isDisabled={!dirty}>Save{dirty ? " *" : ""}</Button>
           </div>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto p-6">
+        <ScrollShadow className="min-h-0 flex-1 p-6">
           <div className="mx-auto flex w-full max-w-[560px] flex-col items-center gap-0">
             {steps.map((step, i) => {
               const result = report?.steps.find((r) => r.stepId === step.id);
               return (
                 <div key={step.id} className="flex w-full flex-col items-center">
-                  <div
+                  <Card
                     role="button"
                     tabIndex={0}
                     onClick={() => setSelectedId(step.id)}
                     onKeyDown={(e) => { if (e.key === "Enter") setSelectedId(step.id); }}
-                    className={cn("flex w-full items-center gap-3 rounded-xl border bg-surface px-4 py-3 text-left", selectedId === step.id ? "border-accent" : "border-border hover:border-border-secondary")}
+                    className={cn("w-full cursor-pointer transition-all border glass-card", selectedId === step.id ? "border-accent ring-1 ring-accent/30" : "border-border/40 hover:border-border")}
                   >
-                    <span className="flex size-7 items-center justify-center rounded-full bg-surface-tertiary text-xs text-muted">{i + 1}</span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm text-foreground">{step.name}</span>
-                      <span className="block truncate font-mono text-[11px] text-muted">{step.sql.replace(/\s+/g, " ").slice(0, 80) || "no SQL yet"}</span>
-                    </span>
-                    {result ? (
-                      <Chip size="sm" color={result.ok ? "success" : "danger"} variant="soft">{result.ok ? `ok · ${formatMs(result.elapsedMs)}${result.rows !== null ? ` · ${result.rows} rows` : ""}` : "error"}</Chip>
-                    ) : null}
-                    <span className="flex flex-col">
-                      <IconButton icon="arrow-up" label="Move up" isDisabled={i === 0} onPress={() => move(i, -1)} size={12} />
-                      <IconButton icon="arrow-down" label="Move down" isDisabled={i === steps.length - 1} onPress={() => move(i, 1)} size={12} />
-                    </span>
-                  </div>
-                  {result && !result.ok && result.error ? <p className="selectable mt-1 w-full rounded-md bg-danger-soft px-3 py-1.5 font-mono text-[11px] text-danger">{result.error}</p> : null}
-                  <div className="h-6 w-px bg-border" />
+                    <Card.Content className="flex items-center gap-3 p-3 w-full">
+                      <span className="flex size-7 items-center justify-center rounded-full bg-surface-tertiary text-xs text-muted shrink-0">{i + 1}</span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm font-medium text-foreground">{step.name}</span>
+                        <span className="block truncate font-mono text-[11px] text-muted">{step.sql.replace(/\s+/g, " ").slice(0, 80) || "no SQL yet"}</span>
+                      </span>
+                      {result ? (
+                        <Chip size="sm" color={result.ok ? "success" : "danger"} variant="soft">{result.ok ? `ok · ${formatMs(result.elapsedMs)}${result.rows !== null ? ` · ${result.rows} rows` : ""}` : "error"}</Chip>
+                      ) : null}
+                      <span className="flex flex-col">
+                        <IconButton icon="arrow-up" label="Move up" isDisabled={i === 0} onPress={() => move(i, -1)} size={12} />
+                        <IconButton icon="arrow-down" label="Move down" isDisabled={i === steps.length - 1} onPress={() => move(i, 1)} size={12} />
+                      </span>
+                    </Card.Content>
+                  </Card>
+                  {result && !result.ok && result.error ? (
+                    <Alert status="danger" className="mt-1 w-full rounded-xl text-xs">
+                      <Alert.Indicator />
+                      <Alert.Content>
+                        <Alert.Description className="selectable font-mono text-[11px]">{result.error}</Alert.Description>
+                      </Alert.Content>
+                    </Alert>
+                  ) : null}
+                  <div className="h-6 w-px bg-border/40" />
                 </div>
               );
             })}
-            <button type="button" onClick={addStep} className="flex size-14 items-center justify-center rounded-full bg-accent text-accent-foreground shadow-lg hover:brightness-110" aria-label="Add step">
+            <Button
+              isIconOnly
+              onPress={addStep}
+              className="flex size-14 min-w-14 items-center justify-center rounded-full bg-accent text-accent-foreground shadow-lg hover:brightness-110"
+              aria-label="Add step"
+            >
               <Icon name="plus" size={22} />
-            </button>
+            </Button>
           </div>
-        </div>
+        </ScrollShadow>
       </div>
       {selected ? (
         <aside className="flex w-[420px] shrink-0 flex-col border-l border-border bg-surface">

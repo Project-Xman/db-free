@@ -1,6 +1,7 @@
 // SOT: form-fields, text-field, select-field, toggle-field, segmented-control, checkbox-field
 import type { ReactNode } from "react";
 import {
+  Button,
   Checkbox as HeroCheckbox,
   Description,
   Input,
@@ -143,10 +144,10 @@ export function Toggle({ checked, onChange, label, description }: ToggleProps) {
         </Switch.Content>
       </Switch>
       {label.length > 0 || description ? (
-        <button type="button" onClick={() => onChange(!checked)} className="min-w-0 text-left">
+        <Button variant="ghost" size="sm" onPress={() => onChange(!checked)} className="h-auto min-w-0 p-0 text-left bg-transparent hover:bg-transparent font-normal">
           {label.length > 0 ? <span className="block text-[13px] text-foreground">{label}</span> : null}
           {description ? <span className="block text-xs text-muted">{description}</span> : null}
-        </button>
+        </Button>
       ) : null}
     </div>
   );

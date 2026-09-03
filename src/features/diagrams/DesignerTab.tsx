@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Background, Controls, MiniMap, ReactFlow, addEdge, type Connection, type Edge, type Node, useEdgesState, useNodesState, MarkerType } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Button, Modal } from "@heroui/react";
+import { Button, Input, Modal } from "@heroui/react";
 import type { DiagramBody, DiagramColumn, DiagramTable, Document } from "@/lib/bindings";
 import { normalizeError } from "@/lib/ipc";
 import { useWorkspace } from "@/stores/workspace";
@@ -19,7 +19,7 @@ function newId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${idCounter}`;
 }
 
-// WHAT:  Free-form schema designer (DB Pro "Schema Diagrams"): add tables and
+// WHAT:  Free-form schema designer (DB Manager "Schema Diagrams"): add tables and
 //        columns, drag to arrange, draw relations by connecting column handles,
 //        preview the DDL, save the document.
 // HOW:   The document body is the source of truth; React Flow state is derived
@@ -92,7 +92,15 @@ export function DesignerTab({ document: doc }: { document: Document }) {
   return (
     <div className="relative flex h-full min-h-0 flex-col">
       <div className="flex h-11 shrink-0 items-center gap-1 border-b border-border bg-surface px-2">
-        <input value={name} onChange={(e) => { setName(e.target.value); setDirty(true); }} className="h-7 w-48 rounded-md border border-transparent bg-transparent px-2 text-sm text-foreground hover:border-border focus:border-accent focus:outline-none" aria-label="Diagram name" />
+        <Input
+          value={name}
+          onChange={(e) => {
+            setName(e.target.value);
+            setDirty(true);
+          }}
+          className="h-7 w-48 rounded-md bg-transparent text-sm text-foreground"
+          aria-label="Diagram name"
+        />
         <IconButton icon="plus" label="Add table" onPress={addTable} />
         <IconButton icon="trash" label="Remove selected tables" onPress={removeSelected} />
         <IconButton icon="pencil" label="Edit selected table" onPress={() => { const sel = nodes.find((n) => n.selected); const t = sel ? tables.find((x) => x.id === sel.id) : undefined; if (t) setEditing(t); }} />

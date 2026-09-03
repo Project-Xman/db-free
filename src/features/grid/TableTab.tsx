@@ -1,6 +1,6 @@
 // SOT: table-tab, table-toolbar, page-based-browsing, sort-state, export-copy, row-inspector, insert-row-flow, delete-rows-flow, cell-edit-staging, foreign-key-traversal
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Button, Dropdown, Label, Modal, Separator, Tooltip } from "@heroui/react";
+import { Button, Chip, CloseButton, Dropdown, Label, Modal, ScrollShadow, Separator, Tooltip } from "@heroui/react";
 import type { CellValue, ColumnInfo, FilterRule, ForeignKey, SortRule, StagedChange, TablePage, TableRef, Value } from "@/lib/bindings";
 import type { JsonValue } from "@/lib/bindings/serde_json/JsonValue";
 import { ipc, normalizeError } from "@/lib/ipc";
@@ -13,7 +13,9 @@ import { AppSelect, Field } from "@/components/global/Field";
 import { IconButton } from "@/components/global/Button";
 import { EmptyState } from "@/components/global/EmptyState";
 import { Segmented } from "@/components/global/Field";
+import { Resizer } from "@/components/global/Resizer";
 import { Icon } from "@/lib/icons";
+import { cn } from "@/lib/cn";
 
 const PAGE_SIZES = [
   { value: "50", label: "50 rows" },
@@ -226,30 +228,30 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-11 shrink-0 items-center gap-1 overflow-x-auto border-b border-border bg-surface px-2 [scrollbar-width:none]">
+      <div className="flex h-11 shrink-0 items-center gap-1.5 overflow-x-auto border-b border-border/40 glass-header px-3 [scrollbar-width:none]">
         <Tooltip delay={300}>
-          <Button size="sm" isDisabled={!editable || columns.length === 0} onPress={() => setInsertOpen(true)}>
-            <Icon name="plus" size={13} />
+          <Button size="sm" isDisabled={!editable || columns.length === 0} onPress={() => setInsertOpen(true)} className="glass-pill text-foreground liquid-hover">
+            <Icon name="plus" size={13} className="text-accent" />
             Insert
           </Button>
           <Tooltip.Content>{readOnly ? "Connection is read-only." : editable ? "Insert a row" : "Editing is only available for SQL engines."}</Tooltip.Content>
         </Tooltip>
-        <Button size="sm" variant="ghost" className="text-muted" onPress={() => setRefresh((r) => r + 1)}>
+        <Button size="sm" variant="ghost" className="text-muted hover:bg-surface-secondary/70 hover:text-foreground liquid-hover rounded-lg" onPress={() => setRefresh((r) => r + 1)}>
           <Icon name="refresh" size={13} />
           Refresh
         </Button>
         <FilterPopover columns={columns} filters={filters} onApply={(next) => { setPageIndex(0); setFilters(next); }} />
-        <Button size="sm" variant={sort.length > 0 ? "primary" : "ghost"} className={sort.length > 0 ? "" : "text-muted"} onPress={() => setSort([])} isDisabled={sort.length === 0}>
+        <Button size="sm" variant={sort.length > 0 ? "primary" : "ghost"} className={cn("rounded-lg liquid-hover", sort.length > 0 ? "glass-pill text-accent" : "text-muted hover:bg-surface-secondary/70 hover:text-foreground")} onPress={() => setSort([])} isDisabled={sort.length === 0}>
           <Icon name="sort" size={13} />
           {sort.length > 0 ? `Sorted by ${sort.length} rule` : "Sort"}
         </Button>
         <Dropdown>
-          <Button size="sm" variant="ghost" className="text-muted" isDisabled={rows.length === 0}>
+          <Button size="sm" variant="ghost" className="text-muted hover:bg-surface-secondary/70 hover:text-foreground liquid-hover rounded-lg" isDisabled={rows.length === 0}>
             <Icon name="download" size={13} />
             Export
             <Icon name="chevron-down" size={12} />
           </Button>
-          <Dropdown.Popover>
+          <Dropdown.Popover className="glass-modal rounded-xl">
             <Dropdown.Menu onAction={(key) => void copyAs(String(key) === "json" ? "json" : "csv")}>
               <Dropdown.Item id="csv" textValue="Copy as CSV"><Label>Copy {selectedRows.size > 0 ? "selection" : "page"} as CSV</Label></Dropdown.Item>
               <Dropdown.Item id="json" textValue="Copy as JSON"><Label>Copy {selectedRows.size > 0 ? "selection" : "page"} as JSON</Label></Dropdown.Item>
@@ -257,25 +259,31 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
           </Dropdown.Popover>
         </Dropdown>
         {selectedRows.size > 0 && editable ? (
-          <Button size="sm" variant="danger-soft" onPress={deleteSelected}>
+          <Button size="sm" variant="danger-soft" className="rounded-lg liquid-hover" onPress={deleteSelected}>
             <Icon name="trash" size={13} />
             Delete {selectedRows.size}
           </Button>
         ) : null}
 
-        <div className="ml-auto flex shrink-0 items-center gap-1.5 text-xs whitespace-nowrap text-muted">
-          {loading ? <span className="text-accent">loading…</span> : null}
-          {selectedRows.size > 0 ? <span>{selectedRows.size} selected</span> : null}
+        <div className="ml-auto flex shrink-0 items-center gap-2 text-xs whitespace-nowrap text-muted">
+          {loading ? <span className="text-accent font-medium">loading…</span> : null}
+          {selectedRows.size > 0 ? (
+            <Chip size="sm" variant="soft" color="accent" className="font-medium">
+              {selectedRows.size} selected
+            </Chip>
+          ) : null}
           <IconButton icon="columns" label={cell ? "Hide inspector" : "Inspect selected cell"} active={cell !== null} isDisabled={cell === null} onPress={() => setCell(null)} />
-          <Separator orientation="vertical" className="mx-1 h-5" />
-          <IconButton icon="chevron-left" label="Previous page" isDisabled={pageIndex === 0} onPress={() => setPageIndex((p) => Math.max(0, p - 1))} />
-          <span className="px-1 tabular-nums text-foreground">
-            {pageIndex + 1}
-            <span className="text-muted"> of {pageCount ?? "…"}</span>
-          </span>
-          <IconButton icon="chevron-right" label="Next page" isDisabled={!hasNext} onPress={() => setPageIndex((p) => p + 1)} />
-          <AppSelect ariaLabel="Rows per page" value={pageSize} options={PAGE_SIZES} size="sm" className="w-28 shrink-0" onChange={(v) => { setPageIndex(0); setPageSize(v); }} />
-          <span className="min-w-16 text-right tabular-nums">{total !== null ? `${page?.totalExact ? "" : "≈ "}${formatCount(total)} rows` : `${formatCount(rows.length)} rows`}</span>
+          <Separator orientation="vertical" className="mx-0.5 h-4 opacity-50" />
+          <div className="flex items-center gap-1 rounded-lg glass-pill px-1.5 py-0.5">
+            <IconButton icon="chevron-left" label="Previous page" isDisabled={pageIndex === 0} onPress={() => setPageIndex((p) => Math.max(0, p - 1))} size={13} className="size-5 min-w-5" />
+            <span className="px-1 tabular-nums font-mono text-[11px] text-foreground">
+              {pageIndex + 1}
+              <span className="text-muted"> / {pageCount ?? "…"}</span>
+            </span>
+            <IconButton icon="chevron-right" label="Next page" isDisabled={!hasNext} onPress={() => setPageIndex((p) => p + 1)} size={13} className="size-5 min-w-5" />
+          </div>
+          <AppSelect ariaLabel="Rows per page" value={pageSize} options={PAGE_SIZES} size="sm" className="w-24 shrink-0" onChange={(v) => { setPageIndex(0); setPageSize(v); }} />
+          <span className="min-w-16 text-right tabular-nums font-mono text-[11px] text-muted">{total !== null ? `${page?.totalExact ? "" : "≈ "}${formatCount(total)} rows` : `${formatCount(rows.length)} rows`}</span>
         </div>
       </div>
 
@@ -383,19 +391,43 @@ function RecordInspector({ columns, row, column, value, table, tabs, activeTab, 
   const current = tabs.includes(activeTab) ? activeTab : (tabs[0] ?? "fields");
   const record = Object.fromEntries(columns.map((c, i) => [c.name, plainValue(row[i])]));
   const insertSql = `INSERT INTO ${table.schema ? `"${table.schema}".` : ""}"${table.name}" (${columns.map((c) => `"${c.name}"`).join(", ")})\nVALUES (${row.map((v) => sqlLiteral(v)).join(", ")});`;
+  const [width, setWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem("db-free:inspector-width");
+      return saved ? Math.max(260, Math.min(650, Number(saved))) : 384;
+    } catch {
+      return 384;
+    }
+  });
+
+  const handleResize = useCallback((delta: number) => {
+    setWidth((prev) => {
+      const next = Math.max(260, Math.min(650, prev - delta));
+      try {
+        localStorage.setItem("db-free:inspector-width", String(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
+
   return (
-    <aside className="flex w-96 shrink-0 flex-col border-l border-border bg-surface">
-      <div className="flex h-9 items-center gap-2 border-b border-border px-3 text-xs">
-        <span className="truncate font-medium text-foreground">{column.name}</span>
-        <span className="font-mono text-muted">{column.dataType}</span>
+    <aside className="relative flex shrink-0 flex-col border-l border-border/40 glass-sidebar select-none" style={{ width }}>
+      <Resizer direction="horizontal" onResize={handleResize} className="absolute -left-1 top-0 bottom-0" />
+      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border/40 glass-header px-3 text-xs">
+        <span className="truncate font-semibold text-foreground tracking-tight">{column.name}</span>
+        <Chip size="sm" variant="soft" className="font-mono text-[10px]">
+          {column.dataType}
+        </Chip>
         <span className="ml-auto">
-          <IconButton icon="x" label="Close inspector" onPress={onClose} />
+          <CloseButton onPress={onClose} aria-label="Close inspector" />
         </span>
       </div>
       <div className="px-3 py-2">
         <Segmented label="Inspector tab" value={current} onChange={onTab} options={tabs.map((t) => ({ value: t, label: t.toUpperCase() }))} />
       </div>
-      <div className="min-h-0 flex-1 overflow-auto">
+      <ScrollShadow className="min-h-0 flex-1">
         {current === "fields" ? (
           <dl className="px-3 pb-3 text-xs">
             {columns.map((c, i) => (
@@ -412,7 +444,7 @@ function RecordInspector({ columns, row, column, value, table, tabs, activeTab, 
         ) : (
           <pre className="selectable p-3 font-mono text-[11px] whitespace-pre-wrap text-foreground">{inspectorBody(value)}</pre>
         )}
-      </div>
+      </ScrollShadow>
     </aside>
   );
 }

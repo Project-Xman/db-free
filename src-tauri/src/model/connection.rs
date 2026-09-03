@@ -16,10 +16,17 @@ pub enum Engine {
     Postgres,
     Mysql,
     Mariadb,
-    Sqlite,
+    Mssql,
     Clickhouse,
     Redis,
     Mongodb,
+    Libsql,
+    ValTown,
+    CloudflareD1,
+    Supabase,
+    Planetscale,
+    Neon,
+    Sqlite,
 }
 
 // WHAT:  Storage model of an engine; drives which UI affordances make sense.
@@ -34,19 +41,36 @@ pub enum EngineKind {
 }
 
 impl Engine {
-    pub const ALL: [Engine; 7] = [
+    pub const ALL: [Engine; 14] = [
         Engine::Postgres,
         Engine::Mysql,
         Engine::Mariadb,
-        Engine::Sqlite,
+        Engine::Mssql,
         Engine::Clickhouse,
         Engine::Redis,
         Engine::Mongodb,
+        Engine::Libsql,
+        Engine::ValTown,
+        Engine::CloudflareD1,
+        Engine::Supabase,
+        Engine::Planetscale,
+        Engine::Neon,
+        Engine::Sqlite,
     ];
 
     pub fn kind(self) -> EngineKind {
         match self {
-            Engine::Postgres | Engine::Mysql | Engine::Mariadb | Engine::Sqlite => EngineKind::Relational,
+            Engine::Postgres
+            | Engine::Mysql
+            | Engine::Mariadb
+            | Engine::Mssql
+            | Engine::Sqlite
+            | Engine::Libsql
+            | Engine::ValTown
+            | Engine::CloudflareD1
+            | Engine::Supabase
+            | Engine::Planetscale
+            | Engine::Neon => EngineKind::Relational,
             Engine::Clickhouse => EngineKind::Analytical,
             Engine::Mongodb => EngineKind::Document,
             Engine::Redis => EngineKind::KeyValue,
@@ -58,10 +82,17 @@ impl Engine {
             Engine::Postgres => "postgres",
             Engine::Mysql => "mysql",
             Engine::Mariadb => "mariadb",
+            Engine::Mssql => "mssql",
             Engine::Sqlite => "sqlite",
             Engine::Clickhouse => "clickhouse",
             Engine::Redis => "redis",
             Engine::Mongodb => "mongodb",
+            Engine::Libsql => "libsql",
+            Engine::ValTown => "val_town",
+            Engine::CloudflareD1 => "cloudflare_d1",
+            Engine::Supabase => "supabase",
+            Engine::Planetscale => "planetscale",
+            Engine::Neon => "neon",
         }
     }
 
@@ -73,14 +104,19 @@ impl Engine {
         matches!(self, Engine::Sqlite)
     }
 
+    pub fn is_http_token_based(self) -> bool {
+        matches!(self, Engine::Libsql | Engine::ValTown | Engine::CloudflareD1)
+    }
+
     pub fn default_port(self) -> Option<u16> {
         match self {
-            Engine::Postgres => Some(5432),
-            Engine::Mysql | Engine::Mariadb => Some(3306),
-            Engine::Sqlite => None,
+            Engine::Postgres | Engine::Supabase | Engine::Neon => Some(5432),
+            Engine::Mysql | Engine::Mariadb | Engine::Planetscale => Some(3306),
+            Engine::Mssql => Some(1433),
             Engine::Clickhouse => Some(8123),
             Engine::Redis => Some(6379),
             Engine::Mongodb => Some(27017),
+            Engine::Sqlite | Engine::Libsql | Engine::ValTown | Engine::CloudflareD1 => None,
         }
     }
 }
@@ -183,6 +219,19 @@ impl ConnectionInput {
         if self.engine.is_file_based() {
             if self.file_path.as_deref().map(str::trim).unwrap_or_default().is_empty() {
                 return Err(AppError::invalid_input("A database file path is required."));
+            }
+        } else if self.engine.is_http_token_based() {
+            if self.engine == Engine::Libsql {
+                if self.host.as_deref().map(str::trim).unwrap_or_default().is_empty() {
+                    return Err(AppError::invalid_input("Turso database URL or host is required."));
+                }
+            } else if self.engine == Engine::CloudflareD1 {
+                if self.host.as_deref().map(str::trim).unwrap_or_default().is_empty() {
+                    return Err(AppError::invalid_input("Cloudflare Account ID is required in the host field."));
+                }
+                if self.database.as_deref().map(str::trim).unwrap_or_default().is_empty() {
+                    return Err(AppError::invalid_input("Cloudflare Database ID is required in the database field."));
+                }
             }
         } else {
             if self.host.as_deref().map(str::trim).unwrap_or_default().is_empty() {

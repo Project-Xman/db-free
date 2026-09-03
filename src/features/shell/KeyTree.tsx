@@ -1,5 +1,6 @@
 // SOT: key-tree, redis-key-grouping, key-namespace-folders
 import { useMemo, useState } from "react";
+import { Button, Chip } from "@heroui/react";
 import type { TableInfo, TableRef } from "@/lib/bindings";
 import { useWorkspace } from "@/stores/workspace";
 import { Icon } from "@/lib/icons";
@@ -15,7 +16,7 @@ interface KeyNode {
 }
 
 // WHAT:  Redis keys grouped by `:` into collapsible folders with key counts
-//        (DB Pro layout): `bull:queue:1` → bull › queue › 1.
+//        (DB Manager layout): `bull:queue:1` → bull › queue › 1.
 // HOW:   Builds a trie from the flat key list every render of the catalog;
 //        folders collapse by default, click a leaf to open the key tab.
 export function KeyTree({ connectionId, keys }: { connectionId: string; keys: TableInfo[] }) {
@@ -64,27 +65,39 @@ function KeyRow({ connectionId, node, depth }: { connectionId: string; node: Key
       <div
         className={cn("group flex h-8 cursor-default items-center gap-1 pr-2 text-[13px]", active ? "bg-surface-tertiary text-foreground" : "text-muted hover:bg-surface-secondary hover:text-foreground")}
         style={{ paddingLeft: 8 + depth * 16 }}
+        title={node.path}
       >
         {hasChildren ? (
-          <button type="button" onClick={() => setOpen((v) => !v)} aria-label={open ? "Collapse" : "Expand"} className="flex size-5 items-center justify-center rounded-sm text-muted hover:text-foreground">
+          <Button
+            isIconOnly
+            variant="ghost"
+            size="sm"
+            onPress={() => setOpen((v) => !v)}
+            aria-label={open ? "Collapse" : "Expand"}
+            className="flex size-5 min-w-5 p-0 items-center justify-center rounded-sm text-muted hover:text-foreground"
+          >
             <Icon name={open ? "chevron-down" : "chevron-right"} size={12} />
-          </button>
+          </Button>
         ) : (
           <span className="size-5" />
         )}
-        <button
-          type="button"
-          onClick={() => {
+        <Button
+          variant="ghost"
+          size="sm"
+          onPress={() => {
             if (ref) openTable(connectionId, ref);
             else setOpen((v) => !v);
           }}
-          className="flex min-w-0 flex-1 items-center gap-2 text-left"
-          title={node.path}
+          className="flex h-auto min-w-0 flex-1 items-center justify-start gap-2 p-0 text-left bg-transparent hover:bg-transparent"
         >
           <Icon name={hasChildren && !isKey ? "folder" : isKey && hasChildren ? "folder" : "hash"} size={13} className={cn("shrink-0", isKey ? "text-accent" : "")} />
           <span className="truncate">{node.name.length > 0 ? node.name : "(empty)"}</span>
-          <span className="ml-1 shrink-0 text-[10px] text-muted">{hasChildren ? `${node.count} key${node.count === 1 ? "" : "s"}` : ""}</span>
-        </button>
+          {hasChildren ? (
+            <Chip size="sm" variant="soft" className="ml-auto font-mono text-[9px]">
+              {node.count}
+            </Chip>
+          ) : null}
+        </Button>
       </div>
       {open && hasChildren ? (
         <ul>

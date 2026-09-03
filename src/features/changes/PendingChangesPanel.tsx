@@ -1,12 +1,13 @@
 // SOT: pending-changes-panel, review-mode-ui, commit-flow, visual-diff
-import { useEffect, useState } from "react";
-import { Button, Kbd } from "@heroui/react";
+import { useCallback, useEffect, useState } from "react";
+import { Button, Card, Chip, CloseButton, Kbd, ScrollShadow } from "@heroui/react";
 import type { ChangePreview, StagedChange, Value } from "@/lib/bindings";
 import { ipc, normalizeError } from "@/lib/ipc";
 import { formatCell } from "@/lib/format";
 import { tableKey, useWorkspace } from "@/stores/workspace";
 import { Segmented } from "@/components/global/Field";
 import { IconButton } from "@/components/global/Button";
+import { Resizer } from "@/components/global/Resizer";
 import { Icon } from "@/lib/icons";
 import { cn } from "@/lib/cn";
 
@@ -29,6 +30,27 @@ export function PendingChangesPanel({ connectionId }: { connectionId: string }) 
   const [loadedPreview, setPreview] = useState<ChangePreview | null>(null);
   const preview = changes.length === 0 ? null : loadedPreview;
   const [committing, setCommitting] = useState(false);
+  const [width, setWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem("db-free:changes-panel-width");
+      return saved ? Math.max(280, Math.min(750, Number(saved))) : 400;
+    } catch {
+      return 400;
+    }
+  });
+
+  const handleResize = useCallback((delta: number) => {
+    setWidth((prev) => {
+      // Dragging left (negative delta) expands panel width
+      const next = Math.max(280, Math.min(750, prev - delta));
+      try {
+        localStorage.setItem("db-free:changes-panel-width", String(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     const token = { cancelled: false };
@@ -74,64 +96,75 @@ export function PendingChangesPanel({ connectionId }: { connectionId: string }) 
   }, [changes, connectionId]);
 
   return (
-    <aside className="flex w-[400px] shrink-0 flex-col border-l border-border bg-surface">
-      <div className="flex h-10 shrink-0 items-center gap-2 border-b border-border px-3">
-        <span className="text-sm font-medium text-foreground">Pending Changes</span>
+    <aside className="relative flex shrink-0 flex-col glass-sidebar select-none" style={{ width }}>
+      <Resizer direction="horizontal" onResize={handleResize} className="absolute -left-1 top-0 bottom-0" />
+      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border/40 glass-header px-3">
+        <span className="text-sm font-semibold text-foreground tracking-tight">Pending Changes</span>
         <span className="ml-auto">
-          <IconButton icon="chevron-right" label="Hide panel" onPress={() => setOpen(false)} />
+          <CloseButton onPress={() => setOpen(false)} aria-label="Hide panel" />
         </span>
       </div>
       <div className="px-3 py-2">
         <Segmented label="Changes view" value={view} onChange={setView} options={[{ value: "visual", label: "Visual" }, { value: "sql", label: "SQL" }]} />
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3">
+      <ScrollShadow className="min-h-0 flex-1 px-3 pb-3">
         {changes.length === 0 ? (
-          <p className="py-6 text-center text-xs text-muted">No pending changes. Double-click a cell to edit, use Insert, or select rows and Delete.</p>
+          <p className="py-8 text-center text-xs text-muted">No pending changes. Double-click a cell to edit, use Insert, or select rows and Delete.</p>
         ) : view === "sql" ? (
-          <pre className="selectable rounded-md bg-background p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-foreground">{preview?.script ?? "…"}</pre>
+          <pre className="selectable rounded-xl glass-card p-3.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-foreground">{preview?.script ?? "…"}</pre>
         ) : (
-          <ul className="flex flex-col gap-2">
-            {changes.map((c, i) => (
-              <li key={c.id} className="rounded-lg border border-border bg-background p-2">
-                <div className="flex items-center gap-2 text-xs">
-                  <span className={cn("flex size-5 items-center justify-center rounded text-[10px] font-bold", c.kind === "update" ? "bg-warning-soft text-warning" : c.kind === "insert" ? "bg-success-soft text-success" : "bg-danger-soft text-danger")}>
-                    {c.kind === "update" ? "U" : c.kind === "insert" ? "I" : "D"}
-                  </span>
-                  <span className="truncate text-foreground">{tableKey(c.table)}</span>
-                  <Icon name="chevron-right" size={11} className="text-muted" />
-                  <span className="truncate text-muted">{describeKey(c)}</span>
-                  {c.kind === "update" ? (
-                    <>
+          <ul className="flex flex-col gap-2.5">
+            {changes.map((c) => (
+              <li key={c.id}>
+                <Card className="rounded-xl glass-card border-border/40 p-3 shadow-xs">
+                  <Card.Content className="p-0">
+                    <div className="flex items-center gap-2 text-xs">
+                      <Chip size="sm" variant="soft" color={c.kind === "update" ? "warning" : c.kind === "insert" ? "success" : "danger"} className="font-bold text-[10px] size-5 min-w-5 p-0 justify-center">
+                        {c.kind === "update" ? "U" : c.kind === "insert" ? "I" : "D"}
+                      </Chip>
+                      <span className="truncate font-medium text-foreground">{tableKey(c.table)}</span>
                       <Icon name="chevron-right" size={11} className="text-muted" />
-                      <span className="truncate text-muted">{c.column}</span>
-                    </>
-                  ) : null}
-                  <span className="ml-auto">
-                    <IconButton icon="refresh" label="Undo this change" onPress={() => unstage(connectionId, c.id)} />
-                  </span>
-                </div>
-                <div className="mt-2 flex flex-col gap-1 font-mono text-[11px]">
-                  {c.kind === "update" ? (
-                    <>
-                      <Diff sign="-" tone="danger" text={cell(c.old)} />
-                      <Diff sign="+" tone="success" text={cell(c.new)} />
-                    </>
-                  ) : c.kind === "insert" ? (
-                    c.values.map((v) => <Diff key={v.column} sign="+" tone="success" text={`${v.column} = ${cell(v.value)}`} />)
-                  ) : (
-                    <Diff sign="-" tone="danger" text={preview?.statements[i] ?? "DELETE row"} />
-                  )}
-                </div>
+                      <span className="truncate text-muted">{describeKey(c)}</span>
+                      {c.kind === "update" ? (
+                        <>
+                          <Icon name="chevron-right" size={11} className="text-muted" />
+                          <span className="truncate text-muted">{c.column}</span>
+                        </>
+                      ) : null}
+                      <span className="ml-auto">
+                        <IconButton icon="refresh" label="Undo this change" onPress={() => unstage(connectionId, c.id)} />
+                      </span>
+                    </div>
+                    <div className="mt-2 flex flex-col gap-1 font-mono text-[11px]">
+                      {c.kind === "update" ? (
+                        <>
+                          <Diff sign="-" tone="danger" text={cell(c.old)} />
+                          <Diff sign="+" tone="success" text={cell(c.new)} />
+                        </>
+                      ) : c.kind === "insert" ? (
+                        c.values.map((v) => <Diff key={v.column} sign="+" tone="success" text={`${v.column} = ${cell(v.value)}`} />)
+                      ) : (
+                        <Diff sign="-" tone="danger" text={describeKey(c)} />
+                      )}
+                    </div>
+                  </Card.Content>
+                </Card>
               </li>
             ))}
           </ul>
         )}
-      </div>
-      <div className="flex shrink-0 items-center gap-2 border-t border-border px-3 py-2">
-        <Button size="sm" variant="ghost" className="text-muted" onPress={() => clearChanges(connectionId)} isDisabled={changes.length === 0}>
+      </ScrollShadow>
+      <div className="flex shrink-0 items-center gap-2 border-t border-border/40 glass-header p-3">
+        <Button size="sm" variant="ghost" className="rounded-lg text-muted hover:bg-surface-secondary/70 hover:text-foreground liquid-hover" onPress={() => clearChanges(connectionId)} isDisabled={changes.length === 0}>
           Clear All
         </Button>
-        <Button size="sm" className="ml-auto" isPending={committing} onPress={() => void commit()} isDisabled={changes.length === 0}>
+        <Button
+          size="sm"
+          className="flex-1 rounded-xl glass-pill bg-accent text-accent-foreground font-semibold shadow-xs liquid-hover"
+          isPending={committing}
+          onPress={() => void commit()}
+          isDisabled={changes.length === 0}
+        >
           Commit All ({changes.length})
           <Kbd className="ml-1 text-[10px]">
             <Kbd.Abbr keyValue="command" />

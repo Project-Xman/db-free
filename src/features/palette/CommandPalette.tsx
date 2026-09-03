@@ -1,6 +1,6 @@
 // SOT: command-palette, cmd-k, quick-actions
 import { useEffect, useMemo, useState } from "react";
-import { Kbd, ListBox, Modal, SearchField } from "@heroui/react";
+import { Chip, Kbd, ListBox, Modal, ScrollShadow, SearchField } from "@heroui/react";
 import { tableKey, useActiveConnection, useWorkspace } from "@/stores/workspace";
 import { Icon, type IconName } from "@/lib/icons";
 import { engineMeta } from "@/lib/engines";
@@ -53,6 +53,7 @@ export function CommandPalette() {
       list.push({ id: "history", section: "navigation", label: "Query history", icon: "history", run: () => s.openHistory(cid) });
       list.push({ id: "transfer", section: "navigation", label: "Export / Import", icon: "download", run: () => s.openTransfer(cid) });
       list.push({ id: "erd", section: "navigation", label: "ER diagram of current schema", icon: "view", run: () => s.openErd(cid, s.schemaFilter[cid] ?? null) });
+      list.push({ id: "chat", section: "navigation", label: "Chat with database", hint: "Ask questions, explore schema, generate queries", icon: "braces", run: () => s.openChat(cid) });
       list.push({ id: "tables", section: "navigation", label: "Tables sidebar", icon: "table", run: () => s.setSidebar("tables") });
       list.push({ id: "queries", section: "navigation", label: "Saved queries sidebar", icon: "file", run: () => s.setSidebar("queries") });
     }
@@ -83,41 +84,48 @@ export function CommandPalette() {
 
   return (
     <Modal isOpen={open} onOpenChange={setOpen}>
-      <Modal.Backdrop>
-        <Modal.Container className="items-start pt-[12vh]">
-          <Modal.Dialog className="w-full sm:max-w-[640px]">
-            <Modal.Body className="p-2">
+      <Modal.Backdrop className="backdrop-blur-md bg-backdrop/70">
+        <Modal.Container className="items-start pt-[14vh]">
+          <Modal.Dialog className="w-full sm:max-w-[620px] glass-modal rounded-2xl overflow-hidden shadow-2xl p-0 border border-border/60">
+            <Modal.Body className="p-3">
               <SearchField value={query} onChange={setQuery} aria-label="Search or run commands" autoFocus className="w-full">
-                <SearchField.Group className="w-full">
+                <SearchField.Group className="w-full glass-input rounded-xl bg-surface-secondary/40 px-3.5 h-11 border border-border/40">
                   <SearchField.SearchIcon />
-                  <SearchField.Input placeholder="Search or run commands…" className="w-full" />
+                  <SearchField.Input placeholder="Search commands, tables, queries…" className="w-full text-sm font-sans" />
                   <SearchField.ClearButton />
                 </SearchField.Group>
               </SearchField>
-              <ListBox
-                aria-label="Commands"
-                className="mt-2 max-h-[50vh] overflow-y-auto"
-                onAction={(key) => {
-                  const action = visible.find((a) => a.id === String(key));
-                  if (action) {
-                    setOpen(false);
-                    setQuery("");
-                    action.run();
-                  }
-                }}
-              >
-                {visible.map((a) => (
-                  <ListBox.Item key={a.id} id={a.id} textValue={a.label}>
-                    <Icon name={a.icon} size={14} className="mr-2 text-muted" />
-                    <span className="truncate">{a.label}</span>
-                    {a.hint ? <span className="ml-2 truncate text-xs text-muted">{a.hint}</span> : null}
-                    <span className="ml-auto text-[10px] uppercase tracking-wide text-muted">{a.section.replace("_", " ")}</span>
-                  </ListBox.Item>
-                ))}
-              </ListBox>
-              <div className="mt-2 flex items-center gap-2 px-2 text-[11px] text-muted">
-                <Kbd><Kbd.Abbr keyValue="enter" /></Kbd> run
-                <Kbd><Kbd.Abbr keyValue="escape" /></Kbd> close
+              <ScrollShadow className="mt-2 max-h-[50vh] p-1">
+                <ListBox
+                  aria-label="Commands"
+                  className="space-y-0.5"
+                  onAction={(key) => {
+                    const action = visible.find((a) => a.id === String(key));
+                    if (action) {
+                      setOpen(false);
+                      setQuery("");
+                      action.run();
+                    }
+                  }}
+                >
+                  {visible.map((a) => (
+                    <ListBox.Item key={a.id} id={a.id} textValue={a.label} className="flex items-center rounded-lg px-2.5 py-2 text-xs liquid-hover cursor-default">
+                      <Icon name={a.icon} size={15} className="mr-2.5 text-accent shrink-0" />
+                      <span className="truncate font-medium text-foreground">{a.label}</span>
+                      {a.hint ? <span className="ml-2 truncate font-mono text-[10.5px] text-muted/80">{a.hint}</span> : null}
+                      <Chip size="sm" variant="soft" className="ml-auto text-[9.5px] uppercase tracking-wider font-medium">
+                        {a.section.replace("_", " ")}
+                      </Chip>
+                    </ListBox.Item>
+                  ))}
+                </ListBox>
+              </ScrollShadow>
+              <div className="mt-2.5 flex items-center justify-between border-t border-border/40 px-2 pt-2 text-[11px] text-muted">
+                <div className="flex items-center gap-3">
+                  <span className="flex items-center gap-1"><Kbd><Kbd.Abbr keyValue="enter" /></Kbd> select</span>
+                  <span className="flex items-center gap-1"><Kbd><Kbd.Abbr keyValue="escape" /></Kbd> close</span>
+                </div>
+                <span className="font-mono text-[10px] text-muted/60">{visible.length} results</span>
               </div>
             </Modal.Body>
           </Modal.Dialog>

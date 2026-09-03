@@ -1,13 +1,12 @@
 // SOT: queries-panel, saved-queries-sidebar, recent-queries
 import { useEffect, useMemo, useState } from "react";
+import { Button, Chip, ScrollShadow } from "@heroui/react";
 import type { HistoryEntry } from "@/lib/bindings";
-import { ipc, normalizeError } from "@/lib/ipc";
+import { ipc } from "@/lib/ipc";
 import { useActiveConnection, useWorkspace } from "@/stores/workspace";
 import { IconButton } from "@/components/global/Button";
 import { Segmented } from "@/components/global/Field";
 import { Icon } from "@/lib/icons";
-import { isMac } from "@/components/global/Kbd";
-import { cn } from "@/lib/cn";
 import { ConnectionSwitcher } from "@/features/shell/ConnectionSwitcher";
 
 // WHAT:  Sidebar of saved queries (A-Z / Z-A) plus the most recent distinct
@@ -18,7 +17,6 @@ export function QueriesPanel() {
   const loadSavedQueries = useWorkspace((s) => s.loadSavedQueries);
   const deleteSavedQuery = useWorkspace((s) => s.deleteSavedQuery);
   const openQuery = useWorkspace((s) => s.openQuery);
-  const showError = useWorkspace((s) => s.showError);
   const [order, setOrder] = useState<"az" | "za">("az");
   const [recent, setRecent] = useState<HistoryEntry[]>([]);
 
@@ -30,72 +28,89 @@ export function QueriesPanel() {
         const rows = await ipc("list_history", { connectionId: connection.id, origin: "user", limit: 200 });
         if (token.cancelled) return;
         const seen = new Set<string>();
-        setRecent(rows.filter((r) => (seen.has(r.sql) ? false : (seen.add(r.sql), true))).slice(0, 8));
-      } catch (raw) {
-        if (!token.cancelled) showError(normalizeError(raw));
+        const deduped: HistoryEntry[] = [];
+        for (const r of rows) {
+          const key = r.sql.trim();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          deduped.push(r);
+          if (deduped.length >= 20) break;
+        }
+        setRecent(deduped);
+      } catch {
+        // history unavailable; not fatal
       }
     })();
     return () => {
       token.cancelled = true;
     };
-  }, [connection, showError]);
+  }, [connection]);
 
+  const cid = connection?.id;
   const sorted = useMemo(() => {
-    const list = savedQueries.filter((q) => q.connectionId === null || q.connectionId === connection?.id);
-    return [...list].sort((a, b) => (order === "az" ? a.name.localeCompare(b.name) : b.name.localeCompare(a.name)));
-  }, [savedQueries, order, connection]);
+    const copy = [...savedQueries];
+    copy.sort((a, b) => a.name.localeCompare(b.name));
+    if (order === "za") copy.reverse();
+    return copy;
+  }, [savedQueries, order]);
 
-  if (!connection) return null;
-  const cid = connection.id;
+  if (!cid) return null;
 
   return (
-    <aside className="flex w-[280px] shrink-0 flex-col border-r border-border bg-surface">
-      <div className={cn("drag-region flex h-10 shrink-0 items-center gap-1 pr-2", isMac() ? "pl-9" : "pl-3")} data-tauri-drag-region>
+    <aside className="flex h-full w-full flex-col glass-sidebar select-none">
+      <div className="flex h-11 shrink-0 items-center justify-between border-b border-border/40 glass-header px-3">
         <ConnectionSwitcher caption="Saved queries" />
-        <div className="drag-region h-full min-w-4 flex-1" data-tauri-drag-region />
-        <span className="flex items-center">
+        <span className="flex items-center gap-0.5">
           <IconButton icon="refresh" label="Refresh" onPress={() => void loadSavedQueries()} />
           <IconButton icon="plus" label="New query" onPress={() => openQuery(cid)} />
         </span>
       </div>
-      <div className="px-3 pb-2">
+      <div className="px-3 py-2">
         <Segmented label="Sort" value={order} onChange={setOrder} options={[{ value: "az", label: "A-Z" }, { value: "za", label: "Z-A" }]} />
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <ScrollShadow className="min-h-0 flex-1 px-1.5 py-1">
         {sorted.length === 0 ? <p className="px-3 py-2 text-xs text-muted">No saved queries yet. Use Save in a query tab.</p> : null}
         {sorted.map((q) => (
-          <div key={q.id} className="group flex h-8 items-center gap-2 pr-2 pl-3 text-[13px] text-muted hover:bg-surface-secondary hover:text-foreground">
-            <button type="button" onClick={() => openQuery(cid, q.sql, q.name)} className="flex min-w-0 flex-1 items-center gap-2 text-left" title={q.sql}>
-              <Icon name="file" size={13} className="shrink-0" />
+          <div key={q.id} title={q.sql} className="group flex h-8 items-center gap-2 rounded-lg px-2 text-[12.5px] text-muted hover:bg-surface-secondary/70 hover:text-foreground liquid-hover">
+            <Button
+              variant="ghost"
+              size="sm"
+              onPress={() => openQuery(cid, q.sql, q.name)}
+              className="flex h-auto min-w-0 flex-1 items-center justify-start gap-2 p-0 text-left bg-transparent hover:bg-transparent"
+            >
+              <Icon name="file" size={13} className="shrink-0 text-accent" />
               <span className="truncate">{q.name}</span>
-              {q.tags.length > 0 ? <span className="ml-auto truncate text-[10px] text-muted">{q.tags.join(", ")}</span> : null}
-            </button>
-            <span className="opacity-0 group-hover:opacity-100">
+              {q.tags.length > 0 ? (
+                <Chip size="sm" variant="soft" className="ml-auto text-[10px]">
+                  {q.tags.join(", ")}
+                </Chip>
+              ) : null}
+            </Button>
+            <span className="opacity-0 group-hover:opacity-100 transition-opacity">
               <IconButton
                 icon="trash"
                 label="Delete saved query"
-                onPress={() => {
-                  void (async () => {
-                    try {
-                      await deleteSavedQuery(q.id);
-                    } catch (raw) {
-                      showError(normalizeError(raw));
-                    }
-                  })();
-                }}
+                onPress={() => void deleteSavedQuery(q.id)}
               />
             </span>
           </div>
         ))}
-        <div className="mt-3 px-3 pb-1 text-xs font-medium text-muted">Recent</div>
+        <div className="mt-3 px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted/80">Recent</div>
         {recent.length === 0 ? <p className="px-3 py-1 text-xs text-muted">Nothing run yet.</p> : null}
         {recent.map((r) => (
-          <button key={r.id} type="button" onClick={() => openQuery(cid, r.sql)} className="flex h-8 w-full items-center gap-2 px-3 text-left text-[12px] text-muted hover:bg-surface-secondary hover:text-foreground" title={r.sql}>
-            <Icon name="file" size={13} className="shrink-0" />
-            <span className="truncate font-mono">{r.sql.replace(/\s+/g, " ")}</span>
-          </button>
+          <div key={r.id} title={r.sql} className="w-full">
+            <Button
+              variant="ghost"
+              size="sm"
+              onPress={() => openQuery(cid, r.sql)}
+              className="flex h-7.5 w-full items-center justify-start gap-2 rounded-lg px-2 text-left text-[11.5px] text-muted hover:bg-surface-secondary/70 hover:text-foreground liquid-hover"
+            >
+              <Icon name="file" size={12} className="shrink-0 opacity-60" />
+              <span className="truncate font-mono">{r.sql.replace(/\s+/g, " ")}</span>
+            </Button>
+          </div>
         ))}
-      </div>
+      </ScrollShadow>
     </aside>
   );
 }

@@ -1,11 +1,11 @@
 // SOT: documents-panel, dashboards-sidebar, workflows-sidebar, diagrams-sidebar
 import { useEffect } from "react";
+import { Button, Chip, ScrollShadow } from "@heroui/react";
 import type { Document, DocumentBody, DocumentKind } from "@/lib/bindings";
 import { normalizeError } from "@/lib/ipc";
 import { useActiveConnection, useWorkspace } from "@/stores/workspace";
 import { IconButton } from "@/components/global/Button";
 import { Icon, type IconName } from "@/lib/icons";
-import { isMac } from "@/components/global/Kbd";
 import { cn } from "@/lib/cn";
 import { ConnectionSwitcher } from "@/features/shell/ConnectionSwitcher";
 
@@ -26,7 +26,7 @@ function emptyBody(kind: DocumentKind): DocumentBody {
   }
 }
 
-// WHAT:  Sidebar listing one document kind, grouped as "Untagged" like DB Pro.
+// WHAT:  Sidebar listing one document kind, grouped as "Untagged" like DB Manager.
 export function DocumentsPanel({ kind }: { kind: DocumentKind }) {
   const connection = useActiveConnection();
   const docs = useWorkspace((s) => s.documents[kind]);
@@ -60,30 +60,37 @@ export function DocumentsPanel({ kind }: { kind: DocumentKind }) {
   };
 
   return (
-    <aside className="flex w-[280px] shrink-0 flex-col border-r border-border bg-surface">
-      <div className={cn("drag-region flex h-10 shrink-0 items-center gap-1 pr-2", isMac() ? "pl-9" : "pl-3")} data-tauri-drag-region>
+    <aside className="flex h-full w-full min-w-0 flex-col glass-sidebar select-none">
+      <div className="drag-region flex h-11 shrink-0 items-center gap-1.5 px-3 border-b border-border/40" data-tauri-drag-region>
         <ConnectionSwitcher caption={meta.title} />
         <div className="drag-region h-full min-w-4 flex-1" data-tauri-drag-region />
-        <span className="flex items-center">
+        <span className="flex items-center gap-0.5">
           <IconButton icon="refresh" label="Refresh" onPress={() => void loadDocuments(kind)} />
           <IconButton icon="plus" label={`New ${kind}`} onPress={() => void create()} />
         </span>
       </div>
-      <div className="flex items-center px-3 py-1 text-xs text-muted">
+      <div className="flex items-center px-3.5 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted/80">
         <span>Untagged</span>
-        <span className="ml-auto">{docs.length}</span>
+        <Chip size="sm" variant="soft" className="ml-auto font-mono text-[9.5px]">
+          {docs.length}
+        </Chip>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        {docs.length === 0 ? <p className="px-3 py-2 text-xs text-muted">{meta.empty}</p> : null}
+      <ScrollShadow className="min-h-0 flex-1 px-1.5 py-1">
+        {docs.length === 0 ? <p className="px-3 py-4 text-xs text-muted">{meta.empty}</p> : null}
         {docs.map((d) => {
           const active = activeTabId === `doc:${kind}:${d.id}`;
           return (
-            <div key={d.id} className={cn("group flex h-8 items-center gap-2 pr-2 pl-3 text-[13px]", active ? "bg-surface-tertiary text-foreground" : "text-muted hover:bg-surface-secondary hover:text-foreground")}>
-              <button type="button" onClick={() => openDocument(kind, d.id, d.connectionId)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
-                <Icon name={meta.icon} size={13} className="shrink-0" />
-                <span className="truncate">{d.name}</span>
-              </button>
-              <span className="opacity-0 group-hover:opacity-100">
+            <div key={d.id} className={cn("group flex h-8 items-center gap-2 rounded-lg px-2 text-[12.5px] liquid-hover", active ? "glass-pill text-accent" : "text-muted hover:bg-surface-secondary/70 hover:text-foreground")}>
+              <Button
+                variant="ghost"
+                size="sm"
+                onPress={() => openDocument(kind, d.id, d.connectionId)}
+                className="flex h-auto min-w-0 flex-1 items-center justify-start gap-2 p-0 text-left bg-transparent hover:bg-transparent"
+              >
+                <Icon name={meta.icon} size={13} className={cn("shrink-0", active ? "text-accent" : "text-muted")} />
+                <span className="truncate font-medium">{d.name}</span>
+              </Button>
+              <span className="opacity-0 group-hover:opacity-100 transition-opacity">
                 <IconButton
                   icon="trash"
                   label="Delete"
@@ -101,7 +108,7 @@ export function DocumentsPanel({ kind }: { kind: DocumentKind }) {
             </div>
           );
         })}
-      </div>
+      </ScrollShadow>
     </aside>
   );
 }

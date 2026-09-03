@@ -24,7 +24,11 @@ export function IconButton({ icon, label, onPress, isDisabled = false, active = 
         variant={active ? "secondary" : "ghost"}
         isDisabled={isDisabled}
         {...(onPress ? { onPress } : {})}
-        className={cn("size-7 min-w-7 rounded-md", active ? "text-accent" : "text-muted", className)}
+        className={cn(
+          "size-7 min-w-7 rounded-lg liquid-hover",
+          active ? "glass-pill text-accent" : "text-muted hover:bg-surface-secondary/70 hover:text-foreground",
+          className,
+        )}
       >
         <Icon name={icon} size={size} />
       </Button>

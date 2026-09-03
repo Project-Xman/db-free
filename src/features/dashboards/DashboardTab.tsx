@@ -1,6 +1,6 @@
 // SOT: dashboard-tab, widget-grid, widget-editor, widget-options, widget-conditions-editor, dashboard-variables, dashboard-refresh
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Button, Spinner } from "@heroui/react";
+import { Button, CloseButton, Input, ScrollShadow, Spinner } from "@heroui/react";
 import type { ConditionOp, DashboardBody, Document, QueryOutcome, Widget, WidgetCondition, WidgetKind } from "@/lib/bindings";
 import { ipc, normalizeError } from "@/lib/ipc";
 import { DENSITIES, formatCount, formatMs } from "@/lib/format";
@@ -8,6 +8,7 @@ import { useWorkspace } from "@/stores/workspace";
 import { DataGrid } from "@/features/grid/DataGrid";
 import { AppSelect, Field, Toggle } from "@/components/global/Field";
 import { IconButton } from "@/components/global/Button";
+import { Resizer } from "@/components/global/Resizer";
 import { EmptyState } from "@/components/global/EmptyState";
 import { SqlEditor } from "@/features/editor/SqlEditor";
 import { Icon } from "@/lib/icons";
@@ -70,7 +71,7 @@ let widgetCounter = 0;
 //        dashboard's connection. Variables (`{{name}}`) substitute into SQL.
 // HOW:   Widget results are fetched through execute_query; the right panel edits
 //        the selected widget (title, kind, options, conditions, SQL) with Run Query
-//        and a result preview, mirroring DB Pro's editor.
+//        and a result preview, mirroring DB Manager's editor.
 // WHERE: src-tauri/src/model/documents.rs (DashboardBody), ./charts.tsx
 export function DashboardTab({ document: doc, connectionId: initialConnectionId }: { document: Document; connectionId: string | null }) {
   const saveDocument = useWorkspace((s) => s.saveDocument);
@@ -92,6 +93,26 @@ export function DashboardTab({ document: doc, connectionId: initialConnectionId 
   const [results, setResults] = useState<Record<string, QueryOutcome | null>>({});
   const [running, setRunning] = useState<Set<string>>(new Set());
   const [showVariables, setShowVariables] = useState(false);
+  const [panelWidth, setPanelWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem("db-free:dashboard-panel-width");
+      return saved ? Math.max(300, Math.min(750, Number(saved))) : 400;
+    } catch {
+      return 400;
+    }
+  });
+
+  const handlePanelResize = useCallback((delta: number) => {
+    setPanelWidth((prev) => {
+      const next = Math.max(300, Math.min(750, prev - delta));
+      try {
+        localStorage.setItem("db-free:dashboard-panel-width", String(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
 
   const patchBody = (partial: Partial<DashboardBody>) => {
     setBody((b) => ({ ...b, ...partial }));
@@ -186,7 +207,15 @@ export function DashboardTab({ document: doc, connectionId: initialConnectionId 
     <div className="flex h-full min-h-0">
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="flex h-11 shrink-0 items-center gap-1 overflow-x-auto border-b border-border bg-surface px-2 whitespace-nowrap [scrollbar-width:none]">
-          <input value={name} onChange={(e) => { setName(e.target.value); setDirty(true); }} className="h-7 w-40 shrink-0 rounded-md border border-transparent bg-transparent px-2 text-sm text-foreground hover:border-border focus:border-accent focus:outline-none" aria-label="Dashboard name" />
+          <Input
+            value={name}
+            onChange={(e) => {
+              setName(e.target.value);
+              setDirty(true);
+            }}
+            className="h-7 w-40 shrink-0 rounded-md bg-transparent text-sm text-foreground"
+            aria-label="Dashboard name"
+          />
           <AppSelect ariaLabel="Connection" value={connectionId ?? ""} options={[{ value: "", label: "— connection —" }, ...connections.map((c) => ({ value: c.id, label: c.name }))]} onChange={(v) => { setChosenConnectionId(v.length > 0 ? v : null); setDirty(true); }} size="sm" className="w-44 shrink-0" icon="database" />
           <Button size="sm" variant="ghost" className="text-muted" onPress={runAll} isDisabled={!connectionId}>
             <Icon name="refresh" size={13} />
@@ -223,7 +252,7 @@ export function DashboardTab({ document: doc, connectionId: initialConnectionId 
             <span className="text-[11px] text-muted">Use as {"{{name}}"} inside widget SQL.</span>
           </div>
         ) : null}
-        <div className="min-h-0 flex-1 overflow-auto p-4">
+        <ScrollShadow className="min-h-0 flex-1 p-4">
           {!connectionId ? (
             <EmptyState icon="columns" title="Pick a connection" body="Choose the connection widgets should query in the toolbar above." />
           ) : body.widgets.length === 0 ? (
@@ -251,12 +280,13 @@ export function DashboardTab({ document: doc, connectionId: initialConnectionId 
               ))}
             </div>
           )}
-        </div>
+        </ScrollShadow>
       </div>
 
       {selected ? (
-        <aside className="flex w-[400px] shrink-0 flex-col overflow-y-auto border-l border-border bg-surface">
-          <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+        <aside className="relative flex shrink-0 flex-col overflow-y-auto border-l border-border/40 glass-sidebar select-none" style={{ width: panelWidth }}>
+          <Resizer direction="horizontal" onResize={handlePanelResize} className="absolute -left-1 top-0 bottom-0" />
+          <div className="flex items-center gap-2 border-b border-border/40 px-3 py-2">
             <Field label="" value={selected.title} onChange={(title) => patchWidget(selected.id, { title })} placeholder="Widget title" className="[&_label]:hidden" />
             <AppSelect ariaLabel="Widget type" value={selected.kind} options={KINDS} onChange={(kind) => patchWidget(selected.id, { kind })} className="w-40 shrink-0" />
           </div>
@@ -353,7 +383,7 @@ function ConditionsEditor({ widget, onChange }: { widget: Widget; onChange: (c: 
             <Icon name="sort" size={12} className="text-muted" />
             <span className="text-[10px] font-medium tracking-wide text-muted uppercase">Condition {i + 1}</span>
             <span className="ml-auto">
-              <IconButton icon="x" label="Remove condition" onPress={() => onChange(widget.conditions.filter((_, j) => j !== i))} />
+              <CloseButton onPress={() => onChange(widget.conditions.filter((_, j) => j !== i))} aria-label="Remove condition" />
             </span>
           </div>
           <div className="flex items-center gap-2">

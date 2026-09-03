@@ -1,7 +1,6 @@
 // SOT: engine-registry, engine-labels, engine-presets, connection-string-parser, coming-soon-engines
 import type { ConnectionInput, Engine, SslMode } from "./bindings";
 import type { IconName } from "./icons";
-import { keysOf } from "./records";
 
 // WHAT:  UI metadata per engine, keyed by the Rust `Engine` enum.
 // WHY:   Adding an engine in Rust makes this object fail `satisfies` until the
@@ -26,13 +25,35 @@ export const ENGINES = {
   postgres: { label: "PostgreSQL", fileBased: false, defaultPort: 5432, defaultDatabase: "", defaultUser: "postgres", icon: "database", hint: "Relational · SQL", commandLanguage: "SQL", schemes: ["postgres", "postgresql"] },
   mysql: { label: "MySQL", fileBased: false, defaultPort: 3306, defaultDatabase: "", defaultUser: "root", icon: "database", hint: "Relational · SQL", commandLanguage: "SQL", schemes: ["mysql"] },
   mariadb: { label: "MariaDB", fileBased: false, defaultPort: 3306, defaultDatabase: "", defaultUser: "root", icon: "database", hint: "Relational · SQL", commandLanguage: "SQL", schemes: ["mariadb"] },
-  sqlite: { label: "SQLite", fileBased: true, defaultPort: null, defaultDatabase: "", defaultUser: "", icon: "file", hint: "Embedded file · SQL", commandLanguage: "SQL", schemes: ["sqlite", "file"] },
+  mssql: { label: "SQL Server", fileBased: false, defaultPort: 1433, defaultDatabase: "master", defaultUser: "sa", icon: "database", hint: "Relational · T-SQL", commandLanguage: "SQL", schemes: ["mssql", "sqlserver", "tds"] },
   clickhouse: { label: "ClickHouse", fileBased: false, defaultPort: 8123, defaultDatabase: "default", defaultUser: "default", icon: "columns", hint: "Analytical · SQL over HTTP", commandLanguage: "SQL", schemes: ["clickhouse"] },
   redis: { label: "Redis", fileBased: false, defaultPort: 6379, defaultDatabase: "0", defaultUser: "", icon: "hash", hint: "Key-value · commands", commandLanguage: "Command", schemes: ["redis", "rediss"] },
   mongodb: { label: "MongoDB", fileBased: false, defaultPort: 27017, defaultDatabase: "test", defaultUser: "", icon: "braces", hint: "Documents · JSON commands", commandLanguage: "Command", schemes: ["mongodb", "mongodb+srv"] },
+  libsql: { label: "LibSQL / Turso", fileBased: false, defaultPort: null, defaultDatabase: "default", defaultUser: "", icon: "database", hint: "Embedded / Serverless · SQLite", commandLanguage: "SQL", schemes: ["libsql", "turso"] },
+  val_town: { label: "Val Town", fileBased: false, defaultPort: null, defaultDatabase: "main", defaultUser: "", icon: "database", hint: "Serverless · SQLite over HTTP", commandLanguage: "SQL", schemes: ["valtown", "val_town"] },
+  cloudflare_d1: { label: "Cloudflare D1", fileBased: false, defaultPort: null, defaultDatabase: "", defaultUser: "", icon: "database", hint: "Serverless · SQLite over REST", commandLanguage: "SQL", schemes: ["cloudflare", "d1"] },
+  supabase: { label: "Supabase", fileBased: false, defaultPort: 5432, defaultDatabase: "postgres", defaultUser: "postgres", icon: "database", hint: "Postgres · Managed Cloud", commandLanguage: "SQL", schemes: ["supabase"] },
+  planetscale: { label: "PlanetScale", fileBased: false, defaultPort: 3306, defaultDatabase: "", defaultUser: "", icon: "database", hint: "MySQL · Serverless Cloud", commandLanguage: "SQL", schemes: ["planetscale", "psdb"] },
+  neon: { label: "Neon", fileBased: false, defaultPort: 5432, defaultDatabase: "neondb", defaultUser: "", icon: "database", hint: "Postgres · Serverless Cloud", commandLanguage: "SQL", schemes: ["neon"] },
+  sqlite: { label: "SQLite", fileBased: true, defaultPort: null, defaultDatabase: "", defaultUser: "", icon: "file", hint: "Embedded file · SQL", commandLanguage: "SQL", schemes: ["sqlite", "file"] },
 } satisfies Record<Engine, EngineMeta>;
 
-export const ENGINE_ORDER: Engine[] = keysOf(ENGINES);
+export const ENGINE_ORDER: Engine[] = [
+  "postgres",
+  "libsql",
+  "mysql",
+  "val_town",
+  "mariadb",
+  "cloudflare_d1",
+  "mssql",
+  "supabase",
+  "clickhouse",
+  "planetscale",
+  "redis",
+  "neon",
+  "mongodb",
+  "sqlite",
+];
 
 export function engineMeta(engine: Engine): EngineMeta {
   return ENGINES[engine];
@@ -49,18 +70,13 @@ export interface EnginePreset {
 }
 
 export const PRESETS: readonly EnginePreset[] = [
-  { id: "supabase", label: "Supabase", engine: "postgres", sslMode: "require", hint: "Postgres · SSL required" },
-  { id: "neon", label: "Neon", engine: "postgres", sslMode: "require", hint: "Postgres · SSL required" },
-  { id: "planetscale", label: "PlanetScale", engine: "mysql", sslMode: "require", hint: "MySQL · SSL required" },
+  { id: "supabase", label: "Supabase", engine: "supabase", sslMode: "require", hint: "Postgres · SSL required" },
+  { id: "neon", label: "Neon", engine: "neon", sslMode: "require", hint: "Postgres · SSL required" },
+  { id: "planetscale", label: "PlanetScale", engine: "planetscale", sslMode: "require", hint: "MySQL · SSL required" },
 ];
 
-// WHAT:  Engines DB Pro lists that this build does not ship an adapter for yet.
-export const COMING_SOON: readonly { label: string; hint: string }[] = [
-  { label: "SQL Server", hint: "adapter not built yet" },
-  { label: "LibSQL / Turso", hint: "adapter not built yet" },
-  { label: "Cloudflare D1", hint: "adapter not built yet" },
-  { label: "Val Town", hint: "adapter not built yet" },
-];
+// WHAT:  Engines DB Manager lists that this build does not ship an adapter for yet.
+export const COMING_SOON: readonly { label: string; hint: string }[] = [];
 
 export function blankInput(engine: Engine, preset?: EnginePreset): ConnectionInput {
   const meta = engineMeta(engine);
@@ -80,7 +96,7 @@ export function blankInput(engine: Engine, preset?: EnginePreset): ConnectionInp
 }
 
 // WHAT:  Parses `scheme://user:pass@host:port/db?sslmode=…` into a ConnectionInput.
-// WHY:   DB Pro's "paste a connection string to auto-detect" affordance.
+// WHY:   DB Manager's "paste a connection string to auto-detect" affordance.
 export function parseConnectionString(raw: string): ConnectionInput | null {
   const text = raw.trim();
   if (text.length === 0) return null;

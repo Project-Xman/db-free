@@ -1,12 +1,11 @@
 // SOT: settings-page, preferences-ui, ai-settings-ui, shortcuts-list
 import { useState } from "react";
-import { Button, Separator } from "@heroui/react";
+import { Button, Card, ScrollShadow, Separator } from "@heroui/react";
 import type { AiProvider, AppSettings, ExecutionMode, RunScope } from "@/lib/bindings";
 import { normalizeError } from "@/lib/ipc";
 import { useWorkspace } from "@/stores/workspace";
 import { AppSelect, Field, Toggle } from "@/components/global/Field";
 import { Icon, type IconName } from "@/lib/icons";
-import { isMac } from "@/components/global/Kbd";
 import { cn } from "@/lib/cn";
 
 type Section = "general" | "themes" | "fonts" | "grid" | "editor" | "shortcuts" | "ai" | "security" | "advanced";
@@ -49,7 +48,7 @@ const SHORTCUTS: readonly { keys: string; action: string }[] = [
   { keys: "Middle click (tab)", action: "Close tab" },
 ];
 
-// WHAT:  Settings page mirroring DB Pro's sections; edits a draft of AppSettings.
+// WHAT:  Settings page mirroring DB Manager's sections; edits a draft of AppSettings.
 //        A floating dock appears while the draft differs from the saved settings
 //        (Reset / Save). The AI key is written separately and never echoed.
 export function SettingsPage() {
@@ -95,27 +94,36 @@ function SettingsBody({ initial }: { initial: AppSettings }) {
 
   return (
     <div className="grid-bg relative flex h-full min-h-0 flex-1 flex-col">
-      <div className={cn("drag-region flex h-10 shrink-0 items-center gap-2 pr-3", isMac() ? "pl-9" : "pl-3")} data-tauri-drag-region>
-        <Button variant="ghost" size="sm" onPress={goConnections} className="text-muted">
+      <div className="drag-region flex h-11 shrink-0 items-center gap-2 px-4 border-b border-border/40 glass-header" data-tauri-drag-region>
+        <Button variant="ghost" size="sm" onPress={goConnections} className="rounded-lg text-muted hover:bg-surface-secondary/70 hover:text-foreground liquid-hover">
           <Icon name="chevron-left" size={14} />
           Back
         </Button>
-        <span className="text-sm font-medium text-foreground" data-tauri-drag-region>
-          Settings
+        <span className="text-sm font-semibold text-foreground tracking-tight" data-tauri-drag-region>
+          Preferences
         </span>
         <div className="drag-region h-full flex-1" data-tauri-drag-region />
       </div>
       <div className="flex min-h-0 flex-1">
-        <nav className="w-44 shrink-0 py-4 pl-4" aria-label="Settings sections">
+        <nav className="w-48 shrink-0 py-4 px-2.5 glass-sidebar space-y-0.5" aria-label="Settings sections">
           {SECTIONS.map((s) => (
-            <button key={s.id} type="button" onClick={() => setSection(s.id)} className={cn("flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[13px]", section === s.id ? "bg-surface-tertiary text-foreground" : "text-muted hover:text-foreground")}>
+            <Button
+              key={s.id}
+              variant="ghost"
+              size="sm"
+              onPress={() => setSection(s.id)}
+              className={cn(
+                "flex h-8 w-full items-center justify-start gap-2.5 rounded-lg px-2.5 text-left text-[12.5px] font-medium liquid-hover",
+                section === s.id ? "glass-pill text-accent" : "text-muted hover:bg-surface-secondary/60 hover:text-foreground",
+              )}
+            >
               <Icon name={s.icon} size={14} />
               {s.label}
-            </button>
+            </Button>
           ))}
         </nav>
-        <div className="min-h-0 flex-1 overflow-y-auto">
-          <div className="mx-auto flex w-full max-w-[720px] flex-col gap-6 px-8 py-6">
+        <ScrollShadow className="min-h-0 flex-1">
+          <div className="mx-auto flex w-full max-w-[720px] flex-col gap-4 px-8 py-6">
             {section === "general" ? (
               <>
                 <h2 className="text-sm font-semibold text-foreground">General</h2>
@@ -258,17 +266,17 @@ function SettingsBody({ initial }: { initial: AppSettings }) {
               </>
             ) : null}
           </div>
-        </div>
+        </ScrollShadow>
       </div>
       {dirty ? (
         <div className="pointer-events-none absolute inset-x-0 bottom-5 flex justify-center">
-          <div role="status" className="pointer-events-auto flex items-center gap-2.5 rounded-xl border border-border bg-surface/95 py-1.5 pr-1.5 pl-3 shadow-2xl backdrop-blur">
-            <Icon name="info" size={15} className="text-muted" />
-            <span className="mr-4 text-[13px] text-foreground">Unsaved changes</span>
-            <Button size="sm" variant="danger" onPress={reset} isDisabled={saving}>
+          <div role="status" className="pointer-events-auto flex items-center gap-3 rounded-2xl glass-modal py-2 pr-2 pl-4 shadow-2xl">
+            <Icon name="info" size={15} className="text-accent" />
+            <span className="mr-3 text-[13px] font-medium text-foreground">Unsaved changes</span>
+            <Button size="sm" variant="danger-soft" onPress={reset} isDisabled={saving} className="rounded-lg liquid-hover">
               Reset
             </Button>
-            <Button size="sm" isPending={saving} onPress={() => void save()}>
+            <Button size="sm" isPending={saving} onPress={() => void save()} className="glass-pill bg-accent text-accent-foreground font-semibold shadow-xs liquid-hover">
               Save
             </Button>
           </div>
@@ -287,13 +295,15 @@ function sameSettings(a: AppSettings, b: AppSettings): boolean {
 
 function Row({ title, body, children }: { title: string; body: string; children: React.ReactNode }) {
   return (
-    <div className="flex items-center gap-6">
-      <div className="min-w-0 flex-1">
-        <p className="text-[13px] text-foreground">{title}</p>
-        <p className="text-xs text-muted">{body}</p>
-      </div>
-      <div className="shrink-0">{children}</div>
-    </div>
+    <Card className="rounded-xl glass-card border-border/40 px-4 py-3.5 shadow-xs">
+      <Card.Content className="flex flex-row items-center gap-6 p-0 w-full">
+        <div className="min-w-0 flex-1">
+          <p className="text-[13px] font-semibold text-foreground tracking-tight">{title}</p>
+          <p className="text-xs text-muted mt-0.5">{body}</p>
+        </div>
+        <div className="shrink-0">{children}</div>
+      </Card.Content>
+    </Card>
   );
 }
 

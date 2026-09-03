@@ -18,7 +18,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 futures = "0.3"
 async-trait = "0.1"
 thiserror = "2"
@@ -27,12 +27,14 @@ env_logger = "0.11"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 base64 = "0.22"
+tokio-util = { version = "0.7", features = ["compat"] }
 # --- vendor adapters: each crate below is imported in exactly one layer ---
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "mysql"] }
 rusqlite = { version = "0.40", features = ["bundled", "column_decltype"] }
 redis = { version = "1", default-features = false, features = ["tokio-comp", "tokio-rustls-comp"] }
 mongodb = { version = "3", features = ["compat-3-3-0", "bson-3"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tiberius = { version = "0.12", default-features = false, features = ["rustls", "tds73", "chrono"] }
 csv = "1"
 aes-gcm = "0.10"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }

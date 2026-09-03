@@ -5,7 +5,7 @@ import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLi
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from "@codemirror/autocomplete";
 import { HighlightStyle, syntaxHighlighting, bracketMatching } from "@codemirror/language";
-import { sql, MySQL, MariaSQL, PostgreSQL, SQLite, StandardSQL, type SQLDialect, type SQLNamespace } from "@codemirror/lang-sql";
+import { sql, MSSQL, MySQL, MariaSQL, PostgreSQL, SQLite, StandardSQL, type SQLDialect, type SQLNamespace } from "@codemirror/lang-sql";
 import { tags } from "@lezer/highlight";
 import type { Engine } from "@/lib/bindings";
 
@@ -23,19 +23,16 @@ interface SqlEditorProps {
 const theme = EditorView.theme({
   "&": { backgroundColor: "var(--background)", color: "var(--foreground)", height: "100%", fontSize: "13px" },
   ".cm-scroller": { fontFamily: "var(--font-mono)", lineHeight: "1.55" },
-  ".cm-content": { caretColor: "var(--accent)", padding: "10px 0" },
-  ".cm-line": { padding: "0 12px" },
-  ".cm-gutters": { backgroundColor: "var(--surface)", color: "var(--muted)", border: "none", borderRight: "1px solid var(--border)", minWidth: "44px" },
-  ".cm-lineNumbers .cm-gutterElement": { padding: "0 10px 0 6px" },
-  ".cm-activeLine": { backgroundColor: "color-mix(in oklab, var(--surface-secondary) 70%, transparent)" },
-  ".cm-activeLineGutter": { backgroundColor: "var(--surface-secondary)", color: "var(--muted)" },
-  "&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection": { backgroundColor: "var(--color-selection)" },
-  ".cm-cursor, .cm-dropCursor": { borderLeftColor: "var(--accent)" },
-  ".cm-matchingBracket": { backgroundColor: "var(--color-selection)", outline: "1px solid var(--accent)" },
-  ".cm-tooltip": { backgroundColor: "var(--overlay)", border: "1px solid var(--border)", color: "var(--foreground)", borderRadius: "8px" },
-  ".cm-tooltip.cm-tooltip-autocomplete > ul": { fontFamily: "var(--font-mono)", fontSize: "12px" },
-  ".cm-tooltip-autocomplete ul li[aria-selected]": { backgroundColor: "var(--surface-tertiary)", color: "var(--foreground)" },
-  ".cm-completionIcon": { color: "var(--muted)" },
+  ".cm-content": { caretColor: "var(--color-accent)", padding: "12px 0" },
+  ".cm-line": { padding: "0 16px" },
+  ".cm-gutters": { backgroundColor: "transparent", color: "var(--color-muted)", border: "none", paddingRight: "4px" },
+  ".cm-activeLine": { backgroundColor: "var(--color-surface-hover)" },
+  ".cm-activeLineGutter": { backgroundColor: "transparent", color: "var(--foreground)" },
+  "&.cm-focused .cm-cursor": { borderLeftColor: "var(--color-accent)", borderLeftWidth: "2px" },
+  "&.cm-focused .cm-selectionBackground, ::selection": { backgroundColor: "var(--color-selection)" },
+  ".cm-panels": { backgroundColor: "var(--color-surface-elevated)", color: "var(--foreground)" },
+  ".cm-tooltip": { backgroundColor: "var(--color-surface-elevated)", border: "1px solid var(--border)", color: "var(--foreground)" },
+  ".cm-tooltip-autocomplete > ul > li[aria-selected]": { backgroundColor: "var(--color-surface-hover)", color: "var(--foreground)" },
 });
 
 const highlight = HighlightStyle.define([
@@ -54,16 +51,25 @@ function sqlConfig(engine: Engine, schema: SQLNamespace, defaultSchema: string |
 function dialectFor(engine: Engine): SQLDialect {
   switch (engine) {
     case "postgres":
+    case "supabase":
+    case "neon":
       return PostgreSQL;
     case "mysql":
+    case "planetscale":
       return MySQL;
     case "mariadb":
       return MariaSQL;
+    case "mssql":
+      return MSSQL;
     case "sqlite":
+    case "libsql":
+    case "val_town":
+    case "cloudflare_d1":
       return SQLite;
     case "clickhouse":
     case "redis":
     case "mongodb":
+    default:
       return StandardSQL;
   }
 }

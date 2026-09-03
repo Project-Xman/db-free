@@ -36,7 +36,8 @@ export type Tab =
   | { id: string; kind: "history"; connectionId: string }
   | { id: string; kind: "transfer"; connectionId: string }
   | { id: string; kind: "erd"; connectionId: string; schema: string | null }
-  | { id: string; kind: "document"; connectionId: string | null; documentKind: DocumentKind; documentId: string };
+  | { id: string; kind: "document"; connectionId: string | null; documentKind: DocumentKind; documentId: string }
+  | { id: string; kind: "chat"; connectionId: string };
 
 export function tableKey(table: TableRef): string {
   return table.schema === null ? table.name : `${table.schema}.${table.name}`;
@@ -93,6 +94,7 @@ interface WorkspaceState {
   openHistory: (connectionId: string) => void;
   openTransfer: (connectionId: string) => void;
   openErd: (connectionId: string, schema: string | null) => void;
+  openChat: (connectionId: string) => void;
   openDocument: (kind: DocumentKind, documentId: string, connectionId: string | null) => void;
   closeTab: (id: string) => void;
   activateTab: (id: string) => void;
@@ -342,6 +344,11 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => ({
   openErd: (connectionId, schema) => {
     const id = `erd:${connectionId}:${schema ?? "*"}`;
     set((s) => ({ tabs: addTab(s.tabs, { id, kind: "erd", connectionId, schema }), activeTabId: id, page: { kind: "workspace" } }));
+  },
+
+  openChat: (connectionId) => {
+    const id = `chat:${connectionId}`;
+    set((s) => ({ tabs: addTab(s.tabs, { id, kind: "chat", connectionId }), activeTabId: id, page: { kind: "workspace" } }));
   },
 
   openDocument: (kind, documentId, connectionId) => {

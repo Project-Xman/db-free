@@ -15,6 +15,7 @@ import { HistoryTab } from "@/features/history/HistoryTab";
 import { TransferTab } from "@/features/transfer/TransferTab";
 import { ErdTab } from "@/features/diagrams/ErdTab";
 import { DocumentTab } from "@/features/documents/DocumentTab";
+import { ChatTab } from "@/features/chat/ChatTab";
 import { PendingChangesPanel } from "@/features/changes/PendingChangesPanel";
 import { CommandPalette } from "@/features/palette/CommandPalette";
 import { Toaster } from "@/components/global/Toaster";
@@ -54,7 +55,7 @@ export function App() {
   }, [settings]);
 
   return (
-    <div className="flex h-full bg-background text-foreground">
+    <div className="grid-bg flex h-full text-foreground">
       <IconRail />
       {!ready ? null : page.kind === "settings" ? (
         <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
@@ -91,6 +92,8 @@ export function App() {
                   <TransferTab key={tab.id} connectionId={tab.connectionId} />
                 ) : tab.kind === "erd" ? (
                   <ErdTab key={tab.id} connectionId={tab.connectionId} schema={tab.schema} />
+                ) : tab.kind === "chat" ? (
+                  <ChatTab key={tab.id} connectionId={tab.connectionId} />
                 ) : (
                   <DocumentTab key={tab.id} kind={tab.documentKind} documentId={tab.documentId} connectionId={tab.connectionId} />
                 )}

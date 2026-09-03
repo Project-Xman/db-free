@@ -11,12 +11,16 @@ use std::sync::Arc;
 use ts_rs::TS;
 
 pub mod clickhouse;
+pub mod cloudflare_d1;
+pub mod libsql;
 pub mod mongodb;
+pub mod mssql;
 pub mod mysql;
 pub mod postgres;
 pub mod redis;
 pub mod sql;
 pub mod sqlite;
+pub mod val_town;
 
 // ============================================================================
 // INTEGRATION ADAPTER LAYER
@@ -106,12 +110,16 @@ pub trait Integration: Send + Sync {
 // WHAT:  The single dispatch point from a resolved connection to its adapter.
 pub async fn connect(conn: &ResolvedConnection) -> AppResult<Arc<dyn Integration>> {
     match conn.summary.engine {
-        Engine::Postgres => postgres::connect(conn).await,
-        Engine::Mysql | Engine::Mariadb => mysql::connect(conn).await,
+        Engine::Postgres | Engine::Supabase | Engine::Neon => postgres::connect(conn).await,
+        Engine::Mysql | Engine::Mariadb | Engine::Planetscale => mysql::connect(conn).await,
         Engine::Sqlite => sqlite::connect(conn).await,
         Engine::Clickhouse => clickhouse::connect(conn).await,
         Engine::Redis => self::redis::connect(conn).await,
         Engine::Mongodb => self::mongodb::connect(conn).await,
+        Engine::Mssql => mssql::connect(conn).await,
+        Engine::Libsql => libsql::connect(conn).await,
+        Engine::CloudflareD1 => cloudflare_d1::connect(conn).await,
+        Engine::ValTown => val_town::connect(conn).await,
     }
 }
 
@@ -130,11 +138,21 @@ pub fn quote_ident(raw: &str) -> String {
     format!("\"{}\"", raw.replace('"', "\"\""))
 }
 
-// WHAT:  Engine-aware identifier quoting: MySQL/MariaDB use backticks.
+// WHAT:  Engine-aware identifier quoting: MySQL/MariaDB use backticks, MSSQL uses brackets.
 pub fn quote_ident_for(engine: Engine, raw: &str) -> String {
     match engine {
-        Engine::Mysql | Engine::Mariadb => format!("`{}`", raw.replace('`', "``")),
-        Engine::Postgres | Engine::Sqlite | Engine::Clickhouse | Engine::Redis | Engine::Mongodb => quote_ident(raw),
+        Engine::Mysql | Engine::Mariadb | Engine::Planetscale => format!("`{}`", raw.replace('`', "``")),
+        Engine::Mssql => format!("[{}]", raw.replace(']', "]]")),
+        Engine::Postgres
+        | Engine::Sqlite
+        | Engine::Clickhouse
+        | Engine::Redis
+        | Engine::Mongodb
+        | Engine::Libsql
+        | Engine::ValTown
+        | Engine::CloudflareD1
+        | Engine::Supabase
+        | Engine::Neon => quote_ident(raw),
     }
 }
 

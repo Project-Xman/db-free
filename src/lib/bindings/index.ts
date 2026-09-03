@@ -11,6 +11,7 @@ export type * from "./CatalogRequest";
 export type * from "./CellValue";
 export type * from "./ChangePreview";
 export type * from "./ChangesRequest";
+export type * from "./ChatMessage";
 export type * from "./ClearHistoryRequest";
 export type * from "./ColumnInfo";
 export type * from "./ColumnMeta";

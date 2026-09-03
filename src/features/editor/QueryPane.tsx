@@ -1,6 +1,6 @@
 // SOT: query-pane, run-query-flow, destructive-confirm-flow, buffer-autosave, save-query-flow, ai-assist-flow, explain-flow, format-sql
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button, Modal, Popover, Spinner, TextArea, TextField } from "@heroui/react";
+import { Alert, Button, CloseButton, Modal, Popover, Spinner, TextArea, TextField } from "@heroui/react";
 import { format as formatSql } from "sql-formatter";
 import type { AppError, ConnectionSummary, PlanReport, QueryOutcome } from "@/lib/bindings";
 import type { SQLNamespace } from "@codemirror/lang-sql";
@@ -9,8 +9,10 @@ import { engineMeta } from "@/lib/engines";
 import { useWorkspace } from "@/stores/workspace";
 import { AppSelect, Field } from "@/components/global/Field";
 import { IconButton } from "@/components/global/Button";
+import { Resizer } from "@/components/global/Resizer";
 import { RunShortcut } from "@/components/global/Kbd";
 import { Icon } from "@/lib/icons";
+import { cn } from "@/lib/cn";
 import { SqlEditor } from "./SqlEditor";
 import { ResultsPane } from "./ResultsPane";
 import { HistoryPanel } from "./HistoryPanel";
@@ -59,9 +61,53 @@ export function QueryPane({ connection, tabId, seedSql }: QueryPaneProps) {
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
   const [aiText, setAiText] = useState<string | null>(null);
+  const [aiGeneratedSql, setAiGeneratedSql] = useState<string | null>(null);
+  const [lastError, setLastError] = useState<string | null>(null);
   const [plan, setPlan] = useState<PlanReport | null>(null);
   const [planBusy, setPlanBusy] = useState(false);
   const saveTimer = useRef<number | null>(null);
+
+  const [editorHeight, setEditorHeight] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem("db-free:query-editor-height");
+      return saved ? Math.max(100, Math.min(800, Number(saved))) : 260;
+    } catch {
+      return 260;
+    }
+  });
+
+  const handleEditorResize = useCallback((delta: number) => {
+    setEditorHeight((prev) => {
+      const next = Math.max(100, Math.min(800, prev + delta));
+      try {
+        localStorage.setItem("db-free:query-editor-height", String(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
+
+  const [historyWidth, setHistoryWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem("db-free:query-history-width");
+      return saved ? Math.max(220, Math.min(600, Number(saved))) : 288;
+    } catch {
+      return 288;
+    }
+  });
+
+  const handleHistoryResize = useCallback((delta: number) => {
+    setHistoryWidth((prev) => {
+      const next = Math.max(220, Math.min(600, prev - delta));
+      try {
+        localStorage.setItem("db-free:query-history-width", String(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     const token = { cancelled: false };
@@ -107,8 +153,10 @@ export function QueryPane({ connection, tabId, seedSql }: QueryPaneProps) {
       try {
         const result = await ipc("execute_query", { connectionId: connection.id, sql, confirmDestructive, maxRows: Number(rowCap) });
         setOutcome(result);
+        setLastError(null);
       } catch (raw) {
         const error: AppError = normalizeError(raw);
+        setLastError(error.message);
         if (error.kind === "destructive_confirmation_required") setConfirm({ statements: error.statements });
         else showError(error);
       } finally {
@@ -152,14 +200,26 @@ export function QueryPane({ connection, tabId, seedSql }: QueryPaneProps) {
     }
   };
 
-  const askAi = async () => {
-    if (aiPrompt.trim().length === 0) return;
+  const askAi = async (overridePrompt?: string) => {
+    const promptText = (overridePrompt ?? aiPrompt).trim();
+    if (promptText.length === 0) return;
+    if (overridePrompt) setAiPrompt(overridePrompt);
     setAiBusy(true);
     setAiText(null);
+    setAiGeneratedSql(null);
     try {
-      const reply = await ipc("ai_generate", { connectionId: connection.id, prompt: aiPrompt });
+      const reply = await ipc("ai_generate", {
+        connectionId: connection.id,
+        prompt: promptText,
+        currentQuery: sql.trim().length > 0 ? sql : null,
+        errorContext: lastError,
+      });
       setAiText(reply.text);
-      if (reply.sql !== null) onChange(sql.trim().length > 0 ? `${sql.trimEnd()}\n\n${reply.sql}` : reply.sql);
+      setAiGeneratedSql(reply.sql);
+      if (reply.sql !== null && sql.trim().length === 0) {
+        onChange(reply.sql);
+        showInfo("Generated query placed in editor.");
+      }
     } catch (raw) {
       showError(normalizeError(raw));
     } finally {
@@ -185,41 +245,182 @@ export function QueryPane({ connection, tabId, seedSql }: QueryPaneProps) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border bg-surface px-2">
-        <Button size="sm" isPending={running} onPress={() => void run(false)} isDisabled={!loaded || sql.trim().length === 0}>
+      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border/40 glass-header px-3">
+        <Button
+          size="sm"
+          isPending={running}
+          onPress={() => void run(false)}
+          isDisabled={!loaded || sql.trim().length === 0}
+          className="glass-pill bg-accent text-accent-foreground font-semibold shadow-sm shadow-accent/30 liquid-hover"
+        >
           <Icon name="play" size={12} />
           Run
         </Button>
         <RunShortcut />
-        {isSql ? <Button size="sm" variant="ghost" className="text-muted" onPress={doFormat} isDisabled={sql.trim().length === 0}>Format</Button> : null}
         {isSql ? (
-          <Button size="sm" variant="ghost" className="text-muted" isPending={planBusy} onPress={() => void explain()} isDisabled={sql.trim().length === 0}>
+          <Button size="sm" variant="ghost" className="rounded-lg text-muted hover:bg-surface-secondary/70 hover:text-foreground liquid-hover" onPress={doFormat} isDisabled={sql.trim().length === 0}>
+            Format
+          </Button>
+        ) : null}
+        {isSql ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="rounded-lg text-muted hover:bg-surface-secondary/70 hover:text-foreground liquid-hover"
+            isPending={planBusy}
+            onPress={() => void explain()}
+            isDisabled={sql.trim().length === 0}
+          >
             Explain
           </Button>
         ) : null}
-        <Button size="sm" variant="ghost" className="text-muted" onPress={() => setSaveOpen(true)} isDisabled={sql.trim().length === 0}>
+        <Button size="sm" variant="ghost" className="rounded-lg text-muted hover:bg-surface-secondary/70 hover:text-foreground liquid-hover" onPress={() => setSaveOpen(true)} isDisabled={sql.trim().length === 0}>
           Save
         </Button>
         <Popover isOpen={aiOpen} onOpenChange={setAiOpen}>
-          <Button size="sm" variant={aiEnabled ? "secondary" : "ghost"} className={aiEnabled ? "" : "text-muted"}>
+          <Button size="sm" variant={aiEnabled ? "secondary" : "ghost"} className={cn("rounded-lg liquid-hover", aiEnabled ? "glass-pill text-accent" : "text-muted hover:bg-surface-secondary/70 hover:text-foreground")}>
             <Icon name="braces" size={12} />
             AI
           </Button>
-          <Popover.Content className="w-[460px]">
+          <Popover.Content className="w-[500px] glass-modal rounded-xl">
             <Popover.Dialog>
-              <Popover.Heading className="text-sm">Ask in plain language</Popover.Heading>
+              <div className="flex items-center justify-between">
+                <Popover.Heading className="text-sm font-semibold text-foreground">AI Database Assistant</Popover.Heading>
+                <div className="flex items-center gap-1.5">
+                  <span className="rounded px-1.5 py-0.5 text-[10px] font-medium bg-surface-secondary text-muted">
+                    {engineMeta(connection.engine).label}
+                  </span>
+                  {sql.trim().length > 0 ? (
+                    <span className="rounded px-1.5 py-0.5 text-[10px] font-medium bg-accent/15 text-accent">
+                      Editor Query
+                    </span>
+                  ) : null}
+                  {lastError !== null ? (
+                    <span className="rounded px-1.5 py-0.5 text-[10px] font-medium bg-danger-soft text-danger">
+                      Error Context
+                    </span>
+                  ) : null}
+                </div>
+              </div>
               {aiEnabled ? (
                 <>
+                  <div className="mt-2.5 flex flex-wrap gap-1.5">
+                    {lastError !== null ? (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-6 rounded-full border-danger/40 bg-danger-soft/40 px-2 text-[11px] text-danger hover:bg-danger-soft liquid-hover"
+                        onPress={() => void askAi("Fix the error in my query")}
+                      >
+                        <Icon name="refresh" size={10} />
+                        Fix Error
+                      </Button>
+                    ) : null}
+                    {sql.trim().length > 0 ? (
+                      <>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-6 rounded-full border-border/60 bg-surface-secondary/50 px-2 text-[11px] text-muted hover:text-foreground hover:bg-surface-secondary liquid-hover"
+                          onPress={() => void askAi("Optimize this query for performance and explain")}
+                        >
+                          Optimize
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-6 rounded-full border-border/60 bg-surface-secondary/50 px-2 text-[11px] text-muted hover:text-foreground hover:bg-surface-secondary liquid-hover"
+                          onPress={() => void askAi("Add pagination using LIMIT and OFFSET")}
+                        >
+                          Paginate
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-6 rounded-full border-border/60 bg-surface-secondary/50 px-2 text-[11px] text-muted hover:text-foreground hover:bg-surface-secondary liquid-hover"
+                          onPress={() => void askAi("Explain what this query does in plain language")}
+                        >
+                          Explain
+                        </Button>
+                      </>
+                    ) : (
+                      <>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-6 rounded-full border-border/60 bg-surface-secondary/50 px-2 text-[11px] text-muted hover:text-foreground hover:bg-surface-secondary liquid-hover"
+                          onPress={() => void askAi("List top 10 rows ordered by latest date")}
+                        >
+                          Top 10 Rows
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-6 rounded-full border-border/60 bg-surface-secondary/50 px-2 text-[11px] text-muted hover:text-foreground hover:bg-surface-secondary liquid-hover"
+                          onPress={() => void askAi("Count total rows grouped by status")}
+                        >
+                          Count by Status
+                        </Button>
+                      </>
+                    )}
+                  </div>
                   <TextField value={aiPrompt} onChange={setAiPrompt} className="mt-2 w-full" aria-label="Prompt">
-                    <TextArea placeholder="e.g. customers who ordered more than 3 times last month" rows={3} className="w-full" />
+                    <TextArea placeholder="Ask to generate, modify, explain, or fix a query..." rows={3} className="w-full" />
                   </TextField>
-                  <div className="mt-2 flex items-center gap-2">
-                    <Button size="sm" isPending={aiBusy} onPress={() => void askAi()} isDisabled={aiPrompt.trim().length === 0}>
+                  <div className="mt-2 flex items-center justify-between">
+                    <Button size="sm" isPending={aiBusy} onPress={() => void askAi()} isDisabled={aiPrompt.trim().length === 0} className="glass-pill bg-accent text-accent-foreground font-semibold liquid-hover">
                       Generate {engineMeta(connection.engine).commandLanguage}
                     </Button>
-                    <span className="text-[11px] text-muted">Schema names and your prompt are sent to {settings.ai.provider}.</span>
+                    <span className="text-[11px] text-muted">Schema, context & prompt sent to {settings.ai.provider}.</span>
                   </div>
-                  {aiText !== null ? <p className="selectable mt-3 max-h-40 overflow-y-auto rounded-md bg-surface-secondary p-2 text-xs whitespace-pre-wrap text-muted">{aiText}</p> : null}
+                  {aiGeneratedSql !== null ? (
+                    <div className="mt-3 rounded-lg border border-border/60 bg-surface-secondary/70 p-2.5">
+                      <div className="mb-1.5 flex items-center justify-between">
+                        <span className="text-[11px] font-semibold text-foreground tracking-tight">Generated Statement</span>
+                        <div className="flex items-center gap-1">
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-5 px-1.5 text-[10.5px] rounded text-muted hover:text-foreground liquid-hover"
+                            onPress={() => {
+                              void navigator.clipboard.writeText(aiGeneratedSql);
+                              showInfo("Copied statement to clipboard.");
+                            }}
+                          >
+                            Copy
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-5 px-1.5 text-[10.5px] rounded text-muted hover:text-foreground liquid-hover"
+                            onPress={() => {
+                              onChange(sql.trim().length > 0 ? `${sql.trimEnd()}\n\n${aiGeneratedSql}` : aiGeneratedSql);
+                              showInfo("Inserted statement below.");
+                            }}
+                          >
+                            Insert Below
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            className="h-5 px-2 text-[10.5px] rounded font-medium glass-pill text-accent liquid-hover"
+                            onPress={() => {
+                              onChange(aiGeneratedSql);
+                              showInfo("Replaced editor query.");
+                            }}
+                          >
+                            Replace Editor
+                          </Button>
+                        </div>
+                      </div>
+                      <pre className="selectable max-h-32 overflow-auto font-mono text-[11px] text-foreground whitespace-pre-wrap">{aiGeneratedSql}</pre>
+                    </div>
+                  ) : null}
+                  {aiText !== null ? (
+                    <div className="selectable mt-2 max-h-36 overflow-y-auto rounded-lg border border-border/40 bg-surface/60 p-2 text-xs whitespace-pre-wrap text-muted">
+                      {aiText}
+                    </div>
+                  ) : null}
                 </>
               ) : (
                 <p className="mt-2 text-xs text-muted">Turn on a provider in Settings → AI (bring your own key).</p>
@@ -234,20 +435,21 @@ export function QueryPane({ connection, tabId, seedSql }: QueryPaneProps) {
       </div>
       <div className="flex min-h-0 flex-1">
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="h-[42%] min-h-[120px] border-b border-border">
+          <div className="relative shrink-0 flex flex-col" style={{ height: editorHeight }}>
             {loaded ? <SqlEditor value={sql} onChange={onChange} onRun={() => void run(false)} engine={connection.engine} schema={schema} defaultSchema={defaultSchema} /> : null}
           </div>
+          <Resizer direction="vertical" onResize={handleEditorResize} />
           <div className="min-h-0 flex-1">
             {plan ? (
               <div className="flex h-full min-h-0 flex-col">
-                <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border bg-surface px-3 text-xs">
-                  <span className="font-medium text-foreground">Execution plan</span>
+                <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border/40 glass-header px-3 text-xs">
+                  <span className="font-semibold text-foreground tracking-tight">Execution plan</span>
                   <span className="ml-auto">
-                    <IconButton icon="x" label="Close plan" onPress={() => setPlan(null)} />
+                    <CloseButton onPress={() => setPlan(null)} aria-label="Close plan" />
                   </span>
                 </div>
                 <div className="grid min-h-0 flex-1 grid-cols-2 gap-0">
-                  <pre className="selectable overflow-auto border-r border-border p-3 font-mono text-[11px] text-foreground">{plan.plan}</pre>
+                  <pre className="selectable overflow-auto border-r border-border/40 p-3 font-mono text-[11px] text-foreground">{plan.plan}</pre>
                   <div className="selectable overflow-auto p-3 text-xs whitespace-pre-wrap text-muted">{plan.explanation ?? "Enable an AI provider in Settings to get a plain-language explanation of this plan."}</div>
                 </div>
               </div>
@@ -257,7 +459,8 @@ export function QueryPane({ connection, tabId, seedSql }: QueryPaneProps) {
           </div>
         </div>
         {showHistory ? (
-          <div className="w-72 shrink-0 border-l border-border bg-surface">
+          <div className="relative shrink-0 flex flex-col border-l border-border/40 glass-sidebar select-none" style={{ width: historyWidth }}>
+            <Resizer direction="horizontal" onResize={handleHistoryResize} className="absolute -left-1 top-0 bottom-0" />
             <HistoryPanel connectionId={connection.id} refreshKey={historyKey} onPick={(picked) => onChange(picked)} />
           </div>
         ) : null}
@@ -295,9 +498,17 @@ export function QueryPane({ connection, tabId, seedSql }: QueryPaneProps) {
                 </Modal.Icon>
                 <Modal.Heading>Run destructive statements?</Modal.Heading>
               </Modal.Header>
-              <Modal.Body>
-                <p className="text-sm text-muted">These statements change or remove data without a safety net. Review before continuing.</p>
-                <ul className="mt-3 flex flex-col gap-1.5">
+              <Modal.Body className="space-y-3">
+                <Alert status="danger" className="rounded-xl">
+                  <Alert.Indicator />
+                  <Alert.Content>
+                    <Alert.Title className="font-semibold text-xs">Destructive Operations</Alert.Title>
+                    <Alert.Description className="text-xs">
+                      These statements change or remove data without a safety net. Review before continuing.
+                    </Alert.Description>
+                  </Alert.Content>
+                </Alert>
+                <ul className="flex flex-col gap-1.5">
                   {confirm?.statements.map((s) => (
                     <li key={s} className="selectable rounded-md bg-danger-soft px-2.5 py-1.5 font-mono text-[11px] text-danger">
                       {s}

@@ -66,7 +66,7 @@ pub struct DashboardBody {
     pub refresh_seconds: u32,
 }
 
-// WHAT:  Widget kinds (DB Pro parity). `Metric` accepts the legacy "number" name.
+// WHAT:  Widget kinds (DB Manager parity). `Metric` accepts the legacy "number" name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]

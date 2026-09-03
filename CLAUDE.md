@@ -31,7 +31,7 @@ UI component → src/lib/ipc.ts (client block) → #[tauri::command] (src-tauri/
 - Typed wrappers for HeroUI form controls live in `src/components/global/Field.tsx` (`Field`, `AppSelect`, `Toggle`, `Check`, `Segmented`); use them in features instead of re-deriving `Key` narrowing.
 - Secrets: never returned to the UI (`ConnectionSummary.hasSecret` only), sealed with AES-256-GCM, key in the OS keychain.
 
-## Feature map (where each DB Pro-style feature lives)
+## Feature map (where each DB Manager-style feature lives)
 
 | Feature | Rust | UI |
 |---|---|---|
