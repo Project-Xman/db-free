@@ -72,6 +72,8 @@ export interface Option<T extends string> {
   value: T;
   label: string;
   icon?: IconName;
+  /// Arbitrary leading node (an engine logo); wins over `icon`.
+  leading?: ReactNode;
 }
 
 interface AppSelectProps<T extends string> {
@@ -112,7 +114,7 @@ export function AppSelect<T extends string>({ value, options, onChange, label, a
           plain ? "!w-auto h-6 min-h-6 gap-1 rounded-md border-0 bg-transparent !pr-1.5 !pl-1 py-0 text-xs text-foreground shadow-none hover:bg-surface-secondary" : "",
         )}
       >
-        {leading ? <Icon name={leading} size={plain ? 12 : 14} className="shrink-0 text-accent" /> : null}
+        {icon === undefined && current?.leading ? <span className="flex shrink-0 items-center">{current.leading}</span> : leading ? <Icon name={leading} size={plain ? 12 : 14} className="shrink-0 text-accent" /> : null}
         <Select.Value className={cn("min-w-0 truncate text-left leading-normal", plain ? "max-w-[150px]" : "flex-1")} />
         <Icon name="chevron-down" size={12} className="shrink-0 text-muted" />
       </Select.Trigger>
@@ -120,7 +122,7 @@ export function AppSelect<T extends string>({ value, options, onChange, label, a
         <ListBox>
           {options.map((o) => (
             <ListBox.Item key={o.value} id={o.value} textValue={o.label}>
-              {o.icon ? <Icon name={o.icon} size={14} className="mr-2 text-muted" /> : null}
+              {o.leading ? <span className="mr-2 flex shrink-0 items-center">{o.leading}</span> : o.icon ? <Icon name={o.icon} size={14} className="mr-2 text-muted" /> : null}
               {o.label}
               <ListBox.ItemIndicator />
             </ListBox.Item>
@@ -334,9 +336,9 @@ export function NumberInput({ value, onChange, integer = false, label, ariaLabel
   return (
     <NumberField
       value={value ?? Number.NaN}
-      onChange={(next) => onChange(next === undefined || Number.isNaN(next) ? null : next)}
+      onChange={(next) => onChange(Number.isNaN(next) ? null : next)}
       formatOptions={{ useGrouping: false, maximumFractionDigits: integer ? 0 : 20 }}
-      step={integer ? 1 : undefined}
+      {...(integer ? { step: 1 } : {})}
       aria-label={ariaLabel ?? label ?? "number"}
       isDisabled={isDisabled}
       autoFocus={autoFocus}

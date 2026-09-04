@@ -254,7 +254,7 @@ export function DataGrid({
                             isIconOnly
                             variant="ghost"
                             size="sm"
-                            aria-label={`Open ${column?.linkTo ?? "related"} rows`}
+                            aria-label={`Open ${column.linkTo ?? "related"} rows`}
                             onPress={() => {
                               onLinkOpen(vr.index, vc.index);
                             }}

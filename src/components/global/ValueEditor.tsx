@@ -1,7 +1,6 @@
 // SOT: value-editor, typed-cell-editor, insert-form-field, json-editor-modal
 import { useMemo, useRef, useState, type KeyboardEvent } from "react";
-import { Button, Input, Modal, TextArea } from "@heroui/react";
-import { ToggleButton } from "@heroui/react";
+import { Button, Input, Modal, TextArea, ToggleButton } from "@heroui/react";
 import type { ColumnInfo, Value } from "@/lib/bindings";
 import type { JsonValue } from "@/lib/bindings/serde_json/JsonValue";
 import { parseJson } from "@/lib/json";
@@ -30,11 +29,17 @@ interface CellEditorProps {
 // WHERE: src/features/grid/DataGrid.tsx
 export function CellEditor({ typeName, value, onCommit, onCancel }: CellEditorProps) {
   const kind = fieldKind(typeName, value);
-  const draft = useRef<string>(editText(value));
-  const number = useRef<number | null>(value.t === "int" || value.t === "float" ? value.v : null);
-  const [text, setText] = useState(draft.current);
+  const initialText = editText(value);
+  const initialNumber = value.t === "int" || value.t === "float" ? value.v : null;
+  // State drives the controls; the refs mirror it so a keydown that both changes
+  // the value and commits (Enter on a calendar cell) commits the fresh draft.
+  // Refs are written in event handlers only, never read during render.
+  const draft = useRef<string>(initialText);
+  const number = useRef<number | null>(initialNumber);
+  const [text, setText] = useState(initialText);
+  const [num, setNum] = useState<number | null>(initialNumber);
 
-  const keys = (commit: () => void) => (e: KeyboardEvent<HTMLElement>) => {
+  const onKey = (e: KeyboardEvent<HTMLElement>, commit: () => void) => {
     if (e.key === "Enter") {
       e.preventDefault();
       commit();
@@ -54,15 +59,25 @@ export function CellEditor({ typeName, value, onCommit, onCancel }: CellEditorPr
     case "int":
     case "float":
       return (
-        <div className="h-[calc(100%-4px)] w-full" onKeyDown={keys(commitNumber)} onBlur={onCancel}>
-          <NumberInput compact autoFocus integer={kind === "int"} ariaLabel="Edit number" value={number.current} onChange={(n) => (number.current = n)} />
+        <div className="h-[calc(100%-4px)] w-full" onKeyDown={(e) => onKey(e, commitNumber)} onBlur={onCancel}>
+          <NumberInput
+            compact
+            autoFocus
+            integer={kind === "int"}
+            ariaLabel="Edit number"
+            value={num}
+            onChange={(n) => {
+              number.current = n;
+              setNum(n);
+            }}
+          />
         </div>
       );
     case "date":
     case "time":
     case "datetime":
       return (
-        <div className="flex h-[calc(100%-4px)] w-full min-w-0 items-center gap-0.5" onKeyDown={keys(commitDate)}>
+        <div className="flex h-[calc(100%-4px)] w-full min-w-0 items-center gap-0.5" onKeyDown={(e) => onKey(e, commitDate)}>
           <div className="h-full min-w-0 flex-1">
             <DateTimeField
               compact
@@ -105,7 +120,7 @@ export function CellEditor({ typeName, value, onCommit, onCancel }: CellEditorPr
             draft.current = e.target.value;
             setText(e.target.value);
           }}
-          onKeyDown={keys(commitText)}
+          onKeyDown={(e) => onKey(e, commitText)}
           onBlur={onCancel}
           inputMode={kind === "decimal" ? "decimal" : undefined}
           className="h-[calc(100%-4px)] w-full rounded-sm border border-accent bg-background px-1 font-mono text-[12px] text-foreground"
@@ -236,7 +251,7 @@ export function JsonEditorModal({ open, title, initial, onSave, onClose, seconda
                 {title}
               </Modal.Heading>
             </Modal.Header>
-            {open ? <JsonEditorBody initial={initial} onSave={onSave} onClose={onClose} secondaryAction={secondaryAction} /> : null}
+            {open ? <JsonEditorBody initial={initial} onSave={onSave} onClose={onClose} {...(secondaryAction ? { secondaryAction } : {})} /> : null}
           </Modal.Dialog>
         </Modal.Container>
       </Modal.Backdrop>

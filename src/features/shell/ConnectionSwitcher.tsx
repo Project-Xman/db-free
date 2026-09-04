@@ -2,6 +2,7 @@
 import { Button, Dropdown, Label } from "@heroui/react";
 import { useActiveConnection, useWorkspace } from "@/stores/workspace";
 import { engineMeta } from "@/lib/engines";
+import { EngineIcon } from "@/components/global/EngineIcon";
 import { EnvDot } from "@/components/global/Badge";
 import { Icon } from "@/lib/icons";
 
@@ -28,6 +29,7 @@ export function ConnectionSwitcher({ caption }: { caption: string }) {
         aria-label={`${caption} — switch connection`}
       >
         <EnvDot environment={connection.environment} live />
+        <EngineIcon engine={connection.engine} size={16} className="shrink-0" />
         <span className="truncate max-w-[140px]">{connection.name}</span>
         <Icon name="chevron-down" size={12} className="text-muted shrink-0" />
       </Button>
@@ -47,6 +49,7 @@ export function ConnectionSwitcher({ caption }: { caption: string }) {
               return (
                 <Dropdown.Item key={c.id} id={c.id} textValue={`${c.name} ${target}`}>
                   <EnvDot environment={c.environment} live={sessions.includes(c.id)} />
+                  <EngineIcon engine={c.engine} size={20} className="ml-2 shrink-0" />
                   <span className="ml-2 flex min-w-0 flex-col">
                     <Label className="truncate">{c.name}</Label>
                     <span className="truncate font-mono text-[10px] text-muted">{meta.label} · {target}</span>

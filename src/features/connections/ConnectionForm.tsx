@@ -3,6 +3,7 @@ import { useState } from "react";
 import { Alert, Button, Card, ScrollShadow, Tabs } from "@heroui/react";
 import type { ConnectionInput, ConnectionSummary, Engine, Environment, SslMode } from "@/lib/bindings";
 import { ENGINE_ORDER, blankInput, categoryLabel, engineMeta, fieldLabels, type EnginePreset } from "@/lib/engines";
+import { EngineIcon } from "@/components/global/EngineIcon";
 import { ENVIRONMENT_ORDER, environmentMeta } from "@/lib/environments";
 import { ipc, normalizeError } from "@/lib/ipc";
 import { pickDirectory, pickSqliteFile } from "@/lib/native";
@@ -133,7 +134,7 @@ function ConnectionFormBody({ editing, preset, draft }: { editing: ConnectionSum
         <div className="mx-auto flex w-full max-w-[640px] flex-col gap-5 px-6 pt-8 pb-10">
           <Card className="glass-card rounded-2xl p-6 shadow-xl flex flex-col gap-5 border-border/40">
             <Card.Content className="flex flex-col gap-5 p-0">
-              <AppSelect label="Type" value={input.engine} options={ENGINE_ORDER.map((e) => ({ value: e, label: `${engineMeta(e).label} · ${categoryLabel(engineMeta(e).kind)}`, icon: engineMeta(e).icon }))} onChange={changeEngine} />
+              <AppSelect label="Type" value={input.engine} options={ENGINE_ORDER.map((e) => ({ value: e, label: `${engineMeta(e).label} · ${categoryLabel(engineMeta(e).kind)}`, leading: <EngineIcon engine={e} size={16} /> }))} onChange={changeEngine} />
               <Field label="Connection Name" value={input.name} onChange={(name) => patch({ name })} placeholder="local-db" autoFocus />
               <AppSelect label="Environment" value={input.environment} options={ENVIRONMENT_ORDER.map((e) => ({ value: e, label: environmentMeta(e).label }))} onChange={changeEnvironment} />
 

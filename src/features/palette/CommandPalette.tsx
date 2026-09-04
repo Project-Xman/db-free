@@ -1,8 +1,9 @@
 // SOT: command-palette, cmd-k, quick-actions
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Chip, Kbd, ListBox, Modal, ScrollShadow, SearchField } from "@heroui/react";
 import { tableKey, useActiveConnection, useWorkspace } from "@/stores/workspace";
 import { Icon, type IconName } from "@/lib/icons";
+import { EngineIcon } from "@/components/global/EngineIcon";
 import { engineMeta } from "@/lib/engines";
 
 const EMPTY_SECTIONS: string[] = [];
@@ -13,6 +14,8 @@ interface Action {
   label: string;
   hint?: string;
   icon: IconName;
+  /// Replaces `icon` when set (engine logo for connections).
+  leading?: ReactNode;
   run: () => void;
 }
 
@@ -60,7 +63,7 @@ export function CommandPalette() {
     list.push({ id: "connections", section: "navigation", label: "Connections", icon: "plug", run: () => s.goConnections() });
     list.push({ id: "settings", section: "settings", label: "Settings", icon: "settings", run: () => s.goSettings() });
     for (const c of connections) {
-      list.push({ id: `conn:${c.id}`, section: "connections", label: c.name, hint: engineMeta(c.engine).label, icon: "database", run: () => s.selectConnection(c.id) });
+      list.push({ id: `conn:${c.id}`, section: "connections", label: c.name, hint: engineMeta(c.engine).label, icon: "database", leading: <EngineIcon engine={c.engine} size={16} />, run: () => s.selectConnection(c.id) });
     }
     if (cid && catalog) {
       for (const schema of catalog.schemas) {
@@ -110,7 +113,7 @@ export function CommandPalette() {
                 >
                   {visible.map((a) => (
                     <ListBox.Item key={a.id} id={a.id} textValue={a.label} className="flex items-center rounded-lg px-2.5 py-2 text-xs liquid-hover cursor-default">
-                      <Icon name={a.icon} size={15} className="mr-2.5 text-accent shrink-0" />
+                      {a.leading ? <span className="mr-2.5 flex shrink-0 items-center">{a.leading}</span> : <Icon name={a.icon} size={15} className="mr-2.5 text-accent shrink-0" />}
                       <span className="truncate font-medium text-foreground">{a.label}</span>
                       {a.hint ? <span className="ml-2 truncate font-mono text-[10.5px] text-muted/80">{a.hint}</span> : null}
                       <Chip size="sm" variant="soft" className="ml-auto text-[9.5px] uppercase tracking-wider font-medium">
