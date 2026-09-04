@@ -16,7 +16,7 @@ UI component → src/lib/ipc.ts (client block) → #[tauri::command] (src-tauri/
 | `commands/` | input validation (`ConnectionInput::validate`), call `guard::*`, call one service | touch store / integrations |
 | `guard/` | timing, connection+session resolution, read-only lock, destructive confirm, timeout, bounds, history log | feature rules |
 | `services/` | orchestrate store + integrations for one use case | import `tauri`, vendor crates |
-| `integrations/` | one file per engine implementing `Integration` (postgres, mysql/mariadb, sqlite, clickhouse, redis, mongodb); the only place that engine's crate is imported | know about the UI |
+| `integrations/` | one file per **adapter family** implementing `Integration` (45 families serving 69 engines: postgres family covers Supabase/Neon/Timescale/Cockroach/Yugabyte…, cassandra covers ScyllaDB, elasticsearch covers OpenSearch, sparql covers Jena/GraphDB/Stardog/Blazegraph/Virtuoso…); the only place that family's crate is imported. Shared helpers: `http.rs` (REST client + JSON→grid + client-side paging), `aws_sigv4.rs`, `gcp_auth.rs` | know about the UI |
 | `store/` | the app's own SQLite (connections, history, buffers); only place `rusqlite` is used for app state | business rules |
 | `adapters/` | `aes_gcm` (secret sealing) and `keyring` (master key) | anything else |
 
@@ -51,14 +51,15 @@ Boundaries with a single audited escape: `src/lib/ipc.ts` (`unknown`), `src/lib/
 ## Adding things
 
 - **UI component:** fetch the HeroUI docs first (`.claude/skills/heroui-react/scripts/get_component_docs.mjs <Name>`); v3 API only (no provider, no framer-motion, `value`/`onChange` on Select).
-- **Engine (Redis, MongoDB, MySQL…):** follow the numbered recipe at the top of `src-tauri/src/integrations/mod.rs`. Compile errors list every place to touch.
+- **Engine:** `model::Engine` is the registry. Each variant maps to a `Family` (which adapter speaks to it), an `EngineKind` (picker category: relational, document, key_value, wide_column, graph, time_series, vector, search, multi_model, spatial, in_memory, analytical, new_sql, embedded, ledger, streaming, object, hierarchical, network, xml, graph_vector, rdf) and a `FormKind` (server / file / http_token / aws / gcp: which connection fields the UI shows). Wire-compatible products (Valkey, ScyllaDB, OpenSearch, Redpanda, Memgraph…) are new `Engine` variants on an existing family: no Rust adapter needed. Follow the numbered recipe at the top of `src-tauri/src/integrations/mod.rs`; compile errors list every place to touch. UI metadata (label, hint, field labels, URL schemes) lives in `src/lib/engines.ts` and fails `satisfies Record<Engine, …>` until every variant has an entry.
+- **Non-SQL engines:** `execute` takes the engine's native language (Cypher, AQL, PromQL, SPARQL, Query DSL JSON, Redis commands…) and `fetch_page` maps the store onto tables (collections, indexes, labels, topics, graphs, keys). Client-side filter/sort/slice via `integrations::http::local::page` when the engine has no server-side paging. Adapters must refuse writes themselves when `read_only` is set, because the SQL guard cannot parse their language.
 - **Command:** add to `CommandName` (commands/mod.rs) → write the `#[tauri::command]` → register in `lib.rs` → export request type in the `export_bindings` test → `pnpm bindings` → add its signature to `CommandMap` in `src/lib/ipc.ts`.
 - **Block concern:** insert a numbered step in `guard/mod.rs`; never a second guard.
 
 ## Run
 
 ```
-pnpm install && pnpm tauri dev      # desktop app (needs Rust toolchain)
+pnpm install && pnpm tauri dev      # desktop app (needs Rust toolchain + libclang for RocksDB bindgen, cmake for aws-lc)
 pnpm bindings                       # regenerate src/lib/bindings after Rust type changes
 pnpm check                          # everything the CI runs
 pnpm tauri build                    # .dmg / .msi / .AppImage+.deb for the host OS

@@ -1,9 +1,35 @@
 # DB Free
 
-Lightweight, native database workbench. Rust core (Tauri v2, tokio, sqlx, rusqlite) with a React/TypeScript UI.
+Lightweight, native database workbench. Rust core (Tauri v2, tokio, sqlx, rusqlite, scylla, neo4rs, rskafka, duckdb, rocksdb, reqwest) with a React/TypeScript UI.
 Sub-second cold start, small memory footprint, no telemetry, works fully offline.
 
-**Engines:** PostgreSQL, MySQL/MariaDB, SQLite, ClickHouse, Redis, MongoDB (plus Supabase/Neon/PlanetScale presets).
+**Engines (69, in 22 categories):**
+
+| Category | Engines |
+|---|---|
+| Relational / SQL | PostgreSQL, MySQL, MariaDB, SQL Server, Oracle, Supabase, Neon, PlanetScale |
+| Document | MongoDB, CouchDB, Firestore |
+| Key-Value | Redis, Valkey, DynamoDB |
+| Wide-Column | Cassandra, ScyllaDB, HBase |
+| Graph | Neo4j, Memgraph, TigerGraph |
+| Time-Series | TimescaleDB, InfluxDB, VictoriaMetrics, Prometheus, QuestDB |
+| Vector | Qdrant, Milvus, Pinecone, Chroma, pgvector |
+| Search / Full-Text | Elasticsearch, OpenSearch, Meilisearch, Typesense |
+| Multi-Model | SurrealDB, OrientDB |
+| Spatial | PostGIS, SpatiaLite |
+| In-Memory | Memcached, Dragonfly |
+| Columnar / OLAP | ClickHouse, DuckDB, Apache Druid, Snowflake, BigQuery |
+| NewSQL / Distributed SQL | CockroachDB, TiDB, YugabyteDB |
+| Embedded | SQLite, RocksDB, LibSQL / Turso, Val Town, Cloudflare D1 |
+| Ledger | immudb, Amazon QLDB |
+| Event / Streaming | Apache Kafka, Redpanda |
+| Object | ObjectDB (via JPQL gateway) |
+| Hierarchical / Network | IBM IMS, Raima RDM (via their SQL gateways) |
+| XML | BaseX, eXist-db |
+| Graph + Vector | Weaviate, ArangoDB |
+| RDF / Triple Store | Apache Jena, GraphDB, Stardog, Blazegraph, Virtuoso |
+
+Each engine speaks its native language in the query tab (SQL, CQL, Cypher, AQL, SurrealQL, PromQL, SPARQL, XQuery, Query DSL, Redis commands…) and its collections / indexes / labels / topics / graphs / keys appear in the table browser.
 
 **Features:** encrypted saved connections (AES-256-GCM, key in the OS keychain) · connection-string auto-detect ·
 environment badges with read-only lock · virtualized table browser with sort, filter builder, pager and record inspector ·
