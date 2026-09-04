@@ -1,9 +1,10 @@
 // SOT: integration-trait, integration-adapter-layer, engine-adapters, capabilities, connect-dispatch, quote-ident
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::model::{
-    ColumnInfo, Engine, Family, FilterRule, ForeignKey, PageQuery, ResolvedConnection, ResultSet,
-    SchemaCatalog, StatementResult, TableRef,
+    ColumnInfo, Engine, Family, FilterRule, ForeignKey, ObjectDetail, ObjectKind, ObjectRef, ObjectSummary,
+    PageQuery, RangeQueryRequest, RangeResult, ResolvedConnection, ResultSet, SchemaCatalog, SearchRequest,
+    SearchResult, ServerStats, StatementResult, TableRef, Tool, VectorSearchRequest,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -49,7 +50,9 @@ pub mod qdrant;
 pub mod qldb;
 pub mod redis;
 pub mod rocksdb;
+pub mod s3;
 pub mod snowflake;
+pub mod spacetimedb;
 pub mod sparql;
 pub mod sql;
 pub mod sqlite;
@@ -148,6 +151,22 @@ impl Capabilities {
     };
 }
 
+// WHAT:  What a family exposes beyond rows: the object kinds its explorer can
+//        list and the playground tools that make sense for it. Static per
+//        family (no session needed), so the capability matrix renders for every
+//        engine and the sidebar lays itself out before the first catalog load.
+// WHY:   The UI never asks `if engine === "postgres"`; it asks the profile.
+//        Declaring a kind here is a promise that `objects(kind, …)` answers it.
+// WHERE: src-tauri/src/integrations/<family>.rs (`profile()`), src/lib/objects.ts
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FamilyProfile {
+    pub capabilities: Capabilities,
+    pub object_kinds: Vec<ObjectKind>,
+    pub tools: Vec<Tool>,
+}
+
 // WHAT:  Per-engine metadata reported once per session (status bar, editor label).
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -155,6 +174,8 @@ impl Capabilities {
 pub struct SessionInfo {
     pub engine: Engine,
     pub capabilities: Capabilities,
+    pub object_kinds: Vec<ObjectKind>,
+    pub tools: Vec<Tool>,
     pub server_version: Option<String>,
     /// Database this session is attached to (Postgres) or the file (SQLite).
     pub database: Option<String>,
@@ -188,6 +209,90 @@ pub trait Integration: Send + Sync {
     /// CREATE statement for a table (export "include schema"). None when unsupported.
     async fn ddl(&self, _table: &TableRef) -> AppResult<Option<String>> {
         Ok(None)
+    }
+
+    // ---- object explorer / administration ------------------------------------
+    // WHAT:  Lists objects of one kind. `parent` is the namespace for scoped kinds
+    //        (`ObjectKind::scoped`) — None means every user namespace, system
+    //        ones excluded — and the owner (table, topic…) for nested ones. Only
+    //        kinds declared in the family's `profile()` are ever asked for.
+    async fn objects(&self, _kind: ObjectKind, _parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        Ok(Vec::new())
+    }
+    /// Definition, properties, nested objects and actions for one object.
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        Ok(ObjectDetail::empty(reference))
+    }
+    /// Monitoring figures (connections, memory, cache, replication…), grouped.
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        Ok(ServerStats::default())
+    }
+
+    // ---- playground tools (declare the matching `Tool` in `profile()`) --------
+    async fn vector_search(&self, _req: &VectorSearchRequest) -> AppResult<ResultSet> {
+        Err(AppError::invalid_input("This engine has no vector search."))
+    }
+    async fn search(&self, _req: &SearchRequest) -> AppResult<SearchResult> {
+        Err(AppError::invalid_input("This engine has no full-text search API."))
+    }
+    async fn query_range(&self, _req: &RangeQueryRequest) -> AppResult<RangeResult> {
+        Err(AppError::invalid_input("This engine has no range query API."))
+    }
+    /// Immutable history of one key / row (ledger engines).
+    async fn history(&self, _reference: &ObjectRef) -> AppResult<ResultSet> {
+        Err(AppError::invalid_input("This engine keeps no verifiable history."))
+    }
+}
+
+// WHAT:  Static profile per adapter family (see `FamilyProfile`).
+pub fn profile(family: Family) -> FamilyProfile {
+    match family {
+        Family::Postgres => postgres::profile(),
+        Family::Mysql => mysql::profile(),
+        Family::Mssql => mssql::profile(),
+        Family::Oracle => self::oracle::profile(),
+        Family::Sqlite => sqlite::profile(),
+        Family::Duckdb => self::duckdb::profile(),
+        Family::Rocksdb => self::rocksdb::profile(),
+        Family::Clickhouse => clickhouse::profile(),
+        Family::Redis => self::redis::profile(),
+        Family::Memcached => memcached::profile(),
+        Family::Mongodb => self::mongodb::profile(),
+        Family::Couchdb => couchdb::profile(),
+        Family::Firestore => firestore::profile(),
+        Family::Dynamodb => dynamodb::profile(),
+        Family::Cassandra => cassandra::profile(),
+        Family::Hbase => hbase::profile(),
+        Family::Neo4j => neo4j::profile(),
+        Family::Tigergraph => tigergraph::profile(),
+        Family::Influxdb => influxdb::profile(),
+        Family::Prometheus => prometheus::profile(),
+        Family::Qdrant => qdrant::profile(),
+        Family::Milvus => milvus::profile(),
+        Family::Weaviate => weaviate::profile(),
+        Family::Pinecone => pinecone::profile(),
+        Family::Chroma => chroma::profile(),
+        Family::Elasticsearch => elasticsearch::profile(),
+        Family::Meilisearch => meilisearch::profile(),
+        Family::Typesense => typesense::profile(),
+        Family::Arangodb => arangodb::profile(),
+        Family::Surrealdb => surrealdb::profile(),
+        Family::Orientdb => orientdb::profile(),
+        Family::Druid => druid::profile(),
+        Family::Snowflake => snowflake::profile(),
+        Family::Bigquery => bigquery::profile(),
+        Family::Libsql => libsql::profile(),
+        Family::ValTown => val_town::profile(),
+        Family::CloudflareD1 => cloudflare_d1::profile(),
+        Family::Immudb => immudb::profile(),
+        Family::Qldb => qldb::profile(),
+        Family::Kafka => kafka::profile(),
+        Family::Objectdb => objectdb::profile(),
+        Family::Sparql => sparql::profile(),
+        Family::Basex => basex::profile(),
+        Family::Existdb => existdb::profile(),
+        Family::Spacetimedb => spacetimedb::profile(),
+        Family::S3 => s3::profile(),
     }
 }
 
@@ -238,13 +343,18 @@ pub async fn connect(conn: &ResolvedConnection) -> AppResult<Arc<dyn Integration
         Family::Sparql => sparql::connect(conn).await,
         Family::Basex => basex::connect(conn).await,
         Family::Existdb => existdb::connect(conn).await,
+        Family::Spacetimedb => spacetimedb::connect(conn).await,
+        Family::S3 => s3::connect(conn).await,
     }
 }
 
 pub async fn describe(integration: &dyn Integration) -> AppResult<SessionInfo> {
+    let family = profile(integration.engine().family());
     Ok(SessionInfo {
         engine: integration.engine(),
         capabilities: integration.capabilities(),
+        object_kinds: family.object_kinds,
+        tools: family.tools,
         server_version: integration.server_version().await.unwrap_or(None),
         database: integration.current_database(),
         databases: integration.databases().await.unwrap_or_default(),

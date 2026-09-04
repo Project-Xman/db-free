@@ -1,12 +1,13 @@
-// SOT: firestore-integration, firestore-rest-api, google-service-account-jwt, firestore-value-decoding, structured-query
+// SOT: firestore-integration, firestore-rest-api, google-service-account-jwt, firestore-value-decoding, structured-query, firestore-object-explorer
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::gcp_auth::GcpAuth;
-use crate::integrations::http::{json_result, json_to_value, json_type_name, Auth, HttpClient};
+use crate::integrations::http::{json_result, json_to_value, json_type_name, objects_to_result_set, Auth, HttpClient};
 use crate::integrations::{Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog,
-    SchemaInfo, SortRule, StatementResult, TableInfo, TableKind, TableRef, Value,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, ObjectDetail, ObjectKind, ObjectRef, ObjectSummary,
+    PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, SortRule, StatementResult, TableInfo, TableKind,
+    TableRef, Value,
 };
 use async_trait::async_trait;
 use reqwest::Method;
@@ -409,6 +410,254 @@ fn union_columns(docs: &[serde_json::Value]) -> Vec<ColumnInfo> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Object explorer
+// ---------------------------------------------------------------------------
+//
+// WHAT:  Databases of the project (`projects/{p}/databases`, the configured
+//        one always present), collections (root, or the sub-collections of a
+//        document path given as parent) and composite indexes from the
+//        Firestore Admin API (`collectionGroups/-/indexes`).
+// WHY:   Firestore has no server-side catalog beyond these three; there are no
+//        users, sessions or stats to show, so no Stats tool is declared.
+// HOW:   The Admin API needs `roles/datastore.indexAdmin` (or Owner) and is
+//        not served by the emulator; the database listing degrades to the
+//        configured database on any error, the index listing surfaces the
+//        error with that hint instead.
+
+type Json = serde_json::Value;
+
+const OBJECT_CAP: usize = 2_000;
+// WHAT:  Documents counted for a collection sheet before reporting "1,000+".
+const COUNT_PROBE: usize = 1_001;
+
+fn last_segment(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+fn jstr<'a>(v: &'a Json, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(Json::as_str)
+}
+
+fn items<'a>(v: &'a Json, key: &str) -> impl Iterator<Item = &'a Json> {
+    v.get(key).and_then(Json::as_array).into_iter().flatten()
+}
+
+fn pretty(v: &Json) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_default()
+}
+
+fn sorted(mut list: Vec<ObjectSummary>) -> Vec<ObjectSummary> {
+    list.sort_by(|a, b| a.reference.name.cmp(&b.reference.name));
+    list.truncate(OBJECT_CAP);
+    list
+}
+
+// WHAT:  The sidebar passes the catalog schema (`collections`) as parent for
+//        scoped kinds; anything else is a document path (`users/u1`).
+fn document_parent(parent: Option<&str>) -> Option<&str> {
+    parent.map(str::trim).filter(|p| !p.is_empty() && *p != COLLECTIONS)
+}
+
+fn database_badge(info: &Json) -> Option<&'static str> {
+    match jstr(info, "type") {
+        Some("FIRESTORE_NATIVE") => Some("native"),
+        Some("DATASTORE_MODE") => Some("datastore"),
+        _ => None,
+    }
+}
+
+// WHAT:  `projects/{p}/databases` → databases; the session's own is always listed.
+fn database_summaries(reply: &Json, current: &str) -> Vec<ObjectSummary> {
+    let mut list: Vec<ObjectSummary> = items(reply, "databases")
+        .filter_map(|db| {
+            let id = last_segment(jstr(db, "name")?);
+            let mut s = ObjectSummary::new(ObjectKind::Database, id, None);
+            if let Some(loc) = jstr(db, "locationId") {
+                s = s.with_detail(loc);
+            }
+            if let Some(b) = database_badge(db) {
+                s = s.with_badge(b);
+            }
+            Some(s)
+        })
+        .collect();
+    if !list.iter().any(|s| s.reference.name == current) {
+        list.push(ObjectSummary::new(ObjectKind::Database, current, None).with_badge("current"));
+    }
+    sorted(list)
+}
+
+fn collection_summaries(ids: &[String], parent: Option<&str>) -> Vec<ObjectSummary> {
+    let list = ids
+        .iter()
+        .map(|id| {
+            let name = match parent {
+                Some(p) => format!("{p}/{id}"),
+                None => id.clone(),
+            };
+            ObjectSummary::new(ObjectKind::Collection, name, parent.map(str::to_string))
+        })
+        .collect();
+    sorted(list)
+}
+
+fn collection_group_of(index_name: &str) -> Option<&str> {
+    let (_, rest) = index_name.split_once("/collectionGroups/")?;
+    rest.split('/').next().filter(|g| !g.is_empty())
+}
+
+fn index_fields_text(index: &Json) -> String {
+    items(index, "fields")
+        .filter_map(|f| {
+            let path = jstr(f, "fieldPath")?;
+            let mode = jstr(f, "order").or_else(|| jstr(f, "arrayConfig")).or_else(|| f.get("vectorConfig").map(|_| "VECTOR")).unwrap_or("");
+            Some(if mode.is_empty() { path.to_string() } else { format!("{path} {mode}") })
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// WHAT:  Admin API index list → indexes; `parent` narrows to one collection group.
+fn index_summaries(reply: &Json, parent: Option<&str>) -> Vec<ObjectSummary> {
+    let list = items(reply, "indexes")
+        .filter_map(|index| {
+            let full = jstr(index, "name")?;
+            let group = collection_group_of(full).unwrap_or("-");
+            if parent.is_some_and(|p| p != group) {
+                return None;
+            }
+            let mut detail = format!("{group}: {}", index_fields_text(index));
+            if jstr(index, "queryScope") == Some("COLLECTION_GROUP") {
+                detail.push_str(" (collection group)");
+            }
+            let mut s = ObjectSummary::new(ObjectKind::Index, last_segment(full), Some(group.to_string())).with_detail(detail);
+            if let Some(state) = jstr(index, "state") {
+                s = s.with_badge(state.to_lowercase());
+            }
+            Some(s)
+        })
+        .collect();
+    sorted(list)
+}
+
+fn database_detail(reference: &ObjectRef, info: &Json, project: &str, collections: Vec<ObjectSummary>) -> ObjectDetail {
+    let mut d = ObjectDetail::empty(reference).definition(pretty(info), CodeLanguage::Json).property("Project", project);
+    for (label, key) in [("Type", "type"), ("Location", "locationId"), ("Concurrency mode", "concurrencyMode"), ("Point-in-time recovery", "pointInTimeRecoveryEnablement"), ("Delete protection", "deleteProtectionState"), ("Created", "createTime"), ("Edition", "databaseEdition")] {
+        if let Some(v) = jstr(info, key) {
+            d = d.property(label, v);
+        }
+    }
+    d.children = collections;
+    d
+}
+
+// WHAT:  Collection sheet: probed document count and the sampled field union.
+fn collection_detail(reference: &ObjectRef, probed: usize, columns: Vec<ColumnInfo>) -> ObjectDetail {
+    let count = if probed >= COUNT_PROBE {
+        format!("{}+", crate::model::objects::format_number((COUNT_PROBE - 1) as f64))
+    } else {
+        crate::model::objects::format_number(probed as f64)
+    };
+    let (parent, id) = split_collection(&reference.name);
+    let mut d = ObjectDetail::empty(reference).property("Collection id", id).property("Documents", count).property("Fields sampled", columns.len().saturating_sub(1).to_string());
+    if let Some(p) = parent {
+        d = d.property("Parent document", p);
+    }
+    d.columns = columns;
+    d
+}
+
+fn index_detail(reference: &ObjectRef, index: &Json) -> ObjectDetail {
+    let mut d = ObjectDetail::empty(reference).definition(pretty(index), CodeLanguage::Json);
+    if let Some(group) = jstr(index, "name").and_then(collection_group_of) {
+        d = d.property("Collection group", group);
+    }
+    for (label, key) in [("Query scope", "queryScope"), ("State", "state"), ("API scope", "apiScope"), ("Density", "density")] {
+        if let Some(v) = jstr(index, key) {
+            d = d.property(label, v);
+        }
+    }
+    d = d.property("Fields", index_fields_text(index));
+    let rows: Vec<Json> = items(index, "fields")
+        .map(|f| serde_json::json!({"field": jstr(f, "fieldPath").unwrap_or_default(), "mode": jstr(f, "order").or_else(|| jstr(f, "arrayConfig")).unwrap_or("")}))
+        .collect();
+    if !rows.is_empty() {
+        d.rows = Some(objects_to_result_set(&rows, Some("field"), OBJECT_CAP));
+    }
+    d
+}
+
+// WHAT:  Admin API failures get the one hint that actually explains them.
+fn with_admin_hint(err: AppError, what: &str) -> AppError {
+    let hint = format!("{what} uses the Firestore Admin API: the credentials need roles/datastore.indexAdmin (or Owner) on the project, and the emulator does not serve it.");
+    match err {
+        AppError::Timeout { .. } => err,
+        AppError::NotConnected { message } => AppError::NotConnected { message: format!("{hint} ({message})") },
+        AppError::NotFound { message } => AppError::NotFound { message: format!("{hint} ({message})") },
+        other => AppError::Driver { message: format!("{hint} ({})", other.message()) },
+    }
+}
+
+impl FirestoreIntegration {
+    fn database_path(&self) -> String {
+        format!("/v1/projects/{}/databases/{}", self.project, self.database)
+    }
+
+    async fn list_indexes(&self) -> AppResult<Json> {
+        let base = format!("{}/collectionGroups/-/indexes", self.database_path());
+        let mut indexes: Vec<Json> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let path = match &token {
+                Some(t) => format!("{base}?pageToken={}", encode_query_value(t)),
+                None => base.clone(),
+            };
+            let reply = self.req(Method::GET, &path, None).await.map_err(|e| with_admin_hint(e, "Listing indexes"))?;
+            indexes.extend(items(&reply, "indexes").cloned());
+            match jstr(&reply, "nextPageToken").filter(|t| !t.is_empty()) {
+                Some(t) if indexes.len() < OBJECT_CAP => token = Some(t.to_string()),
+                _ => break,
+            }
+        }
+        Ok(serde_json::json!({"indexes": indexes}))
+    }
+
+    // WHAT:  How many documents a collection has, probing at most `COUNT_PROBE`
+    //        names (one runQuery selecting `__name__` only).
+    async fn probe_count(&self, table: &str) -> AppResult<usize> {
+        let (parent, coll) = split_collection(table);
+        let sq = serde_json::json!({"from": [{"collectionId": coll}], "select": {"fields": [{"fieldPath": "__name__"}]}, "limit": COUNT_PROBE});
+        Ok(self.run_query(parent.as_deref(), &sq).await?.len())
+    }
+}
+
+// WHAT:  Percent-encodes a page token for a query string.
+fn encode_query_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities::DOCUMENT,
+        object_kinds: vec![K::Database, K::Collection, K::Index],
+        tools: vec![],
+    }
+}
+
 #[async_trait]
 impl Integration for FirestoreIntegration {
     fn engine(&self) -> Engine {
@@ -416,7 +665,7 @@ impl Integration for FirestoreIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities::DOCUMENT
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -532,6 +781,45 @@ impl Integration for FirestoreIntegration {
     }
 
     async fn close(&self) {}
+
+    async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        match kind {
+            ObjectKind::Database => {
+                let reply = self.req(Method::GET, &format!("/v1/projects/{}/databases", self.project), None).await.unwrap_or(Json::Null);
+                Ok(database_summaries(&reply, &self.database))
+            }
+            ObjectKind::Collection => {
+                let parent = document_parent(parent);
+                Ok(collection_summaries(&self.list_collection_ids(parent).await?, parent))
+            }
+            ObjectKind::Index => Ok(index_summaries(&self.list_indexes().await?, document_parent(parent))),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        match reference.kind {
+            ObjectKind::Database => {
+                let info = self.req(Method::GET, &format!("/v1/projects/{}/databases/{}", self.project, reference.name), None).await.unwrap_or(Json::Null);
+                let collections = if reference.name == self.database { collection_summaries(&self.list_collection_ids(None).await?, None) } else { Vec::new() };
+                Ok(database_detail(reference, &info, &self.project, collections))
+            }
+            ObjectKind::Collection => {
+                let probed = self.probe_count(&reference.name).await?;
+                let columns = union_columns(&self.sample(&reference.name).await?);
+                Ok(collection_detail(reference, probed, columns))
+            }
+            ObjectKind::Index => {
+                let reply = self.list_indexes().await?;
+                let group = reference.parent.as_deref();
+                let index = items(&reply, "indexes")
+                    .find(|i| jstr(i, "name").is_some_and(|n| last_segment(n) == reference.name && group.is_none_or(|g| collection_group_of(n) == Some(g))))
+                    .ok_or_else(|| AppError::not_found(format!("Index {} not found.", reference.name)))?;
+                Ok(index_detail(reference, index))
+            }
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
 }
 
 fn split_blank_lines(text: &str) -> Vec<String> {
@@ -639,5 +927,80 @@ mod tests {
         assert!(matches!(parse_command(r#"{"set": {"path": "users/u1", "fields": {"a": 1}}}"#), Ok(Command::Set { .. })));
         assert!(matches!(parse_command(r#"{"delete": "users/u1"}"#), Ok(Command::Delete(_))));
         assert!(parse_command("SELECT 1").is_err());
+    }
+
+    #[test]
+    fn databases_and_collections_map() {
+        let reply = serde_json::json!({"databases": [
+            {"name": "projects/p/databases/(default)", "type": "FIRESTORE_NATIVE", "locationId": "eur3"},
+            {"name": "projects/p/databases/analytics", "type": "DATASTORE_MODE", "locationId": "us-central1"}
+        ]});
+        let dbs = database_summaries(&reply, "(default)");
+        assert_eq!(dbs.len(), 2);
+        assert_eq!(dbs[0].reference.name, "(default)");
+        assert_eq!(dbs[0].badge.as_deref(), Some("native"));
+        assert_eq!(dbs[0].detail.as_deref(), Some("eur3"));
+        assert_eq!(dbs[1].badge.as_deref(), Some("datastore"));
+        let fallback = database_summaries(&serde_json::Value::Null, "(default)");
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].badge.as_deref(), Some("current"));
+
+        let r = ObjectRef { kind: ObjectKind::Database, name: "(default)".into(), parent: None };
+        let d = database_detail(&r, &reply["databases"][0], "p", vec![ObjectSummary::new(ObjectKind::Collection, "users", None)]);
+        assert!(d.properties.iter().any(|p| p.name == "Location" && p.value == "eur3"));
+        assert_eq!(d.children.len(), 1);
+        assert!(d.actions.is_empty());
+
+        let root = collection_summaries(&["users".into(), "orders".into()], document_parent(Some("collections")));
+        assert_eq!(root[0].reference.name, "orders");
+        assert!(root[0].reference.parent.is_none());
+        let nested = collection_summaries(&["orders".into()], document_parent(Some("users/u1")));
+        assert_eq!(nested[0].reference.name, "users/u1/orders");
+        assert_eq!(nested[0].reference.parent.as_deref(), Some("users/u1"));
+
+        let cr = ObjectRef { kind: ObjectKind::Collection, name: "users/u1/orders".into(), parent: Some("users/u1".into()) };
+        let cols = union_columns(&[serde_json::json!({"_name": "o1", "total": 3})]);
+        let cd = collection_detail(&cr, COUNT_PROBE, cols);
+        assert!(cd.properties.iter().any(|p| p.name == "Documents" && p.value == "1,000+"));
+        assert!(cd.properties.iter().any(|p| p.name == "Parent document" && p.value == "users/u1"));
+        assert!(cd.properties.iter().any(|p| p.name == "Fields sampled" && p.value == "1"));
+        assert_eq!(cd.columns.len(), 2);
+        assert!(collection_detail(&cr, 12, vec![]).properties.iter().any(|p| p.name == "Documents" && p.value == "12"));
+    }
+
+    #[test]
+    fn indexes_map_with_group_and_state() {
+        let reply = serde_json::json!({"indexes": [
+            {"name": "projects/p/databases/(default)/collectionGroups/orders/indexes/CICAgJiUpoMK", "queryScope": "COLLECTION", "state": "READY",
+             "fields": [{"fieldPath": "userId", "order": "ASCENDING"}, {"fieldPath": "createdAt", "order": "DESCENDING"}]},
+            {"name": "projects/p/databases/(default)/collectionGroups/posts/indexes/CICAgJiUpoMB", "queryScope": "COLLECTION_GROUP", "state": "CREATING",
+             "fields": [{"fieldPath": "tags", "arrayConfig": "CONTAINS"}, {"fieldPath": "score", "order": "ASCENDING"}]}
+        ]});
+        let all = index_summaries(&reply, None);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1].reference.name, "CICAgJiUpoMK");
+        assert_eq!(all[1].reference.parent.as_deref(), Some("orders"));
+        assert_eq!(all[1].detail.as_deref(), Some("orders: userId ASCENDING, createdAt DESCENDING"));
+        assert_eq!(all[1].badge.as_deref(), Some("ready"));
+        assert_eq!(all[0].detail.as_deref(), Some("posts: tags CONTAINS, score ASCENDING (collection group)"));
+        assert_eq!(index_summaries(&reply, Some("posts")).len(), 1);
+        assert!(index_summaries(&reply, Some("nothing")).is_empty());
+
+        let r = ObjectRef { kind: ObjectKind::Index, name: "CICAgJiUpoMB".into(), parent: Some("posts".into()) };
+        let d = index_detail(&r, &reply["indexes"][1]);
+        assert_eq!(d.language, CodeLanguage::Json);
+        assert!(d.properties.iter().any(|p| p.name == "Collection group" && p.value == "posts"));
+        assert!(d.properties.iter().any(|p| p.name == "State" && p.value == "CREATING"));
+        assert_eq!(d.rows.as_ref().map(|r| r.rows.len()), Some(2));
+        assert!(d.actions.is_empty());
+
+        let hinted = with_admin_hint(AppError::not_connected("Authentication failed (403 Forbidden): denied"), "Listing indexes");
+        assert!(matches!(&hinted, AppError::NotConnected { message } if message.contains("indexAdmin") && message.contains("denied")));
+        let hinted = with_admin_hint(AppError::driver("501 Not Implemented"), "Listing indexes");
+        assert!(matches!(&hinted, AppError::Driver { message } if message.contains("emulator")));
+        assert!(matches!(with_admin_hint(AppError::timeout("slow"), "x"), AppError::Timeout { .. }));
+        assert_eq!(encode_query_value("a b/c"), "a%20b%2Fc");
+        assert_eq!(collection_group_of("projects/p/databases/d/collectionGroups/orders/indexes/x"), Some("orders"));
+        assert_eq!(collection_group_of("projects/p"), None);
     }
 }

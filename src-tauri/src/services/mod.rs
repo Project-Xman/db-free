@@ -11,6 +11,7 @@ pub mod connection;
 pub mod data;
 pub mod documents;
 pub mod history;
+pub mod objects;
 pub mod query;
 pub mod saved_queries;
 pub mod schema;

@@ -3,6 +3,7 @@
 pub mod changes;
 pub mod connection;
 pub mod documents;
+pub mod objects;
 pub mod query;
 pub mod schema;
 pub mod settings;
@@ -18,6 +19,11 @@ pub use documents::{
     ConditionOp, DashboardBody, DashboardVariable, DiagramBody, DiagramColumn, DiagramRelation, DiagramTable,
     Document, DocumentBody, DocumentKind, Widget, WidgetCondition, WidgetKind, WorkflowBody, WorkflowRunReport,
     WorkflowStep, WorkflowStepResult,
+};
+pub use objects::{
+    CodeLanguage, FacetCounts, FacetValue, ObjectAction, ObjectDetail, ObjectKind, ObjectProperty, ObjectRef, ObjectSummary,
+    RangeQueryRequest, RangeResult, SearchRequest, SearchResult, Series, ServerStats, Stat, StatGroup, Tool,
+    VectorSearchRequest,
 };
 pub use query::{
     ColumnMeta, EditorBuffer, FilterOp, FilterRule, HistoryEntry, HistoryOrigin, HistoryStatus,

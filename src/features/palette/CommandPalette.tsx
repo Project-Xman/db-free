@@ -5,6 +5,7 @@ import { tableKey, useActiveConnection, useWorkspace } from "@/stores/workspace"
 import { Icon, type IconName } from "@/lib/icons";
 import { EngineIcon } from "@/components/global/EngineIcon";
 import { engineMeta } from "@/lib/engines";
+import { TOOL_ORDER, toolMeta, toolsOf } from "@/lib/objects";
 
 const EMPTY_SECTIONS: string[] = [];
 
@@ -59,9 +60,19 @@ export function CommandPalette() {
       list.push({ id: "chat", section: "navigation", label: "Chat with database", hint: "Ask questions, explore schema, generate queries", icon: "braces", run: () => s.openChat(cid) });
       list.push({ id: "tables", section: "navigation", label: "Tables sidebar", icon: "table", run: () => s.setSidebar("tables") });
       list.push({ id: "queries", section: "navigation", label: "Saved queries sidebar", icon: "file", run: () => s.setSidebar("queries") });
+      list.push({ id: "objects", section: "navigation", label: "Objects sidebar", hint: "Views, functions, triggers, indexes, streams…", icon: "hierarchy", run: () => s.setSidebar("objects") });
+      list.push({ id: "admin", section: "navigation", label: "Server admin", hint: "Overview, sessions, users, settings", icon: "server", run: () => s.openAdmin(cid) });
+      const engine = s.connections.find((c) => c.id === cid)?.engine;
+      const tools = s.sessionInfos[cid]?.tools ?? (engine ? toolsOf(engine) : []);
+      for (const tool of TOOL_ORDER) {
+        if (!tools.includes(tool) || tool === "stats" || tool === "erd" || tool === "key_browser") continue;
+        const meta = toolMeta(tool);
+        list.push({ id: `tool:${tool}`, section: "navigation", label: meta.label, hint: meta.hint, icon: meta.icon, run: () => s.openTool(cid, tool) });
+      }
     }
     list.push({ id: "connections", section: "navigation", label: "Connections", icon: "plug", run: () => s.goConnections() });
     list.push({ id: "settings", section: "settings", label: "Settings", icon: "settings", run: () => s.goSettings() });
+    list.push({ id: "capabilities", section: "settings", label: "Engine capabilities", hint: "Feature × engine matrix", icon: "grid", run: () => s.goCapabilities() });
     for (const c of connections) {
       list.push({ id: `conn:${c.id}`, section: "connections", label: c.name, hint: engineMeta(c.engine).label, icon: "database", leading: <EngineIcon engine={c.engine} size={16} />, run: () => s.selectConnection(c.id) });
     }

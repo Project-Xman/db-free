@@ -8,13 +8,13 @@ use sha2::{Digest, Sha256};
 // ============================================================================
 // AWS SIGNATURE V4
 //
-// WHAT:  Signs JSON requests to AWS services (DynamoDB, QLDB) with the
-//        connection's access key / secret. No AWS SDK: the two services this
-//        app talks to are plain HTTPS+JSON, and the SDK would add ~150 crates.
+// WHAT:  Signs requests to AWS services (DynamoDB, QLDB, S3) with the
+//        connection's access key / secret. No AWS SDK: the services this app
+//        talks to are plain HTTPS, and the SDK would add ~150 crates.
 // WHY:   Keeping the signing in one audited module means the secret key is
 //        only ever read here and never logged.
 // HOW:   https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html
-// WHERE: src-tauri/src/integrations/dynamodb.rs, src-tauri/src/integrations/qldb.rs
+// WHERE: src-tauri/src/integrations/{dynamodb,qldb,s3}.rs
 // ============================================================================
 
 type HmacSha256 = Hmac<Sha256>;
@@ -75,31 +75,61 @@ pub struct SignedHeaders {
     pub headers: Vec<(String, String)>,
 }
 
-// WHAT:  Signs a POST with a JSON body for `service` (e.g. "dynamodb", "qldb-session").
-//        Returns every header the request must carry (host, x-amz-date, x-amz-target,
-//        content-type, x-amz-security-token, authorization).
+// WHAT:  Percent-encodes one path segment or query value the way SigV4 wants.
+// WHY:   S3 keys carry spaces, `+` and unicode; the canonical request must use
+//        the same encoding the server derives or every signature mismatches.
+//        Unreserved characters are A-Z a-z 0-9 - _ . ~ and nothing else.
+pub fn uri_encode(raw: &str, encode_slash: bool) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.as_bytes() {
+        let c = *byte as char;
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+            out.push(c);
+        } else if c == '/' && !encode_slash {
+            out.push('/');
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+// WHAT:  One request to sign. `query` is the canonical query string — keys
+//        sorted, both sides already `uri_encode`d — or "" when there is none.
+//        `content_type` is None for bodyless verbs so it is not signed.
+// HOW:   Returns every header the request must carry (host, x-amz-date,
+//        x-amz-target, content-type, x-amz-security-token, authorization).
 pub struct SignRequest<'a> {
     pub service: &'a str,
+    pub method: &'a str,
     pub host: &'a str,
     pub path: &'a str,
+    pub query: &'a str,
     pub amz_target: Option<&'a str>,
-    pub content_type: &'a str,
+    pub content_type: Option<&'a str>,
     pub body: &'a [u8],
     pub now: chrono::DateTime<chrono::Utc>,
 }
 
+/// Signs a POST with a JSON body — the shape DynamoDB and QLDB use.
 pub fn sign_post(creds: &AwsCredentials, req: &SignRequest<'_>) -> AppResult<SignedHeaders> {
-    let SignRequest { service, host, path, amz_target, content_type, body, now } = *req;
+    sign(creds, req)
+}
+
+pub fn sign(creds: &AwsCredentials, req: &SignRequest<'_>) -> AppResult<SignedHeaders> {
+    let SignRequest { service, method, host, path, query, amz_target, content_type, body, now } = *req;
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
     let date_stamp = now.format("%Y%m%d").to_string();
     let payload_hash = sha256_hex(body);
 
     let mut headers: Vec<(String, String)> = vec![
-        ("content-type".into(), content_type.into()),
         ("host".into(), host.into()),
         ("x-amz-content-sha256".into(), payload_hash.clone()),
         ("x-amz-date".into(), amz_date.clone()),
     ];
+    if let Some(ct) = content_type {
+        headers.push(("content-type".into(), ct.into()));
+    }
     if let Some(t) = amz_target {
         headers.push(("x-amz-target".into(), t.into()));
     }
@@ -110,7 +140,7 @@ pub fn sign_post(creds: &AwsCredentials, req: &SignRequest<'_>) -> AppResult<Sig
 
     let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{}\n", v.trim())).collect();
     let signed_headers: String = headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
-    let canonical_request = format!("POST\n{path}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+    let canonical_request = format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
 
     let scope = format!("{date_stamp}/{}/{service}/aws4_request", creds.region);
     let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(canonical_request.as_bytes()));
@@ -153,10 +183,12 @@ mod tests {
             &creds,
             &SignRequest {
                 service: "dynamodb",
+                method: "POST",
                 host: "dynamodb.us-east-1.amazonaws.com",
                 path: "/",
+                query: "",
                 amz_target: Some("DynamoDB_20120810.ListTables"),
-                content_type: "application/x-amz-json-1.0",
+                content_type: Some("application/x-amz-json-1.0"),
                 body: b"{}",
                 now: now.unwrap_or_default(),
             },
@@ -192,5 +224,15 @@ mod tests {
         let c = AwsCredentials::from_connection(&conn).unwrap_or_else(|_| AwsCredentials { region: String::new(), access_key: String::new(), secret_key: String::new(), session_token: None });
         assert_eq!(c.secret_key, "SECRET");
         assert_eq!(c.session_token.as_deref(), Some("TOKEN"));
+    }
+
+    #[test]
+    fn uri_encoding_follows_the_sigv4_rules() {
+        // Unreserved characters pass through; everything else is %XX upper-case.
+        assert_eq!(uri_encode("a-z_0.9~", true), "a-z_0.9~");
+        assert_eq!(uri_encode("my key+1", true), "my%20key%2B1");
+        // A path keeps its separators, an object key used as a value does not.
+        assert_eq!(uri_encode("logs/2026/app.log", false), "logs/2026/app.log");
+        assert_eq!(uri_encode("logs/2026/app.log", true), "logs%2F2026%2Fapp.log");
     }
 }

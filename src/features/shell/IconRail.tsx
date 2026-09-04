@@ -8,14 +8,21 @@ import { cn } from "@/lib/cn";
 
 const SIDEBARS: readonly { mode: SidebarMode; icon: IconName; label: string }[] = [
   { mode: "tables", icon: "table", label: "Tables" },
+  { mode: "objects", icon: "hierarchy", label: "Objects" },
   { mode: "queries", icon: "file", label: "Saved queries" },
   { mode: "dashboards", icon: "columns", label: "Dashboards" },
   { mode: "workflows", icon: "play", label: "Workflows" },
   { mode: "diagrams", icon: "view", label: "Schema diagrams" },
 ];
 
+// On macOS the rail is as wide as the traffic-light cluster: tauri.conf.json
+// places the close button at x=9, the three 12px buttons sit 20px apart
+// (right edge 61px), and the same 9px margin on the right gives 70px.
+const RAIL_WIDTH_MAC = "w-[80px]";
+
 // WHAT:  Left rail: connections home, one entry per sidebar, history/transfer
-//        shortcuts, settings. Its top is the window drag region.
+//        shortcuts, settings. Its top is the window drag region and, on
+//        macOS, it is exactly as wide as the traffic lights.
 export function IconRail() {
   const page = useWorkspace((s) => s.page);
   const sidebar = useWorkspace((s) => s.sidebar);
@@ -23,15 +30,17 @@ export function IconRail() {
   const connected = useWorkspace((s) => (activeId ? s.sessions.includes(activeId) : false));
   const goConnections = useWorkspace((s) => s.goConnections);
   const goSettings = useWorkspace((s) => s.goSettings);
+  const goCapabilities = useWorkspace((s) => s.goCapabilities);
   const setSidebar = useWorkspace((s) => s.setSidebar);
   const openHistory = useWorkspace((s) => s.openHistory);
   const openTransfer = useWorkspace((s) => s.openTransfer);
   const openChat = useWorkspace((s) => s.openChat);
+  const openAdmin = useWorkspace((s) => s.openAdmin);
   const setPaletteOpen = useWorkspace((s) => s.setPaletteOpen);
   const inWorkspace = page.kind === "workspace";
 
   return (
-    <nav className="flex w-11 shrink-0 flex-col items-center glass-dock pb-2.5" aria-label="Primary">
+    <nav className={cn("flex shrink-0 flex-col items-center glass-dock pb-2.5", isMac() ? RAIL_WIDTH_MAC : "w-11")} aria-label="Primary">
       <div className={cn("drag-region w-full shrink-0", isMac() ? "h-11" : "h-3")} data-tauri-drag-region />
       <Button
         isIconOnly
@@ -65,8 +74,10 @@ export function IconRail() {
         <IconButton icon="history" label="Query history" isDisabled={!connected} onPress={() => activeId && openHistory(activeId)} size={16} />
         <IconButton icon="download" label="Export / Import" isDisabled={!connected} onPress={() => activeId && openTransfer(activeId)} size={16} />
         <IconButton icon="braces" label="Chat with database" isDisabled={!connected} onPress={() => activeId && openChat(activeId)} size={16} />
+        <IconButton icon="server" label="Server admin" isDisabled={!connected} onPress={() => activeId && openAdmin(activeId)} size={16} />
       </div>
       <div className="mt-auto flex flex-col items-center gap-1">
+        <IconButton icon="grid" label="Engine capabilities" active={page.kind === "capabilities"} onPress={goCapabilities} size={16} />
         <IconButton icon="settings" label="Settings" active={page.kind === "settings"} onPress={goSettings} size={16} />
       </div>
     </nav>

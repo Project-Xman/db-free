@@ -1,4 +1,4 @@
-// SOT: workspace-store, pages, tabs, sidebar-mode, active-connection, catalog-cache, foreign-key-cache, session-info-cache, settings-cache, pending-changes, saved-queries-cache, documents-cache, ui-toasts
+// SOT: workspace-store, pages, tabs, sidebar-mode, active-connection, catalog-cache, foreign-key-cache, objects-cache, session-info-cache, settings-cache, pending-changes, saved-queries-cache, documents-cache, ui-toasts
 import { create } from "zustand";
 import { toast } from "@heroui/react";
 import type {
@@ -11,24 +11,29 @@ import type {
   DocumentKind,
   FilterRule,
   ForeignKey,
+  ObjectKind,
+  ObjectRef,
+  ObjectSummary,
   SavedQuery,
   SchemaCatalog,
   SessionInfo,
   StagedChange,
   TableRef,
+  Tool,
 } from "@/lib/bindings";
 import { errorMessage, ipc, normalizeError } from "@/lib/ipc";
 import type { Density } from "@/lib/format";
 import type { EnginePreset } from "@/lib/engines";
 
-export type SidebarMode = "tables" | "queries" | "dashboards" | "workflows" | "diagrams";
+export type SidebarMode = "tables" | "objects" | "queries" | "dashboards" | "workflows" | "diagrams";
 
 export type Page =
   | { kind: "connections" }
   | { kind: "connection-picker" }
   | { kind: "connection-form"; editingId: string | null; preset?: EnginePreset; draft?: ConnectionInput }
   | { kind: "workspace" }
-  | { kind: "settings" };
+  | { kind: "settings" }
+  | { kind: "capabilities" };
 
 export type Tab =
   | { id: string; kind: "table"; connectionId: string; table: TableRef; initialFilters?: FilterRule[]; filterKey: number }
@@ -37,10 +42,22 @@ export type Tab =
   | { id: string; kind: "transfer"; connectionId: string }
   | { id: string; kind: "erd"; connectionId: string; schema: string | null }
   | { id: string; kind: "document"; connectionId: string | null; documentKind: DocumentKind; documentId: string }
-  | { id: string; kind: "chat"; connectionId: string };
+  | { id: string; kind: "chat"; connectionId: string }
+  | { id: string; kind: "object"; connectionId: string; reference: ObjectRef }
+  | { id: string; kind: "admin"; connectionId: string }
+  | { id: string; kind: "tool"; connectionId: string; tool: Tool };
 
 export function tableKey(table: TableRef): string {
   return table.schema === null ? table.name : `${table.schema}.${table.name}`;
+}
+
+export function objectKey(reference: ObjectRef): string {
+  return `${reference.kind}:${reference.parent ?? ""}:${reference.name}`;
+}
+
+// WHAT:  Cache key for one object listing (connection + kind + namespace).
+export function objectsKey(connectionId: string, kind: ObjectKind, parent: string | null): string {
+  return `${connectionId}:${kind}:${parent ?? ""}`;
 }
 
 let queryCounter = 0;
@@ -57,6 +74,8 @@ interface WorkspaceState {
   catalogs: Record<string, SchemaCatalog>;
   foreignKeys: Record<string, ForeignKey[]>;
   columnsCache: Record<string, ColumnInfo[]>;
+  /// Object explorer listings, keyed by objectsKey(); cleared on disconnect / database switch.
+  objectsCache: Record<string, ObjectSummary[]>;
   schemaFilter: Record<string, string | null>;
   activeConnectionId: string | null;
   connecting: string | null;
@@ -75,6 +94,7 @@ interface WorkspaceState {
   goPicker: () => void;
   goWorkspace: () => void;
   goSettings: () => void;
+  goCapabilities: () => void;
   openForm: (editingId?: string, preset?: EnginePreset, draft?: ConnectionInput) => void;
   setSidebar: (mode: SidebarMode) => void;
   setPaletteOpen: (open: boolean) => void;
@@ -89,12 +109,18 @@ interface WorkspaceState {
   setSchemaFilter: (id: string, schema: string | null) => void;
   loadCatalog: (id: string) => Promise<void>;
   loadColumns: (id: string, table: TableRef) => Promise<ColumnInfo[]>;
+  loadObjects: (id: string, kind: ObjectKind, parent: string | null, force?: boolean) => Promise<ObjectSummary[]>;
+  /// Drops every cached listing for the connection (after an action changed the server).
+  invalidateObjects: (id: string) => void;
   openTable: (connectionId: string, table: TableRef, filters?: FilterRule[]) => void;
   openQuery: (connectionId: string, seedSql?: string, title?: string) => void;
   openHistory: (connectionId: string) => void;
   openTransfer: (connectionId: string) => void;
   openErd: (connectionId: string, schema: string | null) => void;
   openChat: (connectionId: string) => void;
+  openObject: (connectionId: string, reference: ObjectRef) => void;
+  openAdmin: (connectionId: string) => void;
+  openTool: (connectionId: string, tool: Tool) => void;
   openDocument: (kind: DocumentKind, documentId: string, connectionId: string | null) => void;
   closeTab: (id: string) => void;
   activateTab: (id: string) => void;
@@ -129,6 +155,10 @@ function withoutKey<T>(record: Record<string, T>, key: string): Record<string, T
   return Object.fromEntries(Object.entries(record).filter(([k]) => k !== key));
 }
 
+function withoutPrefix<T>(record: Record<string, T>, prefix: string): Record<string, T> {
+  return Object.fromEntries(Object.entries(record).filter(([k]) => !k.startsWith(prefix)));
+}
+
 function addTab(tabs: Tab[], tab: Tab): Tab[] {
   return tabs.some((t) => t.id === tab.id) ? tabs : [...tabs, tab];
 }
@@ -145,6 +175,7 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => ({
   catalogs: {},
   foreignKeys: {},
   columnsCache: {},
+  objectsCache: {},
   schemaFilter: {},
   activeConnectionId: null,
   connecting: null,
@@ -185,6 +216,7 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => ({
   goPicker: () => set({ page: { kind: "connection-picker" } }),
   goWorkspace: () => set({ page: { kind: "workspace" } }),
   goSettings: () => set({ page: { kind: "settings" } }),
+  goCapabilities: () => set({ page: { kind: "capabilities" } }),
   openForm: (editingId, preset, draft) =>
     set({ page: { kind: "connection-form", editingId: editingId ?? null, ...(preset ? { preset } : {}), ...(draft ? { draft } : {}) } }),
   setSidebar: (mode) => set({ sidebar: mode, page: { kind: "workspace" } }),
@@ -221,6 +253,7 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => ({
       catalogs: withoutKey(s.catalogs, id),
       foreignKeys: withoutKey(s.foreignKeys, id),
       sessionInfos: withoutKey(s.sessionInfos, id),
+      objectsCache: withoutPrefix(s.objectsCache, `${id}:`),
       tabs: s.tabs.filter((t) => t.connectionId !== id),
       activeTabId: s.tabs.find((t) => t.id === s.activeTabId)?.connectionId === id ? null : s.activeTabId,
       activeConnectionId: s.activeConnectionId === id ? null : s.activeConnectionId,
@@ -253,6 +286,7 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => ({
       sessions: s.sessions.filter((x) => x !== id),
       catalogs: withoutKey(s.catalogs, id),
       sessionInfos: withoutKey(s.sessionInfos, id),
+      objectsCache: withoutPrefix(s.objectsCache, `${id}:`),
       tabs: s.tabs.filter((t) => t.connectionId !== id),
     }));
   },
@@ -270,8 +304,9 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => ({
     const ok = await get().connect(id, database);
     if (ok) {
       set((s) => ({
-        tabs: s.tabs.filter((t) => !(t.connectionId === id && (t.kind === "table" || t.kind === "erd"))),
+        tabs: s.tabs.filter((t) => !(t.connectionId === id && (t.kind === "table" || t.kind === "erd" || t.kind === "object"))),
         columnsCache: {},
+        objectsCache: withoutPrefix(s.objectsCache, `${id}:`),
         schemaFilter: { ...s.schemaFilter, [id]: null },
         pendingChanges: withoutKey(s.pendingChanges, id),
       }));
@@ -312,6 +347,17 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => ({
     return columns;
   },
 
+  // WHAT:  One object listing per (connection, kind, namespace), cached until a
+  //        refresh asks with `force` or the session changes.
+  loadObjects: async (id, kind, parent, force = false) => {
+    const key = objectsKey(id, kind, parent);
+    const cached = get().objectsCache[key];
+    if (cached && !force) return cached;
+    const objects = await ipc("list_objects", { connectionId: id, kind, parent });
+    set((s) => ({ objectsCache: { ...s.objectsCache, [key]: objects } }));
+    return objects;
+  },
+
   // WHAT:  Opens (or focuses) a table tab; with `filters` (foreign-key traversal)
   //        the tab remounts with those filters applied.
   openTable: (connectionId, table, filters) => {
@@ -349,6 +395,23 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => ({
   openChat: (connectionId) => {
     const id = `chat:${connectionId}`;
     set((s) => ({ tabs: addTab(s.tabs, { id, kind: "chat", connectionId }), activeTabId: id, page: { kind: "workspace" } }));
+  },
+
+  invalidateObjects: (id) => set((s) => ({ objectsCache: withoutPrefix(s.objectsCache, `${id}:`) })),
+
+  openObject: (connectionId, reference) => {
+    const id = `object:${connectionId}:${objectKey(reference)}`;
+    set((s) => ({ tabs: addTab(s.tabs, { id, kind: "object", connectionId, reference }), activeTabId: id, page: { kind: "workspace" } }));
+  },
+
+  openAdmin: (connectionId) => {
+    const id = `admin:${connectionId}`;
+    set((s) => ({ tabs: addTab(s.tabs, { id, kind: "admin", connectionId }), activeTabId: id, page: { kind: "workspace" } }));
+  },
+
+  openTool: (connectionId, tool) => {
+    const id = `tool:${connectionId}:${tool}`;
+    set((s) => ({ tabs: addTab(s.tabs, { id, kind: "tool", connectionId, tool }), activeTabId: id, page: { kind: "workspace" } }));
   },
 
   openDocument: (kind, documentId, connectionId) => {

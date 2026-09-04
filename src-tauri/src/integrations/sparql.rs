@@ -1,13 +1,16 @@
-// SOT: sparql-integration, rdf-triple-store, sparql-protocol, jena-graphdb-stardog-blazegraph-virtuoso, sparql-results-json
+// SOT: sparql-integration, rdf-triple-store, sparql-protocol, jena-graphdb-stardog-blazegraph-virtuoso, sparql-results-json, sparql-object-explorer, sparql-server-stats, rdf-prefixes
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::http::{Auth, HttpClient};
 use crate::integrations::{Capabilities, Integration};
+use crate::model::objects::format_number;
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog,
-    SchemaInfo, SortRule, StatementResult, TableInfo, TableKind, TableRef, Value,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, ObjectAction, ObjectDetail, ObjectKind, ObjectRef,
+    ObjectSummary, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, ServerStats, SortRule, Stat,
+    StatGroup, StatementResult, TableInfo, TableKind, TableRef, Value,
 };
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 // ============================================================================
@@ -386,6 +389,514 @@ fn urlencode(raw: &str) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Object explorer / administration
+//
+// WHAT:  Datasets (the endpoint's repositories, when it has an admin API),
+//        named graphs with their triple counts, and the prefixes actually used
+//        by the data.
+// WHY:   SPARQL 1.1 has no catalog: only the graph list is standard. Everything
+//        else is per-product (`/$/datasets` on Fuseki, `/rest/repositories` on
+//        GraphDB, `/admin/databases` on Stardog), so each is tried and the
+//        configured dataset is the honest fallback.
+// HOW:   Prefixes are a bundled well-known list merged with the namespaces seen
+//        in a sample of the data — never invented. Actions are SPARQL Update
+//        (`CLEAR GRAPH`, `DROP GRAPH`), which `query_kind` classifies as update
+//        and the read-only lock already refuses.
+// ---------------------------------------------------------------------------
+
+const LIST_CAP: usize = 2_000;
+const GRAPH_LIST_CAP: usize = 500;
+const SAMPLE_TRIPLES: usize = 50;
+const PREFIX_SAMPLE: usize = 1_000;
+
+// WHAT:  Prefixes every RDF tool ships with; shown even when the data does not
+//        use them yet, so the list is a usable reference rather than a guess.
+const COMMON_PREFIXES: [(&str, &str); 14] = [
+    ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+    ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
+    ("owl", "http://www.w3.org/2002/07/owl#"),
+    ("xsd", "http://www.w3.org/2001/XMLSchema#"),
+    ("foaf", "http://xmlns.com/foaf/0.1/"),
+    ("dc", "http://purl.org/dc/elements/1.1/"),
+    ("dcterms", "http://purl.org/dc/terms/"),
+    ("skos", "http://www.w3.org/2004/02/skos/core#"),
+    ("schema", "http://schema.org/"),
+    ("sh", "http://www.w3.org/ns/shacl#"),
+    ("prov", "http://www.w3.org/ns/prov#"),
+    ("void", "http://rdfs.org/ns/void#"),
+    ("geo", "http://www.w3.org/2003/01/geo/wgs84_pos#"),
+    ("sd", "http://www.w3.org/ns/sparql-service-description#"),
+];
+
+fn jstr(row: &serde_json::Value, key: &str) -> Option<String> {
+    row.get(key).filter(|v| !v.is_null()).map(|v| match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    })
+    .filter(|s| !s.is_empty())
+}
+
+fn finish(mut out: Vec<ObjectSummary>) -> Vec<ObjectSummary> {
+    out.sort_by(|a, b| a.reference.name.cmp(&b.reference.name));
+    out.truncate(LIST_CAP);
+    out
+}
+
+// ---- datasets ----------------------------------------------------------------
+
+// WHAT:  Fuseki `/$/datasets` → one Dataset per `ds.name`, with its services.
+fn fuseki_datasets(body: &serde_json::Value) -> Vec<ObjectSummary> {
+    let items = body.get("datasets").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    finish(
+        items
+            .iter()
+            .filter_map(|d| {
+                let name = jstr(d, "ds.name")?.trim_start_matches('/').to_string();
+                let services: Vec<String> = d
+                    .get("ds.services")
+                    .and_then(|s| s.as_array())
+                    .map(|a| a.iter().filter_map(|s| jstr(s, "srv.type")).collect())
+                    .unwrap_or_default();
+                let state = d.get("ds.state").and_then(|s| s.as_bool()).unwrap_or(true);
+                let mut s = ObjectSummary::new(ObjectKind::Dataset, name, None).with_badge(if state { "active" } else { "offline" });
+                if !services.is_empty() {
+                    s = s.with_detail(services.join(", "));
+                }
+                Some(s)
+            })
+            .collect(),
+    )
+}
+
+// WHAT:  GraphDB `/rest/repositories` → one Dataset per repository id.
+fn graphdb_repositories(body: &serde_json::Value) -> Vec<ObjectSummary> {
+    let items = body.as_array().cloned().unwrap_or_default();
+    finish(
+        items
+            .iter()
+            .filter_map(|r| {
+                let id = jstr(r, "id")?;
+                let mut parts = Vec::new();
+                if let Some(t) = jstr(r, "title") {
+                    parts.push(t);
+                }
+                if let Some(l) = jstr(r, "location").filter(|l| !l.is_empty()) {
+                    parts.push(l);
+                }
+                let writable = r.get("writable").and_then(|w| w.as_bool()).unwrap_or(true);
+                let mut s = ObjectSummary::new(ObjectKind::Dataset, id, None).with_badge(if writable { "read-write" } else { "read-only" });
+                if !parts.is_empty() {
+                    s = s.with_detail(parts.join(" · "));
+                }
+                Some(s)
+            })
+            .collect(),
+    )
+}
+
+// WHAT:  Stardog `/admin/databases` → `{"databases": ["db", …]}`.
+fn stardog_databases(body: &serde_json::Value) -> Vec<ObjectSummary> {
+    let items = body.get("databases").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    finish(
+        items
+            .iter()
+            .filter_map(|d| d.as_str())
+            .map(|name| ObjectSummary::new(ObjectKind::Dataset, name, None).with_badge("database"))
+            .collect(),
+    )
+}
+
+fn dataset_detail(reference: &ObjectRef, entry: Option<&serde_json::Value>, triples: Option<i64>, graphs: Option<usize>) -> ObjectDetail {
+    let mut d = ObjectDetail::empty(reference);
+    if let Some(e) = entry {
+        d = d.definition(serde_json::to_string_pretty(e).unwrap_or_default(), CodeLanguage::Json);
+        if let Some(services) = e.get("ds.services").and_then(|s| s.as_array()) {
+            d.rows = Some(ResultSet {
+                columns: ["service", "description", "endpoints"].iter().map(|n| ColumnMeta { name: (*n).into(), type_name: "string".into() }).collect(),
+                rows: services
+                    .iter()
+                    .map(|s| {
+                        let endpoints = s.get("srv.endpoints").and_then(|e| e.as_array()).map(|a| a.iter().filter_map(|e| e.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+                        vec![
+                            Value::Text(jstr(s, "srv.type").unwrap_or_default()),
+                            Value::Text(jstr(s, "srv.description").unwrap_or_default()),
+                            Value::Text(endpoints),
+                        ]
+                    })
+                    .collect(),
+                truncated: false,
+            });
+        }
+    }
+    if let Some(t) = triples {
+        d = d.property("triples", format_number(t as f64));
+    }
+    if let Some(g) = graphs {
+        d = d.property("named graphs", g.to_string());
+    }
+    // Deleting a dataset is an admin HTTP call, not SPARQL, and every action
+    // must run through `execute`, so only read-only queries are offered here.
+    d.action(ObjectAction::new("count", "Count triples", "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }"))
+        .action(ObjectAction::new("graphs", "List graphs", "SELECT ?g (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g ORDER BY DESC(?n)"))
+}
+
+// ---- graphs ---------------------------------------------------------------------
+
+fn graph_summaries(counts: &[(String, i64)]) -> Vec<ObjectSummary> {
+    finish(
+        counts
+            .iter()
+            .map(|(name, n)| {
+                let mut s = ObjectSummary::new(ObjectKind::Graph, name.clone(), None).with_detail(format!("{} triples", format_number(*n as f64)));
+                if name == DEFAULT_GRAPH {
+                    s = s.with_badge("default");
+                } else {
+                    s = s.with_badge("named");
+                }
+                s
+            })
+            .collect(),
+    )
+}
+
+fn graph_sample_query(graph: &str) -> String {
+    let body = if graph == DEFAULT_GRAPH { "?subject ?predicate ?object .".to_string() } else { format!("GRAPH {} {{ ?subject ?predicate ?object . }}", iri(graph)) };
+    format!("SELECT ?subject ?predicate ?object WHERE {{ {body} }} LIMIT {SAMPLE_TRIPLES}")
+}
+
+fn graph_detail(reference: &ObjectRef, count: Option<i64>, sample: Option<ResultSet>) -> ObjectDetail {
+    let name = reference.name.as_str();
+    let default = name == DEFAULT_GRAPH;
+    let mut d = ObjectDetail::empty(reference).definition(graph_sample_query(name), CodeLanguage::Text);
+    if let Some(c) = count {
+        d = d.property("triples", format_number(c as f64));
+    }
+    d = d.property("graph", if default { "the endpoint's default graph".into() } else { iri(name) });
+    d.rows = sample;
+    let target = if default { "DEFAULT".to_string() } else { format!("GRAPH {}", iri(name)) };
+    d.action(ObjectAction::new("sample", "Sample 50", graph_sample_query(name)))
+        .action(ObjectAction::destructive("clear", "Clear graph", format!("CLEAR {target}")))
+        .action(ObjectAction::destructive("drop", "Drop graph", format!("DROP {target}")))
+}
+
+// ---- prefixes ---------------------------------------------------------------------
+
+// WHAT:  The namespace part of an IRI: everything up to and including the last
+//        `#` or `/` (the split RDF tools use for QNames).
+fn namespace_of(term: &str) -> Option<String> {
+    let cut = term.rfind('#').map(|i| i + 1).or_else(|| term.rfind('/').map(|i| i + 1))?;
+    let ns = &term[..cut];
+    (cut < term.len() && ns.starts_with("http")).then(|| ns.to_string())
+}
+
+fn well_known(namespace: &str) -> Option<&'static str> {
+    COMMON_PREFIXES.iter().find(|(_, ns)| *ns == namespace).map(|(p, _)| *p)
+}
+
+// WHAT:  Well-known prefixes ∪ the namespaces the sampled data actually uses.
+fn prefix_summaries(uses: &BTreeMap<String, i64>) -> Vec<ObjectSummary> {
+    let mut all: BTreeMap<String, i64> = uses.clone();
+    for (_, ns) in COMMON_PREFIXES {
+        all.entry(ns.to_string()).or_insert(0);
+    }
+    finish(
+        all.into_iter()
+            .map(|(namespace, count)| {
+                let label = well_known(&namespace);
+                let name = label.map(str::to_string).unwrap_or_else(|| namespace.clone());
+                let detail = if count > 0 { format!("{namespace} · {} use(s) in the sample", format_number(count as f64)) } else { namespace.clone() };
+                let badge = match (label.is_some(), count > 0) {
+                    (true, true) => "well-known",
+                    (true, false) => "unused",
+                    (false, _) => "in data",
+                };
+                ObjectSummary::new(ObjectKind::Prefix, name, None).with_detail(detail).with_badge(badge)
+            })
+            .collect(),
+    )
+}
+
+fn prefix_namespace(reference: &ObjectRef) -> String {
+    COMMON_PREFIXES
+        .iter()
+        .find(|(p, _)| *p == reference.name)
+        .map(|(_, ns)| (*ns).to_string())
+        .unwrap_or_else(|| reference.name.clone())
+}
+
+fn prefix_detail(reference: &ObjectRef, count: Option<i64>, sample: Option<ResultSet>) -> ObjectDetail {
+    let namespace = prefix_namespace(reference);
+    let label = well_known(&namespace).unwrap_or("ns");
+    let mut d = ObjectDetail::empty(reference)
+        .definition(format!("PREFIX {label}: {}", iri(&namespace)), CodeLanguage::Text)
+        .property("namespace", namespace.clone());
+    if let Some(c) = count {
+        d = d.property("uses in sample", format_number(c as f64));
+    }
+    d = d.property("source", if well_known(&namespace).is_some() { "well-known prefix" } else { "seen in the data" });
+    d.rows = sample;
+    d.action(ObjectAction::new(
+        "sample",
+        "Sample statements",
+        format!("SELECT ?s ?p ?o WHERE {{ ?s ?p ?o FILTER(STRSTARTS(STR(?p), {})) }} LIMIT 25", sparql_string(&namespace)),
+    ))
+}
+
+// ---- stats ----------------------------------------------------------------------------
+
+// WHAT:  Fuseki `/$/stats` → the counters it keeps per dataset.
+fn fuseki_stats(body: &serde_json::Value, dataset: &str) -> Vec<Stat> {
+    let Some(datasets) = body.get("datasets").and_then(|d| d.as_object()) else { return Vec::new() };
+    let entry = datasets
+        .iter()
+        .find(|(k, _)| k.trim_start_matches('/') == dataset)
+        .or_else(|| datasets.iter().next())
+        .map(|(_, v)| v);
+    let Some(entry) = entry.and_then(|e| e.as_object()) else { return Vec::new() };
+    let mut out = Vec::new();
+    for (key, label) in [("Requests", "Requests"), ("RequestsGood", "Successful"), ("RequestsBad", "Failed")] {
+        if let Some(n) = entry.get(key).and_then(|v| v.as_f64()) {
+            out.push(Stat::number(label, n, None));
+        }
+    }
+    out
+}
+
+// WHAT:  A size endpoint's body: a bare number (GraphDB, Stardog) or JSON.
+fn size_from_body(body: &str) -> Option<i64> {
+    let t = body.trim();
+    if let Ok(n) = t.parse::<i64>() {
+        return Some(n);
+    }
+    let v: serde_json::Value = serde_json::from_str(t).ok()?;
+    ["total", "size", "count", "inferred", "explicit"].iter().find_map(|k| v.get(*k).and_then(|n| n.as_i64()))
+}
+
+// WHAT:  The figures the Data group is built from; counted with SPARQL except
+//        `size`, which the store reports through its own admin API.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct DataCounts {
+    triples: Option<i64>,
+    graphs: usize,
+    classes: Option<i64>,
+    predicates: Option<i64>,
+    size: Option<i64>,
+}
+
+fn stat_groups(engine: Engine, dataset: &str, counts: &DataCounts, requests: Vec<Stat>) -> Vec<StatGroup> {
+    let DataCounts { triples, graphs, classes, predicates, size } = *counts;
+    let product = match engine {
+        Engine::ApacheJena => "Apache Jena Fuseki",
+        Engine::Graphdb => "GraphDB",
+        Engine::Stardog => "Stardog",
+        Engine::Blazegraph => "Blazegraph",
+        Engine::Virtuoso => "Virtuoso",
+        _ => "SPARQL 1.1",
+    };
+    let mut groups = vec![StatGroup { title: "Server".into(), stats: vec![Stat::text("Endpoint", product), Stat::text("Dataset", dataset)] }];
+    let mut data = Vec::new();
+    if let Some(t) = triples {
+        data.push(Stat::number("Triples", t as f64, None));
+    }
+    data.push(Stat::number("Named graphs", graphs as f64, None));
+    if let Some(c) = classes {
+        data.push(Stat::number("Classes", c as f64, None));
+    }
+    if let Some(p) = predicates {
+        data.push(Stat::number("Predicates", p as f64, None));
+    }
+    if let Some(s) = size {
+        data.push(Stat::number("Statements (server)", s as f64, None).with_hint("reported by the store"));
+    }
+    groups.push(StatGroup { title: "Data".into(), stats: data });
+    if !requests.is_empty() {
+        groups.push(StatGroup { title: "Throughput".into(), stats: requests });
+    }
+    groups
+}
+
+impl SparqlIntegration {
+    async fn admin_json(&self, path: &str) -> Option<serde_json::Value> {
+        self.http.get_json::<serde_json::Value>(path).await.ok()
+    }
+
+    // WHAT:  The store's own dataset list when it has one; the configured
+    //        dataset otherwise (an endpoint URL is often all we are given).
+    async fn dataset_objects(&self) -> Vec<ObjectSummary> {
+        let listed = match self.engine {
+            Engine::ApacheJena => self.admin_json("/$/datasets").await.map(|b| fuseki_datasets(&b)),
+            Engine::Graphdb => self.admin_json("/rest/repositories").await.map(|b| graphdb_repositories(&b)),
+            Engine::Stardog => self.admin_json("/admin/databases").await.map(|b| stardog_databases(&b)),
+            _ => None,
+        };
+        match listed.filter(|l| !l.is_empty()) {
+            Some(mut list) => {
+                for entry in &mut list {
+                    if entry.reference.name == self.dataset {
+                        entry.badge = Some("current".into());
+                    }
+                }
+                list
+            }
+            None => vec![ObjectSummary::new(ObjectKind::Dataset, self.dataset.clone(), None).with_badge("current").with_detail(self.query_path.clone())],
+        }
+    }
+
+    async fn dataset_entry(&self, name: &str) -> Option<serde_json::Value> {
+        match self.engine {
+            Engine::ApacheJena => {
+                let body = self.admin_json("/$/datasets").await?;
+                body.get("datasets")?
+                    .as_array()?
+                    .iter()
+                    .find(|d| jstr(d, "ds.name").map(|n| n.trim_start_matches('/').to_string()).as_deref() == Some(name))
+                    .cloned()
+            }
+            Engine::Graphdb => {
+                let body = self.admin_json("/rest/repositories").await?;
+                body.as_array()?.iter().find(|r| jstr(r, "id").as_deref() == Some(name)).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    // WHAT:  Named graphs with their triple counts, plus the default graph.
+    async fn graph_counts(&self) -> AppResult<Vec<(String, i64)>> {
+        let mut out = Vec::new();
+        if let Ok(n) = self.scalar("SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }").await {
+            out.push((DEFAULT_GRAPH.to_string(), n));
+        }
+        let q = format!("SELECT ?g (COUNT(*) AS ?n) WHERE {{ GRAPH ?g {{ ?s ?p ?o }} }} GROUP BY ?g ORDER BY DESC(?n) LIMIT {GRAPH_LIST_CAP}");
+        if let Ok(json) = self.select(&q).await {
+            for row in results_to_set(&json, GRAPH_LIST_CAP)?.rows {
+                let mut it = row.into_iter();
+                let name = match it.next() {
+                    Some(Value::Text(g)) => g,
+                    _ => continue,
+                };
+                let count = match it.next() {
+                    Some(Value::Int(n)) => n,
+                    Some(Value::Decimal(d)) | Some(Value::Text(d)) => d.parse().unwrap_or(0),
+                    _ => 0,
+                };
+                out.push((name, count));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn graph_count(&self, graph: &str) -> Option<i64> {
+        let q = if graph == DEFAULT_GRAPH {
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }".to_string()
+        } else {
+            format!("SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH {} {{ ?s ?p ?o }} }}", iri(graph))
+        };
+        self.scalar(&q).await.ok()
+    }
+
+    async fn sample(&self, query: &str, limit: usize) -> Option<ResultSet> {
+        let json = self.select(query).await.ok()?;
+        results_to_set(&json, limit).ok()
+    }
+
+    // WHAT:  Namespaces used by the sampled predicates and types, with counts.
+    async fn namespace_uses(&self) -> BTreeMap<String, i64> {
+        let mut out: BTreeMap<String, i64> = BTreeMap::new();
+        let q = format!("SELECT ?p (COUNT(*) AS ?n) WHERE {{ ?s ?p ?o }} GROUP BY ?p ORDER BY DESC(?n) LIMIT {PREFIX_SAMPLE}");
+        let Ok(json) = self.select(&q).await else { return out };
+        let Ok(rs) = results_to_set(&json, PREFIX_SAMPLE) else { return out };
+        for row in rs.rows {
+            let mut it = row.into_iter();
+            let Some(Value::Text(term)) = it.next() else { continue };
+            let count = match it.next() {
+                Some(Value::Int(n)) => n,
+                Some(Value::Decimal(d)) | Some(Value::Text(d)) => d.parse().unwrap_or(1),
+                _ => 1,
+            };
+            if let Some(ns) = namespace_of(&term) {
+                *out.entry(ns).or_insert(0) += count;
+            }
+        }
+        out
+    }
+
+    async fn store_size(&self) -> Option<i64> {
+        let path = match self.engine {
+            Engine::Graphdb => format!("/rest/repositories/{}/size", self.dataset),
+            Engine::Stardog => format!("/admin/databases/{}/size", self.dataset),
+            Engine::Blazegraph => return None,
+            _ => return None,
+        };
+        size_from_body(&self.http.get_text(&path).await.ok()?)
+    }
+
+    async fn explorer_objects(&self, kind: ObjectKind, _parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        match kind {
+            ObjectKind::Dataset => Ok(self.dataset_objects().await),
+            ObjectKind::Graph => Ok(graph_summaries(&self.graph_counts().await?)),
+            ObjectKind::Prefix => Ok(prefix_summaries(&self.namespace_uses().await)),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    async fn explorer_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = reference.name.as_str();
+        match reference.kind {
+            ObjectKind::Dataset => {
+                let entry = self.dataset_entry(name).await;
+                let (triples, graphs) = if name == self.dataset {
+                    (self.scalar("SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }").await.ok(), self.graph_counts().await.ok().map(|g| g.len().saturating_sub(1)))
+                } else {
+                    (None, None)
+                };
+                Ok(dataset_detail(reference, entry.as_ref(), triples, graphs))
+            }
+            ObjectKind::Graph => {
+                let count = self.graph_count(name).await;
+                let sample = self.sample(&graph_sample_query(name), SAMPLE_TRIPLES).await;
+                Ok(graph_detail(reference, count, sample))
+            }
+            ObjectKind::Prefix => {
+                let namespace = prefix_namespace(reference);
+                let count = self.namespace_uses().await.get(&namespace).copied();
+                let q = format!("SELECT ?s ?p ?o WHERE {{ ?s ?p ?o FILTER(STRSTARTS(STR(?p), {})) }} LIMIT 25", sparql_string(&namespace));
+                let sample = self.sample(&q, 25).await;
+                Ok(prefix_detail(reference, count, sample))
+            }
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    async fn explorer_stats(&self) -> AppResult<ServerStats> {
+        let counts = DataCounts {
+            triples: self.scalar("SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }").await.ok(),
+            graphs: self.graph_counts().await.map(|g| g.len().saturating_sub(1)).unwrap_or(0),
+            classes: self.scalar("SELECT (COUNT(DISTINCT ?t) AS ?n) WHERE { ?s a ?t }").await.ok(),
+            predicates: self.scalar("SELECT (COUNT(DISTINCT ?p) AS ?n) WHERE { ?s ?p ?o }").await.ok(),
+            size: self.store_size().await,
+        };
+        let requests = match self.engine {
+            Engine::ApacheJena => self.admin_json("/$/stats").await.map(|b| fuseki_stats(&b, &self.dataset)).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        Ok(ServerStats::now(stat_groups(self.engine, &self.dataset, &counts, requests)))
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities { sql: false, namespaces: true, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: false, exact_estimate: true },
+        object_kinds: vec![K::Dataset, K::Graph, K::Prefix],
+        tools: vec![T::Stats, T::GraphView],
+    }
+}
+
 #[async_trait]
 impl Integration for SparqlIntegration {
     fn engine(&self) -> Engine {
@@ -393,7 +904,7 @@ impl Integration for SparqlIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { sql: false, namespaces: true, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: false, exact_estimate: true }
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -508,6 +1019,18 @@ impl Integration for SparqlIntegration {
     }
 
     async fn close(&self) {}
+
+    async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        self.explorer_objects(kind, parent).await
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        self.explorer_detail(reference).await
+    }
+
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        self.explorer_stats().await
+    }
 }
 
 #[cfg(test)]
@@ -596,6 +1119,111 @@ mod tests {
         assert_eq!(iri("http://x/y"), "<http://x/y>");
         assert_eq!(local_name("http://xmlns.com/foaf/0.1/name"), "name");
         assert_eq!(local_name("http://ex#Age"), "Age");
+    }
+
+    #[test]
+    fn admin_listings_become_datasets() {
+        let fuseki = serde_json::json!({"datasets": [
+            {"ds.name": "/ds", "ds.state": true, "ds.services": [{"srv.type": "query", "srv.description": "SPARQL Query", "srv.endpoints": ["sparql", "query"]}, {"srv.type": "gsp-rw"}]},
+            {"ds.name": "/offline", "ds.state": false, "ds.services": []}
+        ]});
+        let d = fuseki_datasets(&fuseki);
+        assert_eq!(d.iter().map(|x| x.reference.name.as_str()).collect::<Vec<_>>(), vec!["ds", "offline"]);
+        assert_eq!(d[0].detail.as_deref(), Some("query, gsp-rw"));
+        assert_eq!(d[0].badge.as_deref(), Some("active"));
+        assert_eq!(d[1].badge.as_deref(), Some("offline"));
+        assert!(d[1].detail.is_none());
+
+        let gdb = graphdb_repositories(&serde_json::json!([{"id": "repo", "title": "Test repo", "writable": false, "location": ""}]));
+        assert_eq!(gdb[0].detail.as_deref(), Some("Test repo"));
+        assert_eq!(gdb[0].badge.as_deref(), Some("read-only"));
+        let star = stardog_databases(&serde_json::json!({"databases": ["a", "b"]}));
+        assert_eq!(star.len(), 2);
+        assert_eq!(star[1].badge.as_deref(), Some("database"));
+
+        let entry = fuseki.get("datasets").and_then(|d| d.as_array()).and_then(|a| a.first()).cloned().unwrap_or_default();
+        let detail = dataset_detail(&d[0].reference, Some(&entry), Some(42), Some(2));
+        assert_eq!(detail.language, CodeLanguage::Json);
+        assert_eq!(detail.rows.as_ref().map(|r| r.rows.len()), Some(2));
+        assert_eq!(detail.rows.as_ref().map(|r| r.rows[0][2].clone()), Some(Value::Text("sparql, query".into())));
+        assert!(detail.properties.iter().any(|p| p.name == "triples" && p.value == "42"));
+        assert!(detail.actions.iter().all(|a| !a.destructive));
+        assert!(detail.actions.iter().all(|a| query_kind(&a.statement) == "select"));
+    }
+
+    #[test]
+    fn graphs_carry_counts_and_update_actions() {
+        let counts = vec![("default".to_string(), 120), ("http://ex/g1".to_string(), 1234)];
+        let s = graph_summaries(&counts);
+        assert_eq!(s[0].reference.name, "default");
+        assert_eq!(s[0].badge.as_deref(), Some("default"));
+        assert_eq!(s[1].detail.as_deref(), Some("1,234 triples"));
+        assert_eq!(s[1].badge.as_deref(), Some("named"));
+
+        let d = graph_detail(&s[1].reference, Some(1234), None);
+        assert!(d.definition.as_deref().is_some_and(|q| q.contains("GRAPH <http://ex/g1>")));
+        assert_eq!(d.actions.len(), 3);
+        assert_eq!(d.actions[1].statement, "CLEAR GRAPH <http://ex/g1>");
+        assert_eq!(d.actions[2].statement, "DROP GRAPH <http://ex/g1>");
+        assert!(d.actions[1].destructive && d.actions[2].destructive && !d.actions[0].destructive);
+        assert_eq!(query_kind(&d.actions[1].statement), "update");
+        assert_eq!(query_kind(&d.actions[2].statement), "update");
+        assert_eq!(query_kind(&d.actions[0].statement), "select");
+        let def = graph_detail(&s[0].reference, None, None);
+        assert_eq!(def.actions[1].statement, "CLEAR DEFAULT");
+        assert!(!graph_sample_query("default").contains("GRAPH"));
+    }
+
+    #[test]
+    fn prefixes_merge_well_known_and_observed() {
+        let mut uses = BTreeMap::new();
+        uses.insert("http://xmlns.com/foaf/0.1/".to_string(), 300);
+        uses.insert("http://example.org/vocab/".to_string(), 12);
+        let s = prefix_summaries(&uses);
+        let names: Vec<&str> = s.iter().map(|p| p.reference.name.as_str()).collect();
+        assert!(names.contains(&"foaf") && names.contains(&"rdf") && names.contains(&"http://example.org/vocab/"));
+        assert_eq!(s.len(), COMMON_PREFIXES.len() + 1);
+        let foaf = s.iter().find(|p| p.reference.name == "foaf").cloned().unwrap_or_else(|| ObjectSummary::new(ObjectKind::Prefix, "x", None));
+        assert_eq!(foaf.badge.as_deref(), Some("well-known"));
+        assert_eq!(foaf.detail.as_deref(), Some("http://xmlns.com/foaf/0.1/ · 300 use(s) in the sample"));
+        let rdf = s.iter().find(|p| p.reference.name == "rdf").cloned().unwrap_or_else(|| ObjectSummary::new(ObjectKind::Prefix, "x", None));
+        assert_eq!(rdf.badge.as_deref(), Some("unused"));
+        let custom = s.iter().find(|p| p.reference.name == "http://example.org/vocab/").cloned().unwrap_or_else(|| ObjectSummary::new(ObjectKind::Prefix, "x", None));
+        assert_eq!(custom.badge.as_deref(), Some("in data"));
+
+        assert_eq!(namespace_of("http://xmlns.com/foaf/0.1/name").as_deref(), Some("http://xmlns.com/foaf/0.1/"));
+        assert_eq!(namespace_of("http://www.w3.org/2001/XMLSchema#int").as_deref(), Some("http://www.w3.org/2001/XMLSchema#"));
+        assert!(namespace_of("mailto:x").is_none());
+        assert!(namespace_of("http://ex/").is_none());
+        assert_eq!(prefix_namespace(&foaf.reference), "http://xmlns.com/foaf/0.1/");
+        assert_eq!(prefix_namespace(&custom.reference), "http://example.org/vocab/");
+        let d = prefix_detail(&foaf.reference, Some(300), None);
+        assert_eq!(d.definition.as_deref(), Some("PREFIX foaf: <http://xmlns.com/foaf/0.1/>"));
+        assert!(d.properties.iter().any(|p| p.name == "source" && p.value == "well-known prefix"));
+        assert_eq!(query_kind(&d.actions[0].statement), "select");
+        assert!(prefix_detail(&custom.reference, None, None).properties.iter().any(|p| p.value == "seen in the data"));
+    }
+
+    #[test]
+    fn stats_groups_and_size_parsing() {
+        let requests = fuseki_stats(&serde_json::json!({"datasets": {"/ds": {"Requests": 10, "RequestsGood": 9, "RequestsBad": 1}}}), "ds");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].numeric, Some(10.0));
+        assert!(fuseki_stats(&serde_json::json!({}), "ds").is_empty());
+        let counts = DataCounts { triples: Some(1234), graphs: 2, classes: Some(5), predicates: Some(30), size: Some(1234) };
+        let groups = stat_groups(Engine::ApacheJena, "ds", &counts, requests);
+        assert_eq!(groups.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(), vec!["Server", "Data", "Throughput"]);
+        assert_eq!(groups[0].stats[0].value, "Apache Jena Fuseki");
+        assert_eq!(groups[1].stats[0].value, "1,234");
+        assert!(groups[1].stats.iter().any(|s| s.label == "Predicates" && s.numeric == Some(30.0)));
+        assert!(groups[1].stats.iter().any(|s| s.label == "Statements (server)" && s.hint.is_some()));
+        let bare = stat_groups(Engine::Virtuoso, "sparql", &DataCounts::default(), vec![]);
+        assert_eq!(bare.len(), 2);
+        assert_eq!(bare[0].stats[0].value, "Virtuoso");
+        assert_eq!(bare[1].stats.len(), 1);
+        assert_eq!(size_from_body(" 4321 "), Some(4321));
+        assert_eq!(size_from_body("{\"total\": 99}"), Some(99));
+        assert_eq!(size_from_body("<html>"), None);
     }
 
     // Runs only when DBFREE_TEST_SPARQL_URL is set:

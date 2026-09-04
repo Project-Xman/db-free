@@ -1,10 +1,11 @@
-// SOT: snowflake-integration, snowflake-sql-rest-api, key-pair-jwt, snowflake-row-decoder, snowflake-pat-auth
+// SOT: snowflake-integration, snowflake-sql-rest-api, key-pair-jwt, snowflake-row-decoder, snowflake-pat-auth, snowflake-object-explorer, snowflake-show-commands, snowflake-get-ddl
 
 use crate::error::{AppError, AppResult};
-use crate::integrations::sql::{order_clause, validate_columns, where_clause};
+use crate::integrations::sql::{order_clause, quote_literal, validate_columns, where_clause};
 use crate::integrations::{quote_ident, Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterRule, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterRule, ObjectAction, ObjectDetail, ObjectKind, ObjectRef,
+    ObjectSummary, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, ServerStats, Stat, StatGroup,
     StatementResult, TableInfo, TableKind, TableRef, Value,
 };
 use async_trait::async_trait;
@@ -601,6 +602,650 @@ impl SnowflakeIntegration {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Object explorer / administration
+//
+// WHAT:  Databases, schemas, tables / views / materialized views, functions,
+//        procedures, sequences, stages, streams, tasks, warehouses, roles,
+//        users, grants and the slowest recent queries.
+// WHY:   The generic explorer / admin UI. Snowflake answers all of it with
+//        `SHOW <kind> IN …`, whose result set is already a grid; definitions
+//        come from `GET_DDL`, which covers every schema-level object.
+// HOW:   Scoped kinds take the schema as `parent` (the sidebar's schema
+//        switch); schema-level kinds the explorer lists server-wide (stages,
+//        streams, tasks) are listed `IN DATABASE` and carry their schema as
+//        `parent` so the detail can qualify them again. Grants take the role.
+//        Actions are plain SQL, so the guard's read-only lock and destructive
+//        confirmation apply unchanged.
+// ---------------------------------------------------------------------------
+
+const MAX_OBJECTS: usize = 2_000;
+
+/// `MYFUNC(NUMBER, VARCHAR) RETURN NUMBER` → ("MYFUNC(NUMBER, VARCHAR)", "NUMBER").
+fn parse_arguments(arguments: &str) -> (String, String) {
+    match arguments.split_once(" RETURN ") {
+        Some((signature, returns)) => (signature.trim().to_string(), returns.trim().to_string()),
+        None => (arguments.trim().to_string(), String::new()),
+    }
+}
+
+/// The `GET_DDL` object type for a kind, when Snowflake has one.
+fn ddl_kind(kind: ObjectKind) -> Option<&'static str> {
+    Some(match kind {
+        ObjectKind::Database => "DATABASE",
+        ObjectKind::Schema => "SCHEMA",
+        ObjectKind::Table => "TABLE",
+        ObjectKind::View | ObjectKind::MaterializedView => "VIEW",
+        ObjectKind::Function => "FUNCTION",
+        ObjectKind::Procedure => "PROCEDURE",
+        ObjectKind::Sequence => "SEQUENCE",
+        ObjectKind::Stream => "STREAM",
+        ObjectKind::Task => "TASK",
+        _ => return None,
+    })
+}
+
+fn warehouse_actions(name: &str) -> Vec<ObjectAction> {
+    let w = quote_ident(name);
+    vec![
+        ObjectAction::new("resume", "Resume warehouse", format!("ALTER WAREHOUSE {w} RESUME IF SUSPENDED")),
+        ObjectAction::destructive("suspend", "Suspend warehouse", format!("ALTER WAREHOUSE {w} SUSPEND")),
+        ObjectAction::destructive("abort", "Abort all running queries", format!("ALTER WAREHOUSE {w} ABORT ALL QUERIES")),
+    ]
+}
+
+fn task_actions(qualified: &str) -> Vec<ObjectAction> {
+    vec![
+        ObjectAction::new("resume", "Resume task", format!("ALTER TASK {qualified} RESUME")),
+        ObjectAction::destructive("suspend", "Suspend task", format!("ALTER TASK {qualified} SUSPEND")),
+        ObjectAction::destructive("drop", "Drop task", format!("DROP TASK {qualified}")),
+    ]
+}
+
+fn drop_action(keyword: &str, qualified: &str) -> ObjectAction {
+    let label = format!("Drop {}", keyword.to_ascii_lowercase());
+    ObjectAction::destructive("drop", &label, format!("DROP {keyword} {qualified}"))
+}
+
+fn warehouse_caption(size: &str, running: &str, queued: &str, clusters: &str) -> String {
+    let mut parts = vec![size.to_string()];
+    if !clusters.is_empty() && clusters != "0" {
+        parts.push(format!("{clusters} clusters"));
+    }
+    parts.push(format!("{} running", if running.is_empty() { "0" } else { running }));
+    parts.push(format!("{} queued", if queued.is_empty() { "0" } else { queued }));
+    parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" · ")
+}
+
+/// `REVOKE <privilege> ON <granted_on> <name> FROM ROLE <role>`, with the
+/// role-to-role grant spelled the way Snowflake expects.
+fn revoke_statement(privilege: &str, granted_on: &str, name: &str, role: &str) -> String {
+    if granted_on.eq_ignore_ascii_case("ROLE") {
+        return format!("REVOKE ROLE {name} FROM ROLE {}", quote_ident(role));
+    }
+    format!("REVOKE {privilege} ON {granted_on} {name} FROM ROLE {}", quote_ident(role))
+}
+
+fn grant_name(privilege: &str, granted_on: &str, name: &str) -> String {
+    format!("{privilege} ON {granted_on} {name}")
+}
+
+impl SnowflakeIntegration {
+    fn require_database(&self) -> AppResult<String> {
+        self.database.clone().ok_or_else(|| AppError::invalid_input("Set the database field (DB or DB.SCHEMA) to browse objects."))
+    }
+
+    /// `IN SCHEMA "DB"."S"` when a schema is known, else `IN DATABASE "DB"`.
+    fn scope(&self, schema: Option<&str>) -> AppResult<String> {
+        let db = self.require_database()?;
+        Ok(match schema.or(self.schema.as_deref()) {
+            Some(s) => format!("IN SCHEMA {}.{}", quote_ident(&db), quote_ident(s)),
+            None => format!("IN DATABASE {}", quote_ident(&db)),
+        })
+    }
+
+    fn qualified3(&self, schema: &str, name: &str) -> AppResult<String> {
+        let db = self.require_database()?;
+        Ok(format!("{}.{}.{}", quote_ident(&db), quote_ident(schema), quote_ident(name)))
+    }
+
+    /// The dotted name GET_DDL takes as a string literal (identifiers unquoted).
+    fn dotted3(&self, schema: &str, name: &str) -> AppResult<String> {
+        let db = self.require_database()?;
+        Ok(format!("{db}.{schema}.{name}"))
+    }
+
+    fn schema_of(&self, reference: &ObjectRef) -> String {
+        reference.parent.clone().or_else(|| self.schema.clone()).unwrap_or_else(|| "PUBLIC".into())
+    }
+
+    async fn get_ddl(&self, kind: ObjectKind, dotted: &str) -> Option<String> {
+        let object = ddl_kind(kind)?;
+        let sql = format!("SELECT GET_DDL({}, {}, true)", quote_literal(object), quote_literal(dotted));
+        let rs = self.rows(&sql, 1).await.ok()?;
+        match rs.rows.first().and_then(|r| r.first()) {
+            Some(Value::Text(t)) if !t.is_empty() => Some(t.clone()),
+            _ => None,
+        }
+    }
+
+    /// Every non-empty column of a SHOW row as a property.
+    fn show_properties(mut detail: ObjectDetail, rs: &ResultSet, row: &[Value], skip: &[&str]) -> ObjectDetail {
+        for (i, column) in rs.columns.iter().enumerate() {
+            if skip.iter().any(|s| s.eq_ignore_ascii_case(&column.name)) {
+                continue;
+            }
+            match row.get(i) {
+                Some(Value::Null) | None => {}
+                Some(v) => {
+                    let text = match v {
+                        Value::Text(t) => t.clone(),
+                        Value::Int(n) => n.to_string(),
+                        Value::Bool(b) => b.to_string(),
+                        Value::Float(f) => f.to_string(),
+                        Value::Decimal(d) | Value::DateTime(d) | Value::Bytes(d) | Value::Unsupported(d) => d.clone(),
+                        Value::Json(j) => j.to_string(),
+                        // Unreachable (the outer arm catches Null) but the match must be total.
+                        Value::Null => String::new(),
+                    };
+                    if !text.is_empty() {
+                        detail = detail.property(&column.name, text);
+                    }
+                }
+            }
+        }
+        detail
+    }
+
+    /// Finds one SHOW row by its `name` column.
+    async fn show_one(&self, sql: &str, name: &str) -> AppResult<(ResultSet, Vec<Value>)> {
+        let rs = self.rows(sql, MAX_OBJECTS).await?;
+        let row = rs
+            .rows
+            .iter()
+            .find(|row| Self::col_text(&rs, row, "name").is_some_and(|n| n == name))
+            .cloned()
+            .ok_or_else(|| AppError::not_found(format!("{name} not found.")))?;
+        Ok((rs, row))
+    }
+
+    async fn list_databases_objects(&self) -> AppResult<Vec<ObjectSummary>> {
+        let rs = self.rows("SHOW DATABASES", MAX_OBJECTS).await?;
+        Ok(rs
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let name = Self::col_text(&rs, row, "name")?;
+                let mut s = ObjectSummary::new(ObjectKind::Database, name, None);
+                if let Some(owner) = Self::col_text(&rs, row, "owner").filter(|o| !o.is_empty()) {
+                    s = s.with_detail(format!("owner {owner}"));
+                }
+                if let Some(kind) = Self::col_text(&rs, row, "kind").filter(|k| !k.is_empty()) {
+                    s = s.with_badge(kind.to_ascii_lowercase());
+                }
+                Some(s)
+            })
+            .collect())
+    }
+
+    async fn list_schema_objects(&self) -> AppResult<Vec<ObjectSummary>> {
+        let db = self.require_database()?;
+        let rs = self.rows(&format!("SHOW SCHEMAS IN DATABASE {}", quote_ident(&db)), MAX_OBJECTS).await?;
+        Ok(rs
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let name = Self::col_text(&rs, row, "name")?;
+                let mut s = ObjectSummary::new(ObjectKind::Schema, name, None);
+                if let Some(owner) = Self::col_text(&rs, row, "owner").filter(|o| !o.is_empty()) {
+                    s = s.with_detail(format!("owner {owner}"));
+                }
+                Some(s)
+            })
+            .collect())
+    }
+
+    // WHAT:  Tables, views and materialized views share the SHOW shape:
+    //        name + schema_name (+ rows / bytes where the object stores data).
+    async fn list_relation_objects(&self, kind: ObjectKind, schema: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let keyword = match kind {
+            ObjectKind::View => "VIEWS",
+            ObjectKind::MaterializedView => "MATERIALIZED VIEWS",
+            _ => "TABLES",
+        };
+        let rs = self.rows(&format!("SHOW {keyword} {}", self.scope(schema)?), 20_000).await?;
+        Ok(rs
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let name = Self::col_text(&rs, row, "name")?;
+                let schema_name = Self::col_text(&rs, row, "schema_name");
+                let mut s = ObjectSummary::new(kind, name, schema_name);
+                let rows = Self::col_text(&rs, row, "rows").and_then(|v| v.parse::<f64>().ok());
+                let bytes = Self::col_text(&rs, row, "bytes").and_then(|v| v.parse::<f64>().ok());
+                let caption = match (rows, bytes) {
+                    (Some(r), Some(b)) => Some(format!("{} rows · {}", crate::model::objects::format_number(r), format_bytes(b))),
+                    (Some(r), None) => Some(format!("{} rows", crate::model::objects::format_number(r))),
+                    _ => Self::col_text(&rs, row, "comment").filter(|c| !c.is_empty()),
+                };
+                if let Some(c) = caption {
+                    s = s.with_detail(c);
+                }
+                if let Some(kind_text) = Self::col_text(&rs, row, "kind").filter(|k| !k.is_empty()) {
+                    s = s.with_badge(kind_text.to_ascii_lowercase());
+                } else if Self::col_text(&rs, row, "is_secure").is_some_and(|v| v == "true") {
+                    s = s.with_badge("secure");
+                }
+                Some(s)
+            })
+            .collect())
+    }
+
+    async fn list_routine_objects(&self, kind: ObjectKind, schema: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let keyword = if kind == ObjectKind::Procedure { "PROCEDURES" } else { "USER FUNCTIONS" };
+        let rs = self.rows(&format!("SHOW {keyword} {}", self.scope(schema)?), MAX_OBJECTS).await?;
+        Ok(rs
+            .rows
+            .iter()
+            .filter(|row| Self::col_text(&rs, row, "is_builtin").is_none_or(|b| b != "true"))
+            .filter_map(|row| {
+                let arguments = Self::col_text(&rs, row, "arguments").unwrap_or_default();
+                let (signature, returns) = parse_arguments(&arguments);
+                let name = if signature.is_empty() { Self::col_text(&rs, row, "name")? } else { signature };
+                let schema_name = Self::col_text(&rs, row, "schema_name");
+                let mut s = ObjectSummary::new(kind, name, schema_name);
+                if !returns.is_empty() {
+                    s = s.with_detail(format!("→ {returns}"));
+                }
+                if Self::col_text(&rs, row, "is_table_function").is_some_and(|v| v == "true") {
+                    s = s.with_badge("table function");
+                } else if Self::col_text(&rs, row, "is_aggregate").is_some_and(|v| v == "true") {
+                    s = s.with_badge("aggregate");
+                }
+                Some(s)
+            })
+            .collect())
+    }
+
+    async fn list_sequence_objects(&self, schema: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let rs = self.rows(&format!("SHOW SEQUENCES {}", self.scope(schema)?), MAX_OBJECTS).await?;
+        Ok(rs
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let name = Self::col_text(&rs, row, "name")?;
+                let next = Self::col_text(&rs, row, "next_value").unwrap_or_default();
+                let interval = Self::col_text(&rs, row, "interval").unwrap_or_default();
+                Some(ObjectSummary::new(ObjectKind::Sequence, name, Self::col_text(&rs, row, "schema_name")).with_detail(format!("next {next} · step {interval}")))
+            })
+            .collect())
+    }
+
+    async fn list_stage_objects(&self, schema: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let rs = self.rows(&format!("SHOW STAGES {}", self.scope(schema)?), MAX_OBJECTS).await?;
+        Ok(rs
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let name = Self::col_text(&rs, row, "name")?;
+                let mut s = ObjectSummary::new(ObjectKind::Stage, name, Self::col_text(&rs, row, "schema_name"));
+                if let Some(url) = Self::col_text(&rs, row, "url").filter(|u| !u.is_empty()) {
+                    s = s.with_detail(url);
+                }
+                if let Some(kind) = Self::col_text(&rs, row, "type").filter(|t| !t.is_empty()) {
+                    s = s.with_badge(kind.to_ascii_lowercase());
+                }
+                Some(s)
+            })
+            .collect())
+    }
+
+    async fn list_stream_objects(&self, schema: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let rs = self.rows(&format!("SHOW STREAMS {}", self.scope(schema)?), MAX_OBJECTS).await?;
+        Ok(rs
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let name = Self::col_text(&rs, row, "name")?;
+                let source = Self::col_text(&rs, row, "table_name").unwrap_or_default();
+                let mut s = ObjectSummary::new(ObjectKind::Stream, name, Self::col_text(&rs, row, "schema_name")).with_detail(format!("on {source}"));
+                if Self::col_text(&rs, row, "stale").is_some_and(|v| v == "true") {
+                    s = s.with_badge("stale");
+                } else if let Some(mode) = Self::col_text(&rs, row, "mode").filter(|m| !m.is_empty()) {
+                    s = s.with_badge(mode.to_ascii_lowercase());
+                }
+                Some(s)
+            })
+            .collect())
+    }
+
+    async fn list_task_objects(&self, schema: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let rs = self.rows(&format!("SHOW TASKS {}", self.scope(schema)?), MAX_OBJECTS).await?;
+        Ok(rs
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let name = Self::col_text(&rs, row, "name")?;
+                let schedule = Self::col_text(&rs, row, "schedule").unwrap_or_default();
+                let warehouse = Self::col_text(&rs, row, "warehouse").unwrap_or_default();
+                let caption = [schedule, warehouse].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" · ");
+                let mut s = ObjectSummary::new(ObjectKind::Task, name, Self::col_text(&rs, row, "schema_name"));
+                if !caption.is_empty() {
+                    s = s.with_detail(caption);
+                }
+                if let Some(state) = Self::col_text(&rs, row, "state").filter(|s| !s.is_empty()) {
+                    s = s.with_badge(state.to_ascii_lowercase());
+                }
+                Some(s)
+            })
+            .collect())
+    }
+
+    async fn list_warehouse_objects(&self) -> AppResult<Vec<ObjectSummary>> {
+        let rs = self.rows("SHOW WAREHOUSES", MAX_OBJECTS).await?;
+        Ok(rs
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let name = Self::col_text(&rs, row, "name")?;
+                let get = |c: &str| Self::col_text(&rs, row, c).unwrap_or_default();
+                let mut s = ObjectSummary::new(ObjectKind::Warehouse, name, None).with_detail(warehouse_caption(&get("size"), &get("running"), &get("queued"), &get("started_clusters")));
+                if let Some(state) = Self::col_text(&rs, row, "state").filter(|s| !s.is_empty()) {
+                    s = s.with_badge(state.to_ascii_lowercase());
+                }
+                Some(s)
+            })
+            .collect())
+    }
+
+    async fn list_role_objects(&self) -> AppResult<Vec<ObjectSummary>> {
+        let rs = self.rows("SHOW ROLES", MAX_OBJECTS).await?;
+        Ok(rs
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let name = Self::col_text(&rs, row, "name")?;
+                let users = Self::col_text(&rs, row, "assigned_to_users").unwrap_or_default();
+                let roles = Self::col_text(&rs, row, "granted_to_roles").unwrap_or_default();
+                let mut s = ObjectSummary::new(ObjectKind::Role, name, None).with_detail(format!("{users} users · granted to {roles} roles"));
+                if Self::col_text(&rs, row, "is_current").is_some_and(|v| v == "true") {
+                    s = s.with_badge("current");
+                }
+                Some(s)
+            })
+            .collect())
+    }
+
+    async fn list_user_objects(&self) -> AppResult<Vec<ObjectSummary>> {
+        let rs = self.rows("SHOW USERS", MAX_OBJECTS).await?;
+        Ok(rs
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let name = Self::col_text(&rs, row, "name")?;
+                let login = Self::col_text(&rs, row, "login_name").unwrap_or_default();
+                let mut s = ObjectSummary::new(ObjectKind::User, name, None).with_detail(login);
+                if Self::col_text(&rs, row, "disabled").is_some_and(|v| v == "true") {
+                    s = s.with_badge("disabled");
+                } else if let Some(role) = Self::col_text(&rs, row, "default_role").filter(|r| !r.is_empty()) {
+                    s = s.with_badge(role);
+                }
+                Some(s)
+            })
+            .collect())
+    }
+
+    async fn grants_of(&self, role: Option<&str>) -> AppResult<ResultSet> {
+        let sql = match role {
+            Some(r) => format!("SHOW GRANTS TO ROLE {}", quote_ident(r)),
+            None => "SHOW GRANTS".to_string(),
+        };
+        self.rows(&sql, MAX_OBJECTS).await
+    }
+
+    async fn list_grant_objects(&self, role: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let rs = self.grants_of(role).await?;
+        Ok(rs
+            .rows
+            .iter()
+            .map(|row| {
+                let get = |c: &str| Self::col_text(&rs, row, c).unwrap_or_default();
+                let owner = role.map(str::to_string).or_else(|| Self::col_text(&rs, row, "grantee_name"));
+                let mut s = ObjectSummary::new(ObjectKind::Grant, grant_name(&get("privilege"), &get("granted_on"), &get("name")), owner)
+                    .with_badge(get("granted_on").to_ascii_lowercase());
+                let granted_by = get("granted_by");
+                if !granted_by.is_empty() {
+                    s = s.with_detail(format!("granted by {granted_by}"));
+                }
+                s
+            })
+            .collect())
+    }
+
+    async fn query_history(&self, limit: usize) -> AppResult<ResultSet> {
+        let sql = format!(
+            "SELECT QUERY_ID, QUERY_TEXT, USER_NAME, WAREHOUSE_NAME, EXECUTION_STATUS, TOTAL_ELAPSED_TIME, BYTES_SCANNED, ROWS_PRODUCED, START_TIME \
+             FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY(RESULT_LIMIT => {limit})) ORDER BY TOTAL_ELAPSED_TIME DESC"
+        );
+        self.rows(&sql, limit).await
+    }
+
+    async fn list_slow_query_objects(&self) -> AppResult<Vec<ObjectSummary>> {
+        let rs = self.query_history(100).await?;
+        Ok(rs
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let id = Self::col_text(&rs, row, "QUERY_ID")?;
+                let elapsed = Self::col_text(&rs, row, "TOTAL_ELAPSED_TIME").unwrap_or_default();
+                let scanned = Self::col_text(&rs, row, "BYTES_SCANNED").and_then(|b| b.parse::<f64>().ok()).map(format_bytes).unwrap_or_default();
+                let text = Self::col_text(&rs, row, "QUERY_TEXT").unwrap_or_default();
+                let caption = format!("{elapsed} ms · {scanned} · {}", preview(&text, 60));
+                let mut s = ObjectSummary::new(ObjectKind::SlowQuery, id, None).with_detail(caption);
+                if let Some(status) = Self::col_text(&rs, row, "EXECUTION_STATUS").filter(|s| !s.is_empty()) {
+                    s = s.with_badge(status.to_ascii_lowercase());
+                }
+                Some(s)
+            })
+            .collect())
+    }
+
+    async fn database_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let (rs, row) = self.show_one("SHOW DATABASES", &reference.name).await?;
+        let mut detail = Self::show_properties(ObjectDetail::empty(reference), &rs, &row, &["name"]);
+        if let Some(ddl) = self.get_ddl(ObjectKind::Database, &reference.name).await {
+            detail = detail.definition(ddl, CodeLanguage::Sql);
+        }
+        Ok(detail.action(drop_action("DATABASE", &quote_ident(&reference.name))))
+    }
+
+    async fn schema_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let db = self.require_database()?;
+        let (rs, row) = self.show_one(&format!("SHOW SCHEMAS IN DATABASE {}", quote_ident(&db)), &reference.name).await?;
+        let mut detail = Self::show_properties(ObjectDetail::empty(reference), &rs, &row, &["name"]);
+        if let Some(ddl) = self.get_ddl(ObjectKind::Schema, &format!("{db}.{}", reference.name)).await {
+            detail = detail.definition(ddl, CodeLanguage::Sql);
+        }
+        detail.children = self.list_relation_objects(ObjectKind::Table, Some(&reference.name)).await.unwrap_or_default();
+        let qualified = format!("{}.{}", quote_ident(&db), quote_ident(&reference.name));
+        Ok(detail.action(drop_action("SCHEMA", &qualified)))
+    }
+
+    async fn relation_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let schema = self.schema_of(reference);
+        let keyword = match reference.kind {
+            ObjectKind::View => "VIEWS",
+            ObjectKind::MaterializedView => "MATERIALIZED VIEWS",
+            _ => "TABLES",
+        };
+        let scope = self.scope(Some(&schema))?;
+        let (rs, row) = self.show_one(&format!("SHOW {keyword} {scope}"), &reference.name).await?;
+        let mut detail = Self::show_properties(ObjectDetail::empty(reference), &rs, &row, &["name", "text"]);
+        if let Some(ddl) = self.get_ddl(reference.kind, &self.dotted3(&schema, &reference.name)?).await {
+            detail = detail.definition(ddl, CodeLanguage::Sql);
+        } else if let Some(text) = Self::col_text(&rs, &row, "text").filter(|t| !t.is_empty()) {
+            detail = detail.definition(text, CodeLanguage::Sql);
+        }
+        detail.columns = self.columns(&TableRef { schema: Some(schema.clone()), name: reference.name.clone() }).await.unwrap_or_default();
+        let qualified = self.qualified3(&schema, &reference.name)?;
+        if reference.kind == ObjectKind::MaterializedView {
+            detail = detail.action(ObjectAction::new("refresh", "Refresh materialized view", format!("ALTER MATERIALIZED VIEW {qualified} REFRESH")));
+            return Ok(detail.action(drop_action("MATERIALIZED VIEW", &qualified)));
+        }
+        if reference.kind == ObjectKind::View {
+            return Ok(detail.action(drop_action("VIEW", &qualified)));
+        }
+        Ok(detail
+            .action(ObjectAction::destructive("truncate", "Truncate table", format!("TRUNCATE TABLE {qualified}")))
+            .action(drop_action("TABLE", &qualified)))
+    }
+
+    async fn routine_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let schema = self.schema_of(reference);
+        let keyword = if reference.kind == ObjectKind::Procedure { "PROCEDURES" } else { "USER FUNCTIONS" };
+        let scope = self.scope(Some(&schema))?;
+        let rs = self.rows(&format!("SHOW {keyword} {scope}"), MAX_OBJECTS).await?;
+        let row = rs
+            .rows
+            .iter()
+            .find(|row| {
+                let arguments = Self::col_text(&rs, row, "arguments").unwrap_or_default();
+                parse_arguments(&arguments).0 == reference.name || Self::col_text(&rs, row, "name").is_some_and(|n| n == reference.name)
+            })
+            .cloned()
+            .ok_or_else(|| AppError::not_found(format!("{} not found in {schema}.", reference.name)))?;
+        let mut detail = Self::show_properties(ObjectDetail::empty(reference), &rs, &row, &[]);
+        let dotted = self.dotted3(&schema, &reference.name)?;
+        if let Some(ddl) = self.get_ddl(reference.kind, &dotted).await {
+            detail = detail.definition(ddl, CodeLanguage::Sql);
+        }
+        let keyword = if reference.kind == ObjectKind::Procedure { "PROCEDURE" } else { "FUNCTION" };
+        let db = self.require_database()?;
+        let qualified = format!("{}.{}.{}", quote_ident(&db), quote_ident(&schema), reference.name);
+        Ok(detail.action(drop_action(keyword, &qualified)))
+    }
+
+    async fn simple_detail(&self, reference: &ObjectRef, keyword: &str, show: &str) -> AppResult<ObjectDetail> {
+        let schema = self.schema_of(reference);
+        let scope = self.scope(Some(&schema))?;
+        let (rs, row) = self.show_one(&format!("SHOW {show} {scope}"), &reference.name).await?;
+        let mut detail = Self::show_properties(ObjectDetail::empty(reference), &rs, &row, &["name"]);
+        if let Some(ddl) = self.get_ddl(reference.kind, &self.dotted3(&schema, &reference.name)?).await {
+            detail = detail.definition(ddl, CodeLanguage::Sql);
+        }
+        let qualified = self.qualified3(&schema, &reference.name)?;
+        if reference.kind == ObjectKind::Stage {
+            if let Ok(desc) = self.rows(&format!("DESC STAGE {qualified}"), MAX_OBJECTS).await {
+                detail.rows = Some(desc);
+            }
+        }
+        if reference.kind == ObjectKind::Task {
+            detail.actions = task_actions(&qualified);
+            return Ok(detail);
+        }
+        Ok(detail.action(drop_action(keyword, &qualified)))
+    }
+
+    async fn warehouse_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let (rs, row) = self.show_one("SHOW WAREHOUSES", &reference.name).await?;
+        let mut detail = Self::show_properties(ObjectDetail::empty(reference), &rs, &row, &["name"]);
+        detail.actions = warehouse_actions(&reference.name);
+        Ok(detail.action(drop_action("WAREHOUSE", &quote_ident(&reference.name))))
+    }
+
+    async fn role_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let (rs, row) = self.show_one("SHOW ROLES", &reference.name).await?;
+        let mut detail = Self::show_properties(ObjectDetail::empty(reference), &rs, &row, &["name"]);
+        if let Ok(grants) = self.grants_of(Some(&reference.name)).await {
+            detail.rows = Some(grants);
+        }
+        detail.children = self.list_grant_objects(Some(&reference.name)).await.unwrap_or_default();
+        Ok(detail.action(drop_action("ROLE", &quote_ident(&reference.name))))
+    }
+
+    async fn user_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let (rs, row) = self.show_one("SHOW USERS", &reference.name).await?;
+        let mut detail = Self::show_properties(ObjectDetail::empty(reference), &rs, &row, &["name"]);
+        if let Ok(grants) = self.rows(&format!("SHOW GRANTS TO USER {}", quote_ident(&reference.name)), MAX_OBJECTS).await {
+            detail.rows = Some(grants);
+        }
+        Ok(detail
+            .action(ObjectAction::destructive("disable", "Disable user", format!("ALTER USER {} SET DISABLED = TRUE", quote_ident(&reference.name))))
+            .action(drop_action("USER", &quote_ident(&reference.name))))
+    }
+
+    async fn grant_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let role = reference.parent.clone().ok_or_else(|| AppError::invalid_input("A grant reference needs its role as parent."))?;
+        let rs = self.grants_of(Some(&role)).await?;
+        let row = rs
+            .rows
+            .iter()
+            .find(|row| {
+                let get = |c: &str| Self::col_text(&rs, row, c).unwrap_or_default();
+                grant_name(&get("privilege"), &get("granted_on"), &get("name")) == reference.name
+            })
+            .cloned()
+            .ok_or_else(|| AppError::not_found(format!("{} is no longer granted to {role}.", reference.name)))?;
+        let get = |c: &str| Self::col_text(&rs, &row, c).unwrap_or_default();
+        let detail = Self::show_properties(ObjectDetail::empty(reference), &rs, &row, &[]).property("role", role.clone());
+        let statement = revoke_statement(&get("privilege"), &get("granted_on"), &get("name"), &role);
+        Ok(detail.action(ObjectAction::destructive("revoke", "Revoke grant", statement)))
+    }
+
+    async fn slow_query_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let rs = self.query_history(1_000).await?;
+        let row = rs
+            .rows
+            .iter()
+            .find(|row| Self::col_text(&rs, row, "QUERY_ID").is_some_and(|id| id == reference.name))
+            .cloned()
+            .ok_or_else(|| AppError::not_found(format!("Query {} is not in the recent query history.", reference.name)))?;
+        let text = Self::col_text(&rs, &row, "QUERY_TEXT").unwrap_or_default();
+        let mut detail = Self::show_properties(ObjectDetail::empty(reference), &rs, &row, &["QUERY_TEXT", "QUERY_ID"]).definition(text, CodeLanguage::Sql);
+        if let Some(bytes) = Self::col_text(&rs, &row, "BYTES_SCANNED").and_then(|b| b.parse::<f64>().ok()) {
+            detail = detail.property("bytes scanned (human)", format_bytes(bytes));
+        }
+        Ok(detail)
+    }
+}
+
+fn format_bytes(bytes: f64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut value = bytes.max(0.0);
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", value as u64, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn preview(query: &str, max: usize) -> String {
+    let flat: String = query.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > max {
+        format!("{}…", flat.chars().take(max).collect::<String>())
+    } else {
+        flat
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities { transactions: false, exact_estimate: false, ..Capabilities::SQL },
+        object_kinds: vec![K::Database, K::Schema, K::Table, K::View, K::MaterializedView, K::Function, K::Procedure, K::Sequence, K::Stage, K::Stream, K::Task, K::Warehouse, K::Role, K::User, K::Grant, K::SlowQuery],
+        tools: vec![T::Stats],
+    }
+}
+
 #[async_trait]
 impl Integration for SnowflakeIntegration {
     fn engine(&self) -> Engine {
@@ -608,7 +1253,7 @@ impl Integration for SnowflakeIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { transactions: false, exact_estimate: false, ..Capabilities::SQL }
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -779,6 +1424,118 @@ impl Integration for SnowflakeIntegration {
     }
 
     async fn close(&self) {}
+
+    async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let mut out = match kind {
+            ObjectKind::Database => self.list_databases_objects().await?,
+            ObjectKind::Schema => self.list_schema_objects().await?,
+            ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView => self.list_relation_objects(kind, parent).await?,
+            ObjectKind::Function | ObjectKind::Procedure => self.list_routine_objects(kind, parent).await?,
+            ObjectKind::Sequence => self.list_sequence_objects(parent).await?,
+            ObjectKind::Stage => self.list_stage_objects(parent).await?,
+            ObjectKind::Stream => self.list_stream_objects(parent).await?,
+            ObjectKind::Task => self.list_task_objects(parent).await?,
+            ObjectKind::Warehouse => self.list_warehouse_objects().await?,
+            ObjectKind::Role => self.list_role_objects().await?,
+            ObjectKind::User => self.list_user_objects().await?,
+            ObjectKind::Grant => self.list_grant_objects(parent).await?,
+            ObjectKind::SlowQuery => self.list_slow_query_objects().await?,
+            _ => Vec::new(),
+        };
+        if kind != ObjectKind::SlowQuery {
+            out.sort_by(|a, b| a.reference.parent.cmp(&b.reference.parent).then(a.reference.name.cmp(&b.reference.name)));
+        }
+        out.truncate(MAX_OBJECTS);
+        Ok(out)
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        match reference.kind {
+            ObjectKind::Database => self.database_detail(reference).await,
+            ObjectKind::Schema => self.schema_detail(reference).await,
+            ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView => self.relation_detail(reference).await,
+            ObjectKind::Function | ObjectKind::Procedure => self.routine_detail(reference).await,
+            ObjectKind::Sequence => self.simple_detail(reference, "SEQUENCE", "SEQUENCES").await,
+            ObjectKind::Stage => self.simple_detail(reference, "STAGE", "STAGES").await,
+            ObjectKind::Stream => self.simple_detail(reference, "STREAM", "STREAMS").await,
+            ObjectKind::Task => self.simple_detail(reference, "TASK", "TASKS").await,
+            ObjectKind::Warehouse => self.warehouse_detail(reference).await,
+            ObjectKind::Role => self.role_detail(reference).await,
+            ObjectKind::User => self.user_detail(reference).await,
+            ObjectKind::Grant => self.grant_detail(reference).await,
+            ObjectKind::SlowQuery => self.slow_query_detail(reference).await,
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    // WHAT:  Account version, warehouse states, and object counts from the
+    //        current database's INFORMATION_SCHEMA.
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        let version = self.server_version().await.unwrap_or_default().unwrap_or_else(|| "Snowflake".into());
+        let mut server = vec![Stat::text("Version", version)];
+        if let Ok(rs) = self.rows("SELECT CURRENT_ACCOUNT(), CURRENT_REGION(), CURRENT_ROLE(), CURRENT_WAREHOUSE()", 1).await {
+            let row = rs.rows.first().cloned().unwrap_or_default();
+            let text = |i: usize| match row.get(i) {
+                Some(Value::Text(t)) => t.clone(),
+                Some(other) => format!("{other:?}"),
+                None => String::new(),
+            };
+            server.push(Stat::text("Account", text(0)));
+            server.push(Stat::text("Region", text(1)));
+            server.push(Stat::text("Role", text(2)));
+            server.push(Stat::text("Warehouse", text(3)));
+        }
+        let mut groups = vec![StatGroup { title: "Server".into(), stats: server }];
+        if let Ok(rs) = self.rows("SHOW WAREHOUSES", MAX_OBJECTS).await {
+            let count_state = |want: &str| {
+                rs.rows.iter().filter(|row| Self::col_text(&rs, row, "state").is_some_and(|s| s.eq_ignore_ascii_case(want))).count() as f64
+            };
+            let sum = |column: &str| {
+                rs.rows.iter().filter_map(|row| Self::col_text(&rs, row, column)).filter_map(|v| v.parse::<f64>().ok()).sum::<f64>()
+            };
+            groups.push(StatGroup {
+                title: "Warehouses".into(),
+                stats: vec![
+                    Stat::number("Total", rs.rows.len() as f64, None),
+                    Stat::number("Started", count_state("STARTED"), None),
+                    Stat::number("Suspended", count_state("SUSPENDED"), None),
+                    Stat::number("Running queries", sum("running"), None),
+                    Stat::number("Queued queries", sum("queued"), None),
+                ],
+            });
+        }
+        if let Some(db) = &self.database {
+            let sql = format!(
+                "SELECT (SELECT COUNT(*) FROM {0}.INFORMATION_SCHEMA.SCHEMATA), \
+                 (SELECT COUNT(*) FROM {0}.INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'), \
+                 (SELECT COUNT(*) FROM {0}.INFORMATION_SCHEMA.VIEWS), \
+                 (SELECT COALESCE(SUM(BYTES), 0) FROM {0}.INFORMATION_SCHEMA.TABLES), \
+                 (SELECT COALESCE(SUM(ROW_COUNT), 0) FROM {0}.INFORMATION_SCHEMA.TABLES)",
+                quote_ident(db)
+            );
+            if let Ok(rs) = self.rows(&sql, 1).await {
+                let row = rs.rows.first().cloned().unwrap_or_default();
+                let n = |i: usize| match row.get(i) {
+                    Some(Value::Int(v)) => *v as f64,
+                    Some(Value::Decimal(d)) | Some(Value::Text(d)) => d.parse().unwrap_or(0.0),
+                    Some(Value::Float(f)) => *f,
+                    _ => 0.0,
+                };
+                let bytes = n(3);
+                groups.push(StatGroup {
+                    title: format!("Database · {db}"),
+                    stats: vec![
+                        Stat::number("Schemas", n(0), None),
+                        Stat::number("Tables", n(1), None),
+                        Stat::number("Views", n(2), None),
+                        Stat::number("Rows", n(4), None),
+                        Stat::number("Size", (bytes / 1_048_576.0 * 10.0).round() / 10.0, Some("MB")).with_hint(format_bytes(bytes)),
+                    ],
+                });
+            }
+        }
+        Ok(ServerStats::now(groups))
+    }
 }
 
 #[cfg(test)]
@@ -860,6 +1617,37 @@ mod tests {
         assert_eq!(rows[0][0], Value::Int(1));
         assert!(is_ddl_dml_response(&json!({"resultSetMetaData": {"rowType": [{"name": "number of rows inserted"}]}})));
         assert!(!is_ddl_dml_response(&json!({"resultSetMetaData": {"rowType": [{"name": "ID"}]}})));
+    }
+
+    #[test]
+    fn explorer_helpers_shape_names_and_statements() {
+        assert_eq!(parse_arguments("MYFUNC(NUMBER, VARCHAR) RETURN NUMBER"), ("MYFUNC(NUMBER, VARCHAR)".to_string(), "NUMBER".to_string()));
+        assert_eq!(parse_arguments("NOARGS()"), ("NOARGS()".to_string(), String::new()));
+        assert_eq!(ddl_kind(ObjectKind::MaterializedView), Some("VIEW"));
+        assert_eq!(ddl_kind(ObjectKind::Table), Some("TABLE"));
+        assert_eq!(ddl_kind(ObjectKind::Warehouse), None);
+        assert_eq!(ddl_kind(ObjectKind::Grant), None);
+
+        let w = warehouse_actions("COMPUTE_WH");
+        assert_eq!(w[0].statement, "ALTER WAREHOUSE \"COMPUTE_WH\" RESUME IF SUSPENDED");
+        assert!(!w[0].destructive, "resume is not destructive");
+        assert_eq!(w[1].statement, "ALTER WAREHOUSE \"COMPUTE_WH\" SUSPEND");
+        assert!(w[1].destructive && w[2].destructive);
+
+        let t = task_actions("\"DB\".\"S\".\"T\"");
+        assert_eq!(t.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), vec!["resume", "suspend", "drop"]);
+        assert!(!t[0].destructive && t[1].destructive);
+        assert_eq!(drop_action("TABLE", "\"DB\".\"S\".\"T\"").statement, "DROP TABLE \"DB\".\"S\".\"T\"");
+        assert_eq!(drop_action("TABLE", "x").label, "Drop table");
+
+        assert_eq!(warehouse_caption("X-SMALL", "2", "0", "1"), "X-SMALL · 1 clusters · 2 running · 0 queued");
+        assert_eq!(warehouse_caption("SMALL", "", "", "0"), "SMALL · 0 running · 0 queued");
+
+        assert_eq!(grant_name("SELECT", "TABLE", "DB.S.T"), "SELECT ON TABLE DB.S.T");
+        assert_eq!(revoke_statement("SELECT", "TABLE", "DB.S.T", "ANALYST"), "REVOKE SELECT ON TABLE DB.S.T FROM ROLE \"ANALYST\"");
+        assert_eq!(revoke_statement("USAGE", "ROLE", "DEVELOPER", "ANALYST"), "REVOKE ROLE DEVELOPER FROM ROLE \"ANALYST\"");
+        assert_eq!(format_bytes(1536.0), "1.5 KB");
+        assert_eq!(preview("SELECT\n 1 FROM t", 6), "SELECT…");
     }
 
     #[tokio::test]

@@ -4,19 +4,33 @@ import { cn } from "@/lib/cn";
 
 export interface ResizerProps {
   direction?: "horizontal" | "vertical";
+  /// Incremental delta (px) since the previous move event.
   onResize: (delta: number) => void;
+  /// Fires once when the mouse is released after a drag.
+  onDragEnd?: (() => void) | undefined;
   className?: string;
 }
 
 // WHAT:  Draggable splitter handle for expanding/collapsing sidebars,
-//        inspectors, and split panes with fluid macOS-style visual feedback.
-export function Resizer({ direction = "horizontal", onResize, className }: ResizerProps) {
+//        inspectors, split panes and grid columns with fluid macOS-style
+//        visual feedback.
+// HOW:   The callbacks live in refs so a caller can hand over a fresh closure
+//        every render (the grid does, per column) without the drag listeners
+//        being torn down and the body cursor reset mid-drag.
+export function Resizer({ direction = "horizontal", onResize, onDragEnd, className }: ResizerProps) {
   const [dragging, setDragging] = useState(false);
   const startPos = useRef(0);
+  const resizeRef = useRef(onResize);
+  const endRef = useRef(onDragEnd);
+  useEffect(() => {
+    resizeRef.current = onResize;
+    endRef.current = onDragEnd;
+  });
 
   const onMouseDown = useCallback(
     (e: React.MouseEvent) => {
       e.preventDefault();
+      e.stopPropagation();
       setDragging(true);
       startPos.current = direction === "horizontal" ? e.clientX : e.clientY;
       document.body.style.cursor = direction === "horizontal" ? "col-resize" : "row-resize";
@@ -32,13 +46,14 @@ export function Resizer({ direction = "horizontal", onResize, className }: Resiz
       const currentPos = direction === "horizontal" ? e.clientX : e.clientY;
       const delta = currentPos - startPos.current;
       startPos.current = currentPos;
-      onResize(delta);
+      resizeRef.current(delta);
     };
 
     const onMouseUp = () => {
       setDragging(false);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
+      endRef.current?.();
     };
 
     window.addEventListener("mousemove", onMouseMove);
@@ -49,7 +64,7 @@ export function Resizer({ direction = "horizontal", onResize, className }: Resiz
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
-  }, [dragging, direction, onResize]);
+  }, [dragging, direction]);
 
   return (
     <div

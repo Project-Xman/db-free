@@ -1,12 +1,14 @@
-// SOT: immudb-integration, immudb-rest-api, immudb-sql, immudb-kv, immudb-login
+// SOT: immudb-integration, immudb-rest-api, immudb-sql, immudb-kv, immudb-login, immudb-object-explorer, immudb-server-stats, immudb-ledger-history
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::http::{base_url, local, HttpClient};
+use crate::integrations::prometheus::{human_bytes, human_duration, jtext, mib, parse_exposition, pretty};
 use crate::integrations::sql::{order_clause, validate_columns, where_clause};
 use crate::integrations::{quote_ident, Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterRule, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo,
-    SslMode, StatementResult, TableInfo, TableKind, TableRef, Value,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterRule, ObjectAction, ObjectDetail, ObjectKind, ObjectRef,
+    ObjectSummary, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, ServerStats, SslMode, Stat,
+    StatGroup, StatementResult, TableInfo, TableKind, TableRef, Value,
 };
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -403,6 +405,486 @@ impl ImmudbIntegration {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Object explorer / stats / ledger history
+// ---------------------------------------------------------------------------
+
+const OBJECT_CAP: usize = 2_000;
+const HISTORY_LIMIT: usize = 100;
+
+// WHAT:  Cell of a decoded grid by column name (immudb's own column labels
+//        vary between builds, so lookups are case-insensitive and try aliases).
+fn cell<'a>(rs: &'a ResultSet, row: &'a [Value], names: &[&str]) -> Option<&'a Value> {
+    let idx = names.iter().find_map(|n| rs.columns.iter().position(|c| c.name.eq_ignore_ascii_case(n)))?;
+    row.get(idx)
+}
+
+fn cell_text(rs: &ResultSet, row: &[Value], names: &[&str]) -> String {
+    match cell(rs, row, names) {
+        Some(Value::Text(s)) => s.clone(),
+        Some(Value::Int(i)) => i.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        Some(Value::Float(f)) => f.to_string(),
+        Some(Value::Decimal(s)) | Some(Value::DateTime(s)) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+fn cell_flag(rs: &ResultSet, row: &[Value], names: &[&str]) -> bool {
+    matches!(cell(rs, row, names), Some(Value::Bool(true))) || cell_text(rs, row, names).eq_ignore_ascii_case("true")
+}
+
+// WHAT:  A history entry's value, base64-decoded to text when it is UTF-8.
+fn entry_value(entry: &Json) -> Value {
+    entry.get("value").and_then(Json::as_str).map(unb64_text).unwrap_or(Value::Null)
+}
+
+fn entry_number(entry: &Json, key: &str) -> Value {
+    match entry.get(key) {
+        Some(Json::String(s)) => s.parse::<i64>().map(Value::Int).unwrap_or_else(|_| Value::Text(s.clone())),
+        Some(Json::Number(n)) => n.as_i64().map(Value::Int).unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
+// WHAT:  immudb stamps entries with `metadata.timestamp` (unix seconds) on
+//        recent builds; older ones carry nothing, which stays NULL.
+fn entry_timestamp(entry: &Json) -> Value {
+    let raw = entry
+        .get("metadata")
+        .and_then(|m| m.get("timestamp").or_else(|| m.get("Timestamp")))
+        .or_else(|| entry.get("timestamp"))
+        .cloned()
+        .unwrap_or(Json::Null);
+    let secs = match &raw {
+        Json::String(s) => s.parse::<i64>().ok(),
+        Json::Number(n) => n.as_i64(),
+        _ => None,
+    };
+    match secs.and_then(chrono::DateTime::from_timestamp_millis_or_seconds) {
+        Some(dt) => Value::DateTime(dt.to_rfc3339()),
+        None => Value::Null,
+    }
+}
+
+// WHAT:  immudb writes timestamps in seconds; a few endpoints use milliseconds.
+//        Anything past year ~2286 in seconds is really milliseconds.
+trait TimestampGuess {
+    fn from_timestamp_millis_or_seconds(v: i64) -> Option<chrono::DateTime<chrono::Utc>>;
+}
+
+impl TimestampGuess for chrono::DateTime<chrono::Utc> {
+    fn from_timestamp_millis_or_seconds(v: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+        if v.abs() > 10_000_000_000 {
+            chrono::DateTime::from_timestamp_millis(v)
+        } else {
+            chrono::DateTime::from_timestamp(v, 0)
+        }
+    }
+}
+
+pub(crate) fn history_result(entries: &[Json], verified_tx: Option<i64>) -> ResultSet {
+    let columns = [("tx", "integer"), ("ts", "dateTime"), ("revision", "integer"), ("value", "string"), ("verified", "string")]
+        .iter()
+        .map(|(n, t)| ColumnMeta { name: (*n).to_string(), type_name: (*t).to_string() })
+        .collect();
+    let rows = entries
+        .iter()
+        .map(|e| {
+            let tx = entry_number(e, "tx");
+            let verified = match (&tx, verified_tx) {
+                (Value::Int(t), Some(v)) if *t == v => "verified",
+                _ => "unverified",
+            };
+            vec![tx, entry_timestamp(e), entry_number(e, "revision"), entry_value(e), Value::Text(verified.into())]
+        })
+        .collect();
+    ResultSet { columns, rows, truncated: false }
+}
+
+impl ImmudbIntegration {
+    /// GET a web-API path, falling back to POST {} (the gateway moved several
+    /// admin endpoints between verbs); None when neither answers.
+    async fn get_or_post(&self, path: &str) -> Option<Json> {
+        if let Ok(v) = self.http.get_json::<Json>(path).await {
+            return Some(v);
+        }
+        self.http.post_json::<Json>(path, &json!({})).await.ok()
+    }
+
+    async fn query_rows(&self, sql: &str) -> AppResult<ResultSet> {
+        let v = self.query(sql).await?;
+        Ok(query_to_result_set(&v, 10_000))
+    }
+
+    async fn index_rows(&self, table: &str) -> ResultSet {
+        self.query_rows(&format!("SELECT * FROM INDEXES({})", crate::integrations::sql::quote_literal(table)))
+            .await
+            .unwrap_or(ResultSet { columns: vec![], rows: vec![], truncated: false })
+    }
+
+    fn index_summaries(rs: &ResultSet, table: &str) -> Vec<ObjectSummary> {
+        rs.rows
+            .iter()
+            .map(|row| {
+                let name = {
+                    let n = cell_text(rs, row, &["name", "index"]);
+                    if n.is_empty() {
+                        cell_text(rs, row, &["cols", "columns"])
+                    } else {
+                        n
+                    }
+                };
+                let cols = cell_text(rs, row, &["cols", "columns"]);
+                let mut s = ObjectSummary::new(ObjectKind::Index, name, Some(table.to_string()));
+                if !cols.is_empty() {
+                    s = s.with_detail(cols);
+                }
+                let badge = if cell_flag(rs, row, &["primary", "isPrimary"]) {
+                    Some("primary")
+                } else if cell_flag(rs, row, &["unique", "isUnique"]) {
+                    Some("unique")
+                } else {
+                    None
+                };
+                match badge {
+                    Some(b) => s.with_badge(b),
+                    None => s,
+                }
+            })
+            .collect()
+    }
+
+    async fn users(&self) -> Vec<Json> {
+        let body = self.get_or_post("/api/user/list").await.unwrap_or(Json::Null);
+        body.get("users").and_then(Json::as_array).cloned().unwrap_or_default()
+    }
+
+    // WHAT:  A user's permission list → "defaultdb: read, mydb: admin".
+    fn permissions_of(user: &Json) -> String {
+        let level = |p: &Json| match p.get("permission").and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))) {
+            Some(1) => "read".to_string(),
+            Some(2) => "read/write".to_string(),
+            Some(254) => "admin".to_string(),
+            Some(255) => "sysadmin".to_string(),
+            Some(other) => other.to_string(),
+            None => String::new(),
+        };
+        user.get("permissions")
+            .and_then(Json::as_array)
+            .map(|list| {
+                list.iter()
+                    .map(|p| {
+                        let db = jtext(p, "database");
+                        let l = level(p);
+                        if db.is_empty() {
+                            l
+                        } else {
+                            format!("{db}: {l}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
+    }
+
+    fn user_name(user: &Json) -> String {
+        match user.get("user").and_then(Json::as_str) {
+            Some(b64_name) => match unb64_text(b64_name) {
+                Value::Text(s) => s,
+                other => format!("{other:?}"),
+            },
+            None => jtext(user, "name"),
+        }
+    }
+
+    async fn list_objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let mut out = match kind {
+            ObjectKind::Database => self
+                .databases()
+                .await?
+                .into_iter()
+                .map(|name| {
+                    let current = name == self.database;
+                    let s = ObjectSummary::new(ObjectKind::Database, name, None);
+                    if current {
+                        s.with_badge("current")
+                    } else {
+                        s
+                    }
+                })
+                .collect(),
+            ObjectKind::Table => {
+                let mut out = Vec::new();
+                for name in self.table_names().await? {
+                    let count = self
+                        .query_rows(&format!("SELECT COUNT(*) FROM {}", quote_ident(&name)))
+                        .await
+                        .ok()
+                        .and_then(|rs| rs.rows.first().and_then(|r| r.first()).and_then(|v| match v {
+                            Value::Int(i) => Some(*i),
+                            _ => None,
+                        }));
+                    let mut s = ObjectSummary::new(ObjectKind::Table, name, Some(self.database.clone()));
+                    if let Some(n) = count {
+                        s = s.with_detail(format!("{n} rows"));
+                    }
+                    out.push(s);
+                }
+                out
+            }
+            ObjectKind::Index => {
+                let tables = match parent {
+                    Some(t) => vec![t.to_string()],
+                    None => self.table_names().await?,
+                };
+                let mut out = Vec::new();
+                for table in tables {
+                    let rs = self.index_rows(&table).await;
+                    out.extend(Self::index_summaries(&rs, &table));
+                }
+                out
+            }
+            ObjectKind::User => self
+                .users()
+                .await
+                .iter()
+                .map(|u| {
+                    let mut s = ObjectSummary::new(ObjectKind::User, Self::user_name(u), None);
+                    let perms = Self::permissions_of(u);
+                    if !perms.is_empty() {
+                        s = s.with_detail(perms);
+                    }
+                    let active = u.get("active").and_then(Json::as_bool);
+                    match active {
+                        Some(true) => s = s.with_badge("active"),
+                        Some(false) => s = s.with_badge("inactive"),
+                        None => {}
+                    }
+                    s
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        out.sort_by(|a, b| a.reference.parent.cmp(&b.reference.parent).then_with(|| a.reference.name.cmp(&b.reference.name)));
+        out.truncate(OBJECT_CAP);
+        Ok(out)
+    }
+
+    async fn table_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = &reference.name;
+        let cols = self.sql_columns(name).await?;
+        let ident = quote_ident(name);
+        let index_rows = self.index_rows(name).await;
+        let mut detail = ObjectDetail::empty(reference)
+            .definition(format!("SELECT * FROM {ident} LIMIT 100"), CodeLanguage::Sql)
+            .property("database", self.database.clone())
+            .property("columns", cols.len().to_string())
+            .property("indexes", index_rows.rows.len().to_string());
+        if let Some(pk) = cols.iter().find(|c| c.primary_key) {
+            detail = detail.property("primary key", pk.name.clone());
+        }
+        if let Ok(rs) = self.query_rows(&format!("SELECT COUNT(*) FROM {ident}")).await {
+            if let Some(Value::Int(n)) = rs.rows.first().and_then(|r| r.first()) {
+                detail = detail.property("rows", n.to_string());
+            }
+        }
+        detail.columns = cols;
+        detail.children = Self::index_summaries(&index_rows, name);
+        detail.rows = Some(index_rows);
+        detail = detail
+            .action(ObjectAction::new("preview", "Preview rows", format!("SELECT * FROM {ident} LIMIT 100")))
+            .action(ObjectAction::new("count", "Count rows", format!("SELECT COUNT(*) FROM {ident}")))
+            .action(ObjectAction::destructive("truncate", "Truncate table", format!("TRUNCATE TABLE {ident}")));
+        Ok(detail)
+    }
+
+    async fn index_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let table = reference.parent.clone().ok_or_else(|| AppError::invalid_input("An index needs its table."))?;
+        let rs = self.index_rows(&table).await;
+        let row = rs
+            .rows
+            .iter()
+            .find(|r| cell_text(&rs, r, &["name", "index"]) == reference.name || cell_text(&rs, r, &["cols", "columns"]) == reference.name)
+            .ok_or_else(|| AppError::not_found(format!("Index `{}` not found on `{table}`.", reference.name)))?;
+        let cols = cell_text(&rs, row, &["cols", "columns"]);
+        let mut detail = ObjectDetail::empty(reference)
+            .definition(format!("SELECT * FROM INDEXES({})", crate::integrations::sql::quote_literal(&table)), CodeLanguage::Sql)
+            .property("table", table)
+            .property("unique", cell_flag(&rs, row, &["unique", "isUnique"]).to_string())
+            .property("primary", cell_flag(&rs, row, &["primary", "isPrimary"]).to_string());
+        if !cols.is_empty() {
+            detail = detail.property("columns", cols);
+        }
+        detail.rows = Some(ResultSet { columns: rs.columns.clone(), rows: vec![row.clone()], truncated: false });
+        Ok(detail)
+    }
+
+    async fn database_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let mut detail = ObjectDetail::empty(reference).definition(format!("USE DATABASE {}", quote_ident(&reference.name)), CodeLanguage::Sql);
+        if reference.name == self.database {
+            detail = detail.property("session", "attached");
+            let tables = self.table_names().await.unwrap_or_default();
+            detail = detail.property("tables", tables.len().to_string());
+            detail.children = tables.into_iter().map(|t| ObjectSummary::new(ObjectKind::Table, t, Some(reference.name.clone()))).collect();
+            if let Some(state) = self.get_or_post("/api/db/state").await {
+                detail = detail.property("transaction id", jtext(&state, "txId"));
+            }
+        }
+        Ok(detail)
+    }
+
+    async fn user_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let users = self.users().await;
+        let user = users
+            .iter()
+            .find(|u| Self::user_name(u) == reference.name)
+            .ok_or_else(|| AppError::not_found(format!("User `{}` not found.", reference.name)))?;
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(user), CodeLanguage::Json);
+        let perms = Self::permissions_of(user);
+        if !perms.is_empty() {
+            detail = detail.property("permissions", perms);
+        }
+        if let Some(active) = user.get("active").and_then(Json::as_bool) {
+            detail = detail.property("active", active.to_string());
+        }
+        let created_by = jtext(user, "createdby");
+        if !created_by.is_empty() {
+            detail = detail.property("created by", created_by);
+        }
+        Ok(detail)
+    }
+
+    async fn detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        match reference.kind {
+            ObjectKind::Database => self.database_detail(reference).await,
+            ObjectKind::Table => self.table_detail(reference).await,
+            ObjectKind::Index => self.index_detail(reference).await,
+            ObjectKind::User => self.user_detail(reference).await,
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    // WHAT:  Every revision of one key, newest first, with the ledger's own
+    //        transaction ids. The newest revision is proved with
+    //        /db/verifiable/get; older ones are listed as unverified rather
+    //        than paying for a proof per revision.
+    async fn key_history(&self, key: &str) -> AppResult<ResultSet> {
+        let body = json!({ "key": b64(key.as_bytes()), "limit": HISTORY_LIMIT, "offset": 0, "desc": true });
+        let v: Json = self.http.post_json("/api/db/history", &body).await?;
+        let entries = v.get("entries").and_then(Json::as_array).cloned().unwrap_or_default();
+        if entries.is_empty() {
+            return Ok(history_result(&[], None));
+        }
+        let verified_tx = self
+            .http
+            .post_json::<Json>("/api/db/verifiable/get", &json!({ "keyRequest": { "key": b64(key.as_bytes()) } }))
+            .await
+            .ok()
+            .filter(|v| v.get("verifiableTx").is_some())
+            .and_then(|v| match entry_number(v.get("entry").unwrap_or(&Json::Null), "tx") {
+                Value::Int(i) => Some(i),
+                _ => None,
+            });
+        Ok(history_result(&entries, verified_tx))
+    }
+
+    async fn stats(&self) -> AppResult<ServerStats> {
+        let state = self.get_or_post("/api/db/state").await.unwrap_or(Json::Null);
+        let health = self.get_or_post("/api/health").await.unwrap_or(Json::Null);
+        let info = self.get_or_post("/api/serverinfo").await.unwrap_or(Json::Null);
+        // immudb serves Prometheus metrics on its own port (9497); when the
+        // configured host is that port they land here, otherwise this is empty.
+        let metrics = self.http.get_text("/metrics").await.map(|t| parse_exposition(&t)).unwrap_or_default();
+
+        let mut server = vec![Stat::text("Database", self.database.clone())];
+        for (label, source, key) in [("Version", &info, "version"), ("Version", &health, "version")] {
+            let v = jtext(source, key);
+            if !v.is_empty() && !server.iter().any(|s| s.label == label) {
+                server.push(Stat::text(label, v));
+            }
+        }
+        match health.get("status").and_then(Json::as_bool) {
+            Some(true) => server.push(Stat::text("Health", "ok")),
+            Some(false) => server.push(Stat::text("Health", "unhealthy")),
+            None => {
+                let s = jtext(&health, "status");
+                if !s.is_empty() {
+                    server.push(Stat::text("Health", s));
+                }
+            }
+        }
+        if let Some(v) = metrics.first("immudb_uptime_hours") {
+            server.push(Stat::text("Uptime", human_duration(v * 3600.0)));
+        }
+        if let Some(v) = metrics.first("immudb_number_of_sessions").or_else(|| metrics.sum("immudb_clients")) {
+            server.push(Stat::number("Clients", v, None));
+        }
+
+        let mut ledger = Vec::new();
+        let tx_id = jtext(&state, "txId");
+        if !tx_id.is_empty() {
+            match tx_id.parse::<f64>() {
+                Ok(n) => ledger.push(Stat::number("Transaction id", n, None)),
+                Err(_) => ledger.push(Stat::text("Transaction id", tx_id)),
+            }
+        }
+        let hash = jtext(&state, "txHash");
+        if !hash.is_empty() {
+            ledger.push(Stat::text("State hash", crate::integrations::prometheus::truncate(&hash, 16)));
+        }
+        if let Some(v) = metrics.sum("immudb_number_of_stored_entries") {
+            ledger.push(Stat::number("Stored entries", v, None));
+        }
+        if let Some(v) = metrics.sum("immudb_db_size_bytes") {
+            ledger.push(Stat::number("Database size", mib(v), Some("MB")).with_hint(human_bytes(v)));
+        }
+        if let Some(v) = metrics.sum("immudb_number_of_transactions") {
+            ledger.push(Stat::number("Transactions", v, None));
+        }
+
+        let mut schema = Vec::new();
+        if let Ok(tables) = self.table_names().await {
+            schema.push(Stat::number("Tables", tables.len() as f64, None));
+        }
+        if let Ok(dbs) = self.databases().await {
+            schema.push(Stat::number("Databases", dbs.len() as f64, None));
+        }
+        let users = self.users().await;
+        if !users.is_empty() {
+            schema.push(Stat::number("Users", users.len() as f64, None));
+        }
+
+        let mut memory = Vec::new();
+        for (label, metric) in [("RSS", "process_resident_memory_bytes"), ("Heap alloc", "go_memstats_alloc_bytes")] {
+            if let Some(v) = metrics.first(metric) {
+                memory.push(Stat::number(label, mib(v), Some("MB")));
+            }
+        }
+
+        let groups = [("Server", server), ("Ledger", ledger), ("Schema", schema), ("Memory", memory)]
+            .into_iter()
+            .filter(|(_, stats)| !stats.is_empty())
+            .map(|(title, stats)| StatGroup { title: title.to_string(), stats })
+            .collect();
+        Ok(ServerStats::now(groups))
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities { transactions: false, views: false, exact_estimate: true, ..Capabilities::SQL },
+        object_kinds: vec![K::Database, K::Table, K::Index, K::User],
+        tools: vec![T::Stats, T::LedgerHistory],
+    }
+}
+
 #[async_trait]
 impl Integration for ImmudbIntegration {
     fn engine(&self) -> Engine {
@@ -410,7 +892,7 @@ impl Integration for ImmudbIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { transactions: false, views: false, exact_estimate: true, ..Capabilities::SQL }
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -589,6 +1071,40 @@ impl Integration for ImmudbIntegration {
     }
 
     async fn close(&self) {}
+
+    async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        self.list_objects(kind, parent).await
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        self.detail(reference).await
+    }
+
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        self.stats().await
+    }
+
+    // WHAT:  Ledger history. A `document` reference is a KV key (the ledger's
+    //        own versioned unit); a `table` reference has no equivalent, because
+    //        immudb's SQL engine exposes point-in-time reads (`SINCE TX`) rather
+    //        than a per-row revision list.
+    async fn history(&self, reference: &ObjectRef) -> AppResult<ResultSet> {
+        match reference.kind {
+            ObjectKind::Document => {
+                let key = reference.name.trim();
+                if key.is_empty() {
+                    return Err(AppError::invalid_input("Enter the key whose history you want."));
+                }
+                self.key_history(key).await
+            }
+            ObjectKind::Table => Err(AppError::invalid_input(format!(
+                "immudb keeps verifiable history per key, not per SQL row: `{}` has no revision list. Query a point in time with `SELECT * FROM {} SINCE TX <n>`, or load the history of a key instead.",
+                reference.name,
+                quote_ident(&reference.name)
+            ))),
+            other => Err(AppError::invalid_input(format!("{other:?} objects have no ledger history."))),
+        }
+    }
 }
 
 impl ImmudbIntegration {
@@ -688,6 +1204,54 @@ mod tests {
         assert!(!is_read_sql("UPSERT INTO t(id) VALUES (1)"));
         let row = kv_entry_row(&json!({"key": b64(b"k"), "value": b64(b"v"), "tx": "7"}));
         assert_eq!(row, vec![Value::Text("k".into()), Value::Text("v".into()), Value::Int(7)]);
+    }
+
+    #[test]
+    fn history_entries_become_revisions() {
+        let entries = vec![
+            json!({"key": b64(b"k"), "value": b64(b"v2"), "tx": "9", "revision": "2", "metadata": {"timestamp": "1700000000"}}),
+            json!({"key": b64(b"k"), "value": b64(b"v1"), "tx": "7", "revision": "1"}),
+        ];
+        let rs = history_result(&entries, Some(9));
+        assert_eq!(rs.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["tx", "ts", "revision", "value", "verified"]);
+        assert_eq!(rs.rows[0][0], Value::Int(9));
+        assert!(matches!(rs.rows[0][1], Value::DateTime(_)));
+        assert_eq!(rs.rows[0][2], Value::Int(2));
+        assert_eq!(rs.rows[0][3], Value::Text("v2".into()));
+        assert_eq!(rs.rows[0][4], Value::Text("verified".into()));
+        // Only the proved transaction is marked; older revisions stay unverified.
+        assert_eq!(rs.rows[1][4], Value::Text("unverified".into()));
+        assert_eq!(rs.rows[1][1], Value::Null);
+        assert!(history_result(&[], None).rows.is_empty());
+    }
+
+    #[test]
+    fn index_and_user_shapes_decode() {
+        let rs = ResultSet {
+            columns: [("table", "varchar"), ("name", "varchar"), ("unique", "boolean"), ("primary", "boolean"), ("cols", "varchar")]
+                .iter()
+                .map(|(n, t)| ColumnMeta { name: (*n).into(), type_name: (*t).into() })
+                .collect(),
+            rows: vec![
+                vec![Value::Text("t".into()), Value::Text("PK".into()), Value::Bool(true), Value::Bool(true), Value::Text("id".into())],
+                vec![Value::Text("t".into()), Value::Text("idx_name".into()), Value::Bool(false), Value::Bool(false), Value::Text("name".into())],
+            ],
+            truncated: false,
+        };
+        let summaries = ImmudbIntegration::index_summaries(&rs, "t");
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].reference.name, "PK");
+        assert_eq!(summaries[0].reference.parent.as_deref(), Some("t"));
+        assert_eq!(summaries[0].badge.as_deref(), Some("primary"));
+        assert_eq!(summaries[1].badge, None);
+        assert_eq!(summaries[1].detail.as_deref(), Some("name"));
+        assert_eq!(cell_text(&rs, &rs.rows[0], &["NAME"]), "PK");
+        assert!(cell_flag(&rs, &rs.rows[0], &["unique"]));
+
+        let user = json!({"user": b64(b"immudb"), "active": true, "permissions": [{"database": "defaultdb", "permission": 254}, {"database": "other", "permission": 1}]});
+        assert_eq!(ImmudbIntegration::user_name(&user), "immudb");
+        assert_eq!(ImmudbIntegration::permissions_of(&user), "defaultdb: admin, other: read");
+        assert_eq!(ImmudbIntegration::user_name(&json!({"name": "plain"})), "plain");
     }
 
     #[tokio::test]

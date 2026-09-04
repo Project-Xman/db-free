@@ -1,11 +1,12 @@
-// SOT: kafka-integration, redpanda-integration, rskafka-adapter, topic-browser, kafka-record-decoding, kafka-console-commands
+// SOT: kafka-integration, redpanda-integration, rskafka-adapter, topic-browser, kafka-record-decoding, kafka-console-commands, kafka-object-explorer, kafka-server-stats
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::http::local;
 use crate::integrations::{Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterRule, PageQuery, ResolvedConnection, ResultSet,
-    SchemaCatalog, SchemaInfo, StatementResult, TableInfo, TableKind, TableRef, Value,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterRule, ObjectAction, ObjectDetail, ObjectKind, ObjectRef,
+    ObjectSummary, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, ServerStats, Stat, StatGroup,
+    StatementResult, TableInfo, TableKind, TableRef, Value,
 };
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -47,6 +48,9 @@ pub struct KafkaIntegration {
     engine: Engine,
     topic_filter: Option<String>,
     read_only: bool,
+    /// Bootstrap list this session dialled. rskafka 0.6 exposes no cluster
+    /// broker metadata, so this is the only broker fact the adapter can report.
+    servers: Vec<String>,
 }
 
 fn map_error(err: rskafka::client::error::Error) -> AppError {
@@ -104,7 +108,7 @@ fn bootstrap_servers(host: Option<&str>, port: Option<u16>) -> Vec<String> {
 pub async fn connect(conn: &ResolvedConnection) -> AppResult<Arc<dyn Integration>> {
     let s = &conn.summary;
     let servers = bootstrap_servers(s.host.as_deref(), s.port);
-    let mut builder = ClientBuilder::new(servers).client_id("db-free").backoff_config(BackoffConfig {
+    let mut builder = ClientBuilder::new(servers.clone()).client_id("db-free").backoff_config(BackoffConfig {
         init_backoff: Duration::from_millis(100),
         max_backoff: Duration::from_secs(2),
         base: 2.0,
@@ -119,7 +123,7 @@ pub async fn connect(conn: &ResolvedConnection) -> AppResult<Arc<dyn Integration
     }
     let client = builder.build().await.map_err(map_error)?;
     let topic_filter = s.database.as_deref().map(str::trim).filter(|d| !d.is_empty()).map(str::to_string);
-    Ok(Arc::new(KafkaIntegration { client, engine: s.engine, topic_filter, read_only: s.read_only }))
+    Ok(Arc::new(KafkaIntegration { client, engine: s.engine, topic_filter, read_only: s.read_only, servers }))
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +211,10 @@ pub enum Command {
     Topics,
     Consume { topic: String, partition: Option<i32>, start: Start, limit: u64 },
     Produce { topic: String, partition: Option<i32>, key: Option<String>, value: String, headers: BTreeMap<String, String> },
+    /// `{"delete": {"topic": "…"}}` — the one destructive verb the object
+    /// explorer can offer, since `ControllerClient::delete_topic` is the only
+    /// admin call rskafka 0.6 exposes.
+    DeleteTopic { topic: String },
 }
 
 fn json_string(value: &serde_json::Value) -> String {
@@ -237,6 +245,16 @@ pub fn parse_command(text: &str, max_rows: usize) -> AppResult<Command> {
                 .unwrap_or_default();
             return Ok(Command::Produce { topic, partition, key, value, headers });
         }
+        if let Some(delete) = obj.get("delete") {
+            let topic = delete
+                .as_object()
+                .and_then(|d| d.get("topic"))
+                .map(json_string)
+                .or_else(|| delete.as_str().map(str::to_string))
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| AppError::invalid_input("\"delete.topic\" is required."))?;
+            return Ok(Command::DeleteTopic { topic });
+        }
         if obj.get("topics").is_some() && obj.get("topic").is_none() {
             return Ok(Command::Topics);
         }
@@ -263,7 +281,7 @@ pub fn parse_command(text: &str, max_rows: usize) -> AppResult<Command> {
             Ok(Command::Consume { topic, partition: None, start: Start::Latest, limit: limit.unwrap_or(cap.min(100)).clamp(1, cap) })
         }
         _ => Err(AppError::invalid_input(
-            "Enter `TOPICS`, `CONSUME <topic> [n]`, a JSON body {\"topic\": \"…\", \"offset\": \"earliest\", \"limit\": 50}, or {\"produce\": {\"topic\": \"…\", \"value\": \"…\"}}.",
+            "Enter `TOPICS`, `CONSUME <topic> [n]`, a JSON body {\"topic\": \"…\", \"offset\": \"earliest\", \"limit\": 50}, {\"produce\": {\"topic\": \"…\", \"value\": \"…\"}} or {\"delete\": {\"topic\": \"…\"}}.",
         )),
     }
 }
@@ -428,14 +446,247 @@ impl KafkaIntegration {
     }
 }
 
-#[async_trait]
-impl Integration for KafkaIntegration {
-    fn engine(&self) -> Engine {
-        self.engine
+// ---------------------------------------------------------------------------
+// Object explorer / stats
+// ---------------------------------------------------------------------------
+
+const OBJECT_CAP: usize = 2_000;
+// Watermarks cost two round trips per partition, so an unscoped partition
+// listing walks only the first topics rather than the whole cluster.
+const TOPIC_WALK: usize = 50;
+const DELETE_TIMEOUT_MS: i32 = 5_000;
+
+fn is_internal(topic: &str) -> bool {
+    topic.starts_with("__") || topic.starts_with('_')
+}
+
+fn partition_columns() -> Vec<ColumnMeta> {
+    [("partition", "int"), ("low_watermark", "bigint"), ("high_watermark", "bigint"), ("records", "bigint")]
+        .iter()
+        .map(|(n, t)| ColumnMeta { name: (*n).to_string(), type_name: (*t).to_string() })
+        .collect()
+}
+
+// WHAT:  One partition's offset window. `records` is high − low, i.e. what is
+//        retained now — not everything ever written (compaction / retention
+//        move the low watermark up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PartitionOffsets {
+    pub partition: i32,
+    pub low: i64,
+    pub high: i64,
+}
+
+impl PartitionOffsets {
+    fn records(&self) -> i64 {
+        (self.high - self.low).max(0)
     }
 
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
+    fn row(&self) -> Vec<Value> {
+        vec![Value::Int(i64::from(self.partition)), Value::Int(self.low), Value::Int(self.high), Value::Int(self.records())]
+    }
+
+    fn detail(&self) -> String {
+        format!("offsets {}–{} · {} records", self.low, self.high, self.records())
+    }
+}
+
+pub(crate) fn offsets_result(offsets: &[PartitionOffsets]) -> ResultSet {
+    ResultSet { columns: partition_columns(), rows: offsets.iter().map(PartitionOffsets::row).collect(), truncated: false }
+}
+
+impl KafkaIntegration {
+    async fn delete_topic(&self, topic: &str) -> AppResult<StatementResult> {
+        if self.read_only {
+            return Err(AppError::read_only("This connection is read-only; deleting a topic is blocked."));
+        }
+        let controller = self.client.controller_client().map_err(map_error)?;
+        controller.delete_topic(topic, DELETE_TIMEOUT_MS).await.map_err(map_error)?;
+        Ok(StatementResult::Affected { rows_affected: 1 })
+    }
+
+    async fn partition_offsets(&self, topic: &str) -> AppResult<Vec<PartitionOffsets>> {
+        let mut out = Vec::new();
+        for partition in self.partitions_of(topic).await? {
+            let pc = self.partition(topic, partition).await?;
+            let (low, high) = self.watermarks(&pc).await?;
+            out.push(PartitionOffsets { partition, low, high });
+        }
+        Ok(out)
+    }
+
+    fn topic_summary(name: &str, partitions: usize, records: Option<i64>) -> ObjectSummary {
+        let detail = match records {
+            Some(n) => format!("{partitions} partitions · {n} records"),
+            None => format!("{partitions} partitions"),
+        };
+        let mut summary = ObjectSummary::new(ObjectKind::Topic, name, None).with_detail(detail);
+        if is_internal(name) {
+            summary = summary.with_badge("internal");
+        }
+        summary
+    }
+
+    async fn topic_objects(&self) -> AppResult<Vec<ObjectSummary>> {
+        let topics = self.topics().await?;
+        let mut out = Vec::with_capacity(topics.len());
+        for t in topics {
+            let records = self.topic_count(&t.name).await.ok();
+            out.push(Self::topic_summary(&t.name, t.partitions.len(), records));
+        }
+        Ok(out)
+    }
+
+    async fn partition_objects(&self, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let topics: Vec<String> = match parent {
+            Some(t) => vec![t.to_string()],
+            None => self.topics().await?.into_iter().map(|t| t.name).take(TOPIC_WALK).collect(),
+        };
+        let mut out = Vec::new();
+        for topic in topics {
+            for o in self.partition_offsets(&topic).await.unwrap_or_default() {
+                out.push(ObjectSummary::new(ObjectKind::Partition, o.partition.to_string(), Some(topic.clone())).with_detail(o.detail()));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let mut out = match kind {
+            ObjectKind::Topic => self.topic_objects().await?,
+            ObjectKind::Partition => self.partition_objects(parent).await?,
+            _ => Vec::new(),
+        };
+        // Partitions sort numerically; topics by name.
+        out.sort_by(|a, b| {
+            let key = |s: &ObjectSummary| s.reference.name.parse::<i64>().ok();
+            a.reference.parent.cmp(&b.reference.parent).then_with(|| match (key(a), key(b)) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                _ => a.reference.name.cmp(&b.reference.name),
+            })
+        });
+        out.truncate(OBJECT_CAP);
+        Ok(out)
+    }
+
+    async fn topic_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = &reference.name;
+        let topic = self
+            .topics()
+            .await?
+            .into_iter()
+            .find(|t| t.name == *name)
+            .ok_or_else(|| AppError::not_found(format!("Topic \"{name}\" not found.")))?;
+        let offsets = self.partition_offsets(name).await.unwrap_or_default();
+        let records: i64 = offsets.iter().map(PartitionOffsets::records).sum();
+        let mut detail = ObjectDetail::empty(reference)
+            .definition(format!("{{\"topic\": \"{name}\", \"offset\": \"earliest\", \"limit\": 100}}"), CodeLanguage::Json)
+            .property("partitions", topic.partitions.len().to_string())
+            .property("records retained", records.to_string())
+            .property("internal", is_internal(name).to_string());
+        if let (Some(first), Some(last)) = (offsets.iter().map(|o| o.low).min(), offsets.iter().map(|o| o.high).max()) {
+            detail = detail.property("offset range", format!("{first}–{last}"));
+        }
+        detail.columns = fixed_columns();
+        detail.rows = Some(offsets_result(&offsets));
+        detail.children = offsets
+            .iter()
+            .map(|o| ObjectSummary::new(ObjectKind::Partition, o.partition.to_string(), Some(name.clone())).with_detail(o.detail()))
+            .collect();
+        detail = detail.action(ObjectAction::destructive("delete_topic", "Delete topic", format!("{{\"delete\": {{\"topic\": \"{name}\"}}}}")));
+        Ok(detail)
+    }
+
+    async fn partition_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let topic = reference.parent.clone().ok_or_else(|| AppError::invalid_input("A partition needs its topic."))?;
+        let id: i32 = reference.name.parse().map_err(|_| AppError::invalid_input(format!("`{}` is not a partition number.", reference.name)))?;
+        let pc = self.partition(&topic, id).await?;
+        let (low, high) = self.watermarks(&pc).await?;
+        let o = PartitionOffsets { partition: id, low, high };
+        let mut detail = ObjectDetail::empty(reference)
+            .definition(format!("{{\"topic\": \"{topic}\", \"partition\": {id}, \"offset\": \"earliest\", \"limit\": 100}}"), CodeLanguage::Json)
+            .property("topic", topic)
+            .property("low watermark", low.to_string())
+            .property("high watermark", high.to_string())
+            .property("records retained", o.records().to_string());
+        detail.columns = fixed_columns();
+        detail.rows = Some(offsets_result(&[o]));
+        Ok(detail)
+    }
+
+    async fn detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        match reference.kind {
+            ObjectKind::Topic => self.topic_detail(reference).await,
+            ObjectKind::Partition => self.partition_detail(reference).await,
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    // WHAT:  Cluster shape from topic metadata plus per-partition watermarks.
+    // WHY:   rskafka 0.6 exposes no broker list, controller id or DescribeConfigs,
+    //        so "brokers" here is the bootstrap list this session dialled, and it
+    //        is labelled as such rather than passed off as cluster metadata.
+    async fn stats(&self) -> AppResult<ServerStats> {
+        let topics = self.topics().await?;
+        let mut partitions = 0usize;
+        let mut records = 0i64;
+        let mut internal_topics = 0usize;
+        let mut largest: Option<(String, i64)> = None;
+        let mut empty = 0usize;
+        for t in &topics {
+            partitions += t.partitions.len();
+            if is_internal(&t.name) {
+                internal_topics += 1;
+                continue;
+            }
+            let n: i64 = self.partition_offsets(&t.name).await.unwrap_or_default().iter().map(PartitionOffsets::records).sum();
+            records += n;
+            if n == 0 {
+                empty += 1;
+            }
+            if largest.as_ref().is_none_or(|(_, best)| n > *best) {
+                largest = Some((t.name.clone(), n));
+            }
+        }
+        let cluster = vec![
+            Stat::text("Engine", if self.engine == Engine::Redpanda { "Redpanda" } else { "Kafka" }),
+            Stat::number("Bootstrap brokers", self.servers.len() as f64, None).with_hint(self.servers.join(", ")),
+            Stat::text("Broker metadata", "not exposed by the client"),
+        ];
+        let mut topic_stats = vec![
+            Stat::number("Topics", topics.len() as f64, None),
+            Stat::number("Partitions", partitions as f64, None),
+            Stat::number("Internal topics", internal_topics as f64, None),
+            Stat::number("Empty topics", empty as f64, None),
+        ];
+        if let Some(filter) = &self.topic_filter {
+            topic_stats.push(Stat::text("Name filter", filter.clone()));
+        }
+        let mut throughput = vec![Stat::number("Records retained", records as f64, None).with_hint("Σ (high − low watermark) over non-internal topics")];
+        if let Some((name, n)) = largest {
+            throughput.push(Stat::number("Largest topic", n as f64, None).with_hint(name));
+        }
+        let groups = [("Cluster", cluster), ("Topics", topic_stats), ("Throughput", throughput)]
+            .into_iter()
+            .map(|(title, stats)| StatGroup { title: title.to_string(), stats })
+            .collect();
+        Ok(ServerStats::now(groups))
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// NOTE:  ConsumerGroup / Node / Acl / Setting are NOT declared: rskafka 0.6
+//        exposes neither group listing (ListGroups/DescribeGroups), broker
+//        metadata, ACLs nor DescribeConfigs, and no crate may be added. Only
+//        list_topics / partition_client / controller_client are public, which
+//        is exactly Topic + Partition.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities {
             sql: false,
             namespaces: false,
             fixed_columns: true,
@@ -444,7 +695,20 @@ impl Integration for KafkaIntegration {
             views: false,
             transactions: false,
             exact_estimate: true,
-        }
+        },
+        object_kinds: vec![K::Topic, K::Partition],
+        tools: vec![T::Stats, T::MessageViewer],
+    }
+}
+
+#[async_trait]
+impl Integration for KafkaIntegration {
+    fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -527,6 +791,7 @@ impl Integration for KafkaIntegration {
                     StatementResult::Rows { result: self.consume(&topic, partition, &start, limit).await? }
                 }
                 Command::Produce { topic, partition, key, value, headers } => self.produce(&topic, partition, key, value, headers).await?,
+                Command::DeleteTopic { topic } => self.delete_topic(&topic).await?,
             };
             out.push(result);
         }
@@ -534,6 +799,18 @@ impl Integration for KafkaIntegration {
     }
 
     async fn close(&self) {}
+
+    async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        self.list_objects(kind, parent).await
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        self.detail(reference).await
+    }
+
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        self.stats().await
+    }
 }
 
 // WHAT:  JSON bodies are one statement each (balanced braces); shorthands are one per line.
@@ -632,6 +909,30 @@ mod tests {
         assert!(matches!(parse_command("SELECT 1", 10), Err(AppError::InvalidInput { .. })));
         assert!(matches!(parse_command(r#"{"offset": 1}"#, 10), Err(AppError::InvalidInput { .. })));
         assert!(matches!(parse_command(r#"{"topic": "t", "offset": true}"#, 10), Err(AppError::InvalidInput { .. })));
+    }
+
+    #[test]
+    fn delete_topic_parses_and_offsets_shape_rows() {
+        assert_eq!(parse_command(r#"{"delete": {"topic": "orders"}}"#, 10).ok(), Some(Command::DeleteTopic { topic: "orders".into() }));
+        assert_eq!(parse_command(r#"{"delete": "orders"}"#, 10).ok(), Some(Command::DeleteTopic { topic: "orders".into() }));
+        assert!(matches!(parse_command(r#"{"delete": {}}"#, 10), Err(AppError::InvalidInput { .. })));
+
+        let offsets = [PartitionOffsets { partition: 0, low: 5, high: 12 }, PartitionOffsets { partition: 1, low: 0, high: 0 }];
+        assert_eq!(offsets[0].records(), 7);
+        assert_eq!(offsets[1].records(), 0);
+        assert_eq!(offsets[0].detail(), "offsets 5–12 · 7 records");
+        let rs = offsets_result(&offsets);
+        assert_eq!(rs.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["partition", "low_watermark", "high_watermark", "records"]);
+        assert_eq!(rs.rows[0], vec![Value::Int(0), Value::Int(5), Value::Int(12), Value::Int(7)]);
+        // A low watermark above the high one (mid-truncation) never goes negative.
+        assert_eq!(PartitionOffsets { partition: 0, low: 9, high: 4 }.records(), 0);
+
+        assert!(is_internal("__consumer_offsets"));
+        assert!(!is_internal("orders"));
+        let s = KafkaIntegration::topic_summary("__consumer_offsets", 3, Some(9));
+        assert_eq!(s.badge.as_deref(), Some("internal"));
+        assert_eq!(s.detail.as_deref(), Some("3 partitions · 9 records"));
+        assert_eq!(KafkaIntegration::topic_summary("orders", 1, None).detail.as_deref(), Some("1 partitions"));
     }
 
     #[test]

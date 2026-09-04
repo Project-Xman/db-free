@@ -1,12 +1,13 @@
-// SOT: hbase-integration, hbase-rest-api, stargate, hbase-scanner
+// SOT: hbase-integration, hbase-rest-api, stargate, hbase-scanner, hbase-object-explorer, hbase-cluster-status
 
 use crate::error::{AppError, AppResult};
-use crate::integrations::http::{base_url, json_result, local, HttpClient};
+use crate::integrations::http::{base_url, json_result, local, objects_to_result_set, HttpClient};
 use crate::integrations::sql::validate_columns;
 use crate::integrations::{Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog,
-    SchemaInfo, SslMode, StatementResult, TableInfo, TableKind, TableRef, Value,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, ObjectDetail, ObjectKind, ObjectRef,
+    ObjectSummary, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, ServerStats, SslMode, Stat,
+    StatGroup, StatementResult, TableInfo, TableKind, TableRef, Value,
 };
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -407,6 +408,291 @@ impl HbaseIntegration {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Object explorer / administration
+//
+// WHAT:  Namespaces (GET /namespaces), tables (GET /namespaces/{ns}/tables or
+//        GET /) with their schema (GET /{table}/schema) and regions
+//        (GET /{table}/regions), and region servers from GET /status/cluster.
+// WHY:   The generic explorer / admin UI; the REST gateway exposes no DDL, so
+//        a table's definition is its schema document as JSON.
+// HOW:   Pure decoders below turn the gateway's JSON into summaries / result
+//        sets and are unit-tested offline; the async methods only fetch.
+//        There are no actions: schema changes go through the raw
+//        `{"method","path","body"}` passthrough in `execute`.
+// ---------------------------------------------------------------------------
+
+const SYSTEM_NAMESPACE: &str = "hbase";
+const MAX_OBJECTS: usize = 2_000;
+
+/// `ns:table` → (ns, table); bare names live in `default`.
+fn split_table_name(full: &str) -> (String, String) {
+    match full.split_once(':') {
+        Some((ns, name)) => (ns.to_string(), name.to_string()),
+        None => ("default".to_string(), full.to_string()),
+    }
+}
+
+fn json_i64(v: Option<&Json>) -> i64 {
+    match v {
+        Some(Json::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)).unwrap_or(0),
+        Some(Json::String(s)) => s.parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn json_f64(v: Option<&Json>) -> f64 {
+    match v {
+        Some(Json::Number(n)) => n.as_f64().unwrap_or(0.0),
+        Some(Json::String(s)) => s.parse().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// The gateway capitalises some keys (`LiveNodes`) and not others (`liveNodes`) depending on the version.
+fn key<'a>(obj: &'a Json, names: &[&str]) -> Option<&'a Json> {
+    names.iter().find_map(|n| obj.get(n))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct LiveNode {
+    name: String,
+    requests: i64,
+    regions: usize,
+    heap_mb: i64,
+    max_heap_mb: i64,
+}
+
+fn live_nodes(status: &Json) -> Vec<LiveNode> {
+    key(status, &["LiveNodes", "liveNodes"])
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .map(|n| LiveNode {
+            name: n.get("name").and_then(Json::as_str).unwrap_or_default().to_string(),
+            requests: json_i64(n.get("requests")),
+            regions: key(n, &["Region", "region"]).and_then(Json::as_array).map(Vec::len).unwrap_or(0),
+            heap_mb: json_i64(n.get("heapSizeMB")),
+            max_heap_mb: json_i64(n.get("maxHeapSizeMB")),
+        })
+        .collect()
+}
+
+fn dead_nodes(status: &Json) -> Vec<String> {
+    key(status, &["DeadNodes", "deadNodes"])
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|n| n.as_str().map(str::to_string).or_else(|| n.get("name").and_then(Json::as_str).map(str::to_string)))
+        .collect()
+}
+
+fn node_summaries(status: &Json) -> Vec<ObjectSummary> {
+    let mut out: Vec<ObjectSummary> = live_nodes(status)
+        .into_iter()
+        .map(|n| {
+            ObjectSummary::new(ObjectKind::Node, n.name, None)
+                .with_detail(format!("{} requests · {} regions · heap {}/{} MB", n.requests, n.regions, n.heap_mb, n.max_heap_mb))
+                .with_badge("live")
+        })
+        .collect();
+    out.extend(dead_nodes(status).into_iter().map(|n| ObjectSummary::new(ObjectKind::Node, n, None).with_badge("dead")));
+    out
+}
+
+/// Column families of a schema document with their attributes (VERSIONS, TTL, …).
+fn schema_families(schema: &Json) -> Vec<(String, Map<String, Json>)> {
+    let mut fams: Vec<(String, Map<String, Json>)> = schema
+        .get("ColumnSchema")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let name = c.get("name").and_then(Json::as_str)?.to_string();
+            let attrs: Map<String, Json> = c.as_object().map(|o| o.iter().filter(|(k, _)| k.as_str() != "name").map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
+            Some((name, attrs))
+        })
+        .collect();
+    fams.sort_by(|a, b| a.0.cmp(&b.0));
+    fams
+}
+
+fn family_caption(attrs: &Map<String, Json>) -> String {
+    ["VERSIONS", "TTL", "COMPRESSION", "BLOOMFILTER", "IN_MEMORY", "DATA_BLOCK_ENCODING"]
+        .iter()
+        .filter_map(|k| attrs.get(*k).map(|v| format!("{k}={}", v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `{"name": t, "Region": [{id, name, startKey, endKey, location}]}` → one row per region.
+fn regions_result(info: &Json) -> ResultSet {
+    let rows: Vec<Json> = key(info, &["Region", "region"])
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .map(|r| {
+            let mut obj = Map::new();
+            for k in ["name", "id", "startKey", "endKey", "location"] {
+                if let Some(v) = r.get(k) {
+                    obj.insert(k.to_string(), v.clone());
+                }
+            }
+            Json::Object(obj)
+        })
+        .collect();
+    objects_to_result_set(&rows, Some("name"), MAX_OBJECTS)
+}
+
+/// Regions hosted by one live node (`Region` entries of a `LiveNodes` element).
+fn node_regions_result(node: &Json) -> ResultSet {
+    let rows: Vec<Json> = key(node, &["Region", "region"])
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .map(|r| {
+            let mut obj = r.as_object().cloned().unwrap_or_default();
+            if let Some(Json::String(raw)) = obj.get("name").cloned() {
+                obj.insert("name".into(), Json::String(decode_text(&raw)));
+            }
+            Json::Object(obj)
+        })
+        .collect();
+    objects_to_result_set(&rows, Some("name"), MAX_OBJECTS)
+}
+
+fn pretty(v: &Json) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+}
+
+impl HbaseIntegration {
+    async fn get_json(&self, path: &str) -> AppResult<Json> {
+        let req = self.http.request(Method::GET, path).headers(Self::json_headers());
+        let resp = self.http.send(req).await?;
+        resp.json().await.map_err(|e| AppError::driver(format!("Malformed response from {path}: {e}")))
+    }
+
+    async fn namespaces(&self) -> AppResult<Vec<String>> {
+        let v = self.get_json("/namespaces").await?;
+        let mut names: Vec<String> = key(&v, &["Namespace", "namespace"])
+            .and_then(Json::as_array)
+            .map(|a| a.iter().filter_map(Json::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        names.sort();
+        Ok(names)
+    }
+
+    async fn tables_in(&self, namespace: &str) -> AppResult<Vec<String>> {
+        let v = self.get_json(&format!("/namespaces/{}/tables", pct(namespace))).await?;
+        let mut names: Vec<String> = v
+            .get("table")
+            .and_then(Json::as_array)
+            .map(|a| a.iter().filter_map(|t| t.get("name").and_then(Json::as_str)).map(|n| split_table_name(n).1).collect())
+            .unwrap_or_default();
+        names.sort();
+        Ok(names)
+    }
+
+    async fn list_namespace_objects(&self) -> AppResult<Vec<ObjectSummary>> {
+        let mut out = Vec::new();
+        for ns in self.namespaces().await? {
+            if ns == SYSTEM_NAMESPACE {
+                continue;
+            }
+            let count = self.tables_in(&ns).await.map(|t| t.len()).unwrap_or(0);
+            out.push(ObjectSummary::new(ObjectKind::Namespace, ns, None).with_detail(format!("{count} tables")));
+        }
+        Ok(out)
+    }
+
+    async fn list_table_objects(&self, namespace: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        match namespace {
+            Some(ns) => Ok(self.tables_in(ns).await?.into_iter().map(|t| ObjectSummary::new(ObjectKind::Table, t, Some(ns.to_string()))).collect()),
+            None => {
+                let mut out: Vec<ObjectSummary> = self
+                    .all_tables()
+                    .await?
+                    .into_iter()
+                    .map(|full| split_table_name(&full))
+                    .filter(|(ns, _)| ns != SYSTEM_NAMESPACE)
+                    .map(|(ns, name)| ObjectSummary::new(ObjectKind::Table, name, Some(ns)))
+                    .collect();
+                out.sort_by(|a, b| a.reference.parent.cmp(&b.reference.parent).then(a.reference.name.cmp(&b.reference.name)));
+                Ok(out)
+            }
+        }
+    }
+
+    async fn namespace_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let ns = &reference.name;
+        let props = self.get_json(&format!("/namespaces/{}", pct(ns))).await.unwrap_or(Json::Null);
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&props), CodeLanguage::Json);
+        if let Some(obj) = props.get("properties").and_then(Json::as_object) {
+            for (k, v) in obj {
+                detail = detail.property(k, v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()));
+            }
+        }
+        detail.children = self.list_table_objects(Some(ns)).await.unwrap_or_default();
+        Ok(detail)
+    }
+
+    async fn table_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let table = TableRef { schema: reference.parent.clone(), name: reference.name.clone() };
+        let path = table_path(&table);
+        let schema = self.get_json(&format!("/{}/schema", pct(&path))).await?;
+        let families = schema_families(&schema);
+        let names: Vec<String> = families.iter().map(|(n, _)| n.clone()).collect();
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&schema), CodeLanguage::Json).property("name", path.clone());
+        if let Some(obj) = schema.as_object() {
+            for (k, v) in obj.iter().filter(|(k, _)| k.as_str() != "name" && k.as_str() != "ColumnSchema") {
+                detail = detail.property(k, v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()));
+            }
+        }
+        for (name, attrs) in &families {
+            detail = detail.property(&format!("family {name}"), family_caption(attrs));
+        }
+        detail.columns = fixed_columns(&names);
+        if let Ok(regions) = self.get_json(&format!("/{}/regions", pct(&path))).await {
+            let set = regions_result(&regions);
+            detail = detail.property("regions", set.rows.len().to_string());
+            detail.rows = Some(set);
+        }
+        Ok(detail)
+    }
+
+    async fn node_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let status = self.get_json("/status/cluster").await?;
+        let live = key(&status, &["LiveNodes", "liveNodes"]).and_then(Json::as_array).into_iter().flatten().find(|n| n.get("name").and_then(Json::as_str) == Some(reference.name.as_str()));
+        let Some(node) = live else {
+            if dead_nodes(&status).iter().any(|n| n == &reference.name) {
+                return Ok(ObjectDetail::empty(reference).property("state", "dead"));
+            }
+            return Err(AppError::not_found(format!("Region server {} is not in the cluster status.", reference.name)));
+        };
+        let mut detail = ObjectDetail::empty(reference).property("state", "live");
+        for (k, v) in node.as_object().into_iter().flatten().filter(|(k, _)| !matches!(k.as_str(), "Region" | "region" | "name")) {
+            detail = detail.property(k, v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()));
+        }
+        let regions = node_regions_result(node);
+        detail = detail.property("regions", regions.rows.len().to_string());
+        detail.rows = Some(regions);
+        Ok(detail)
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities { namespaces: true, fixed_columns: true, row_estimate: false, ..Capabilities::KEY_VALUE },
+        object_kinds: vec![K::Namespace, K::Table, K::Node],
+        tools: vec![T::Stats],
+    }
+}
+
 #[async_trait]
 impl Integration for HbaseIntegration {
     fn engine(&self) -> Engine {
@@ -414,7 +700,7 @@ impl Integration for HbaseIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { namespaces: true, fixed_columns: true, row_estimate: false, ..Capabilities::KEY_VALUE }
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -615,12 +901,112 @@ impl Integration for HbaseIntegration {
     }
 
     async fn close(&self) {}
+
+    async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let mut out = match kind {
+            ObjectKind::Namespace => self.list_namespace_objects().await?,
+            ObjectKind::Table => self.list_table_objects(parent).await?,
+            ObjectKind::Node => node_summaries(&self.get_json("/status/cluster").await?),
+            _ => Vec::new(),
+        };
+        out.truncate(MAX_OBJECTS);
+        Ok(out)
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        match reference.kind {
+            ObjectKind::Namespace => self.namespace_detail(reference).await,
+            ObjectKind::Table => self.table_detail(reference).await,
+            ObjectKind::Node => self.node_detail(reference).await,
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    // WHAT:  /status/cluster totals (regions, requests, load, live / dead
+    //        servers, heap across live servers) plus /version/cluster.
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        let status = self.get_json("/status/cluster").await?;
+        let live = live_nodes(&status);
+        let dead = dead_nodes(&status);
+        let version = self.server_version().await.unwrap_or_default().unwrap_or_else(|| "HBase".into());
+        let heap: i64 = live.iter().map(|n| n.heap_mb).sum();
+        let max_heap: i64 = live.iter().map(|n| n.max_heap_mb).sum();
+        let groups = vec![
+            StatGroup { title: "Server".into(), stats: vec![Stat::text("Version", version), Stat::text("Gateway", self.http.base().to_string())] },
+            StatGroup {
+                title: "Cluster".into(),
+                stats: vec![
+                    Stat::number("Live region servers", live.len() as f64, None),
+                    Stat::number("Dead region servers", dead.len() as f64, None),
+                    Stat::number("Regions", json_f64(status.get("regions")), None),
+                    Stat::number("Average load", json_f64(status.get("averageLoad")), Some("regions/server")),
+                ],
+            },
+            StatGroup {
+                title: "Throughput".into(),
+                stats: vec![Stat::number("Requests", json_f64(status.get("requests")), None).with_hint("cluster-wide request counter from /status/cluster")],
+            },
+            StatGroup {
+                title: "Memory".into(),
+                stats: vec![Stat::number("Heap used", heap as f64, Some("MB")), Stat::number("Heap max", max_heap as f64, Some("MB"))],
+            },
+        ];
+        Ok(ServerStats::now(groups))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{ConnectionSummary, Environment, SslMode};
+
+    #[test]
+    fn cluster_status_decodes_nodes() {
+        let status = json!({
+            "regions": 3, "requests": 42, "averageLoad": 1.5,
+            "LiveNodes": [{
+                "name": "rs1:16020", "startCode": 1, "requests": 40, "heapSizeMB": 120, "maxHeapSizeMB": 1024,
+                "Region": [{"name": b64(b"t,,1.abc."), "stores": 1, "storefiles": 2, "readRequestsCount": 7}, {"name": b64(b"u,,2.def."), "stores": 1}]
+            }],
+            "DeadNodes": ["rs2,16020,99"]
+        });
+        let live = live_nodes(&status);
+        assert_eq!(live, vec![LiveNode { name: "rs1:16020".into(), requests: 40, regions: 2, heap_mb: 120, max_heap_mb: 1024 }]);
+        assert_eq!(dead_nodes(&status), vec!["rs2,16020,99"]);
+        let summaries = node_summaries(&status);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].badge.as_deref(), Some("live"));
+        assert_eq!(summaries[0].detail.as_deref(), Some("40 requests · 2 regions · heap 120/1024 MB"));
+        assert_eq!(summaries[1].badge.as_deref(), Some("dead"));
+        let regions = node_regions_result(&status["LiveNodes"][0]);
+        assert_eq!(regions.rows.len(), 2);
+        assert_eq!(regions.rows[0][0], Value::Text("t,,1.abc.".into()));
+        assert_eq!(json_f64(status.get("averageLoad")), 1.5);
+        assert_eq!(json_i64(Some(&json!("12"))), 12);
+        // Lower-case keys from older gateways are accepted too.
+        assert_eq!(live_nodes(&json!({"liveNodes": [{"name": "x"}]})).len(), 1);
+    }
+
+    #[test]
+    fn schema_and_regions_decode() {
+        let schema = json!({"name": "users", "IS_META": "false", "ColumnSchema": [
+            {"name": "meta", "VERSIONS": "3", "TTL": "FOREVER"},
+            {"name": "cf", "VERSIONS": "1", "TTL": "86400", "COMPRESSION": "SNAPPY", "BLOOMFILTER": "ROW"}
+        ]});
+        let fams = schema_families(&schema);
+        assert_eq!(fams.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), vec!["cf", "meta"]);
+        assert_eq!(family_caption(&fams[0].1), "VERSIONS=1, TTL=86400, COMPRESSION=SNAPPY, BLOOMFILTER=ROW");
+        let info = json!({"name": "users", "Region": [
+            {"id": 1, "name": "users,,1.a.", "startKey": "", "endKey": "m", "location": "rs1:16020"},
+            {"id": 2, "name": "users,m,2.b.", "startKey": "m", "endKey": "", "location": "rs2:16020"}
+        ]});
+        let set = regions_result(&info);
+        assert_eq!(set.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["name", "id", "startKey", "endKey", "location"]);
+        assert_eq!(set.rows.len(), 2);
+        assert_eq!(set.rows[1][4], Value::Text("rs2:16020".into()));
+        assert_eq!(split_table_name("ns:t"), ("ns".to_string(), "t".to_string()));
+        assert_eq!(split_table_name("t"), ("default".to_string(), "t".to_string()));
+    }
 
     #[test]
     fn scanner_xml_encodes_prefix_and_batch() {

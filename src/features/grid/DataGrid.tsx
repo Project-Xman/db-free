@@ -1,4 +1,4 @@
-// SOT: data-grid, virtualized-grid, grid-cell-rendering, column-sort-header, row-selection, inline-cell-edit, foreign-key-link, change-highlighting
+// SOT: data-grid, virtualized-grid, grid-cell-rendering, column-sort-header, column-resize, row-selection, inline-cell-edit, foreign-key-link, change-highlighting
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@heroui/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -8,6 +8,7 @@ import { fieldKind } from "@/lib/fields";
 import { Icon, typeIcon } from "@/lib/icons";
 import { Check } from "@/components/global/Field";
 import { CellEditor } from "@/components/global/ValueEditor";
+import { Resizer } from "@/components/global/Resizer";
 import { cn } from "@/lib/cn";
 
 export interface GridColumn {
@@ -52,6 +53,10 @@ interface DataGridProps {
 
 const HEADER_HEIGHT = 32;
 const CHECK_WIDTH = 40;
+const MIN_COL_WIDTH = 56;
+const MAX_COL_WIDTH = 1600;
+/// Grab area straddling a column's right edge.
+const HANDLE_WIDTH = 6;
 
 // WHAT:  Two-axis virtualized grid: only visible rows AND columns are mounted.
 // WHY:   PRD §4.2 — 10^6 rows at 60 FPS. Row data is pulled through `getRow`
@@ -63,6 +68,9 @@ const CHECK_WIDTH = 40;
 //        Change highlighting: staged cell = amber with a left bar and a
 //        "was: …" tooltip, staged delete = red strike-through row, staged
 //        insert = green row appended after the fetched page.
+//        Column resize: a Resizer straddles each header's right edge; widths
+//        are keyed by column name so they survive a refetch, double-click
+//        restores the type-based estimate.
 // WHERE: src/features/grid/TableTab.tsx, src/features/editor/ResultsPane.tsx
 export function DataGrid({
   columns,
@@ -90,8 +98,13 @@ export function DataGrid({
     rangeRef.current = onRangeChange;
   });
   const [editing, setEditing] = useState<{ row: number; col: number } | null>(null);
+  // User-dragged widths by column name; unset = estimateWidth().
+  const [widthOverrides, setWidthOverrides] = useState<Readonly<Record<string, number>>>({});
+  // Unclamped width of the column being dragged, so dragging past the minimum
+  // and back does not leave the handle lagging behind the pointer.
+  const dragWidth = useRef<number | null>(null);
 
-  const widths = useMemo(() => columns.map((c) => estimateWidth(c)), [columns]);
+  const widths = useMemo(() => columns.map((c) => widthOverrides[c.name] ?? estimateWidth(c)), [columns, widthOverrides]);
 
   const rowVirtualizer = useVirtualizer({
     count: rowCount,
@@ -115,6 +128,21 @@ export function DataGrid({
   useEffect(() => {
     rowVirtualizer.measure();
   }, [rowHeight, rowVirtualizer]);
+  useEffect(() => {
+    colVirtualizer.measure();
+  }, [widths, colVirtualizer]);
+
+  const resizeColumn = (column: GridColumn, current: number, delta: number) => {
+    const raw = (dragWidth.current ?? current) + delta;
+    dragWidth.current = raw;
+    const next = Math.min(MAX_COL_WIDTH, Math.max(MIN_COL_WIDTH, raw));
+    setWidthOverrides((prev) => (prev[column.name] === next ? prev : { ...prev, [column.name]: next }));
+  };
+  const resetColumn = (column: GridColumn) =>
+    setWidthOverrides((prev) => {
+      if (!(column.name in prev)) return prev;
+      return Object.fromEntries(Object.entries(prev).filter(([name]) => name !== column.name));
+    });
 
   const totalWidth = colVirtualizer.getTotalSize();
   const totalHeight = rowVirtualizer.getTotalSize();
@@ -153,6 +181,28 @@ export function DataGrid({
                   {column.linkTo !== undefined ? <span className="truncate text-[10px] text-muted">→ {column.linkTo}</span> : null}
                   {rule ? <Icon name={rule.desc ? "arrow-down" : "arrow-up"} size={11} className="ml-auto shrink-0 text-accent" /> : null}
                 </Button>
+              );
+            })}
+            {virtualCols.map((vc) => {
+              const column = columns[vc.index];
+              if (!column) return null;
+              return (
+                <div
+                  key={`${vc.key}-resize`}
+                  className="absolute top-0 z-10 h-full"
+                  style={{ left: vc.end - HANDLE_WIDTH / 2, width: HANDLE_WIDTH }}
+                  title="Drag to resize · double-click to reset"
+                  onDoubleClick={() => resetColumn(column)}
+                >
+                  <Resizer
+                    direction="horizontal"
+                    onResize={(delta) => resizeColumn(column, vc.size, delta)}
+                    onDragEnd={() => {
+                      dragWidth.current = null;
+                    }}
+                    className="absolute inset-0 rounded-none"
+                  />
+                </div>
               );
             })}
           </div>

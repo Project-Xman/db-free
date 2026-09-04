@@ -67,6 +67,7 @@ VENDOR_OWNERS = {
         "integrations/prometheus.rs",
         "integrations/qdrant.rs",
         "integrations/qldb.rs",
+        "integrations/s3.rs",
         "integrations/snowflake.rs",
         "integrations/sparql.rs",
         "integrations/surrealdb.rs",

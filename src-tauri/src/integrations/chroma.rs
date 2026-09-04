@@ -1,11 +1,12 @@
-// SOT: chroma-integration, chroma-rest-api, vector-collections, chroma-api-v2, chroma-api-v1-fallback, chroma-where-filter, chroma-command-console
+// SOT: chroma-integration, chroma-rest-api, vector-collections, chroma-api-v2, chroma-api-v1-fallback, chroma-where-filter, chroma-command-console, object-explorer, vector-search-playground, chroma-admin-actions
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::http::{self, json_result, json_to_value, json_type_name, objects_to_result_set, HttpClient};
 use crate::integrations::{Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog,
-    SchemaInfo, StatementResult, TableInfo, TableKind, TableRef, Value,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, ObjectAction, ObjectDetail, ObjectKind,
+    ObjectRef, ObjectSummary, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, StatementResult,
+    TableInfo, TableKind, TableRef, Value, VectorSearchRequest,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value as Json};
@@ -459,14 +460,269 @@ impl ChromaIntegration {
     }
 }
 
-#[async_trait]
-impl Integration for ChromaIntegration {
-    fn engine(&self) -> Engine {
-        self.engine
+// ---------------------------------------------------------------------------
+// Object explorer / vector search
+//
+// WHAT:  `objects()` lists the tenant's databases and the collections of the
+//        current one; `object_detail()` adds the collection JSON, a property
+//        sheet (uuid, count, metadata, dimension) and a delete action written
+//        as this adapter's own `{"path", "method"}` envelope; `vector_search()`
+//        posts `/query` with `query_embeddings`.
+// ---------------------------------------------------------------------------
+
+const OBJECT_CAP: usize = 2_000;
+const DISTANCE_COLUMN: &str = "_distance";
+
+fn text_of(v: &Json) -> String {
+    match v {
+        Json::Null => String::new(),
+        Json::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn pretty(v: &Json) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_default()
+}
+
+fn finish(mut list: Vec<ObjectSummary>) -> Vec<ObjectSummary> {
+    list.sort_by(|a, b| a.reference.name.cmp(&b.reference.name).then_with(|| a.reference.parent.cmp(&b.reference.parent)));
+    list.truncate(OBJECT_CAP);
+    list
+}
+
+fn summary(kind: ObjectKind, name: &str, parent: Option<&str>, detail: String, badge: Option<String>) -> ObjectSummary {
+    let mut s = ObjectSummary::new(kind, name, parent.map(str::to_string));
+    if !detail.is_empty() {
+        s = s.with_detail(detail);
+    }
+    if let Some(b) = badge.filter(|b| !b.is_empty()) {
+        s = s.with_badge(b);
+    }
+    s
+}
+
+fn rows_table(columns: &[(&str, &str)], rows: Vec<Vec<Value>>) -> ResultSet {
+    ResultSet {
+        columns: columns.iter().map(|(name, ty)| ColumnMeta { name: (*name).to_string(), type_name: (*ty).to_string() }).collect(),
+        rows,
+        truncated: false,
+    }
+}
+
+// WHAT:  One collection row (name, uuid, metadata, dimension) → a summary; the
+//        count comes from `/count` and is passed in because it costs a call.
+fn collection_summary(c: &Json, count: Option<f64>) -> Option<ObjectSummary> {
+    let name = c.get("name").and_then(Json::as_str)?;
+    let mut parts = Vec::new();
+    if let Some(n) = count {
+        parts.push(format!("{} records", crate::model::objects::format_number(n)));
+    }
+    if let Some(d) = c.get("dimension").and_then(Json::as_f64) {
+        parts.push(format!("{d}d"));
+    }
+    let keys: Vec<String> = c.get("metadata").and_then(Json::as_object).map(|m| m.keys().cloned().collect()).unwrap_or_default();
+    if !keys.is_empty() {
+        parts.push(keys.join(", "));
+    }
+    let badge = c
+        .get("metadata")
+        .and_then(|m| m.get("hnsw:space"))
+        .map(text_of)
+        .filter(|s| !s.is_empty())
+        .or_else(|| c.get("configuration_json").and_then(|cfg| cfg.pointer("/hnsw/space")).map(text_of).filter(|s| !s.is_empty()));
+    Some(summary(ObjectKind::Collection, name, None, parts.join(" · "), badge))
+}
+
+fn database_summaries(names: &[String], current: &str, tenant: &str) -> Vec<ObjectSummary> {
+    let list = names
+        .iter()
+        .map(|name| {
+            let is_current = name == current;
+            summary(
+                ObjectKind::Database,
+                name,
+                None,
+                format!("tenant {tenant}"),
+                is_current.then(|| "current".to_string()),
+            )
+        })
+        .collect();
+    finish(list)
+}
+
+// ---- vector search ----------------------------------------------------------
+
+// WHAT:  Playground request → `/collections/{id}/query`. The filter is Chroma's
+//        own `where` document; `include` always carries metadata + documents +
+//        distances, and embeddings when the caller asked for vectors.
+fn query_body(req: &VectorSearchRequest) -> Json {
+    let mut include = vec!["metadatas", "documents", "distances"];
+    if req.include_vectors {
+        include.push("embeddings");
+    }
+    let mut body = json!({
+        "query_embeddings": [req.vector],
+        "n_results": req.top_k.max(1),
+        "include": include,
+    });
+    if let Some(filter) = req.filter.clone().filter(|f| f.is_object() && f.as_object().map(|o| !o.is_empty()).unwrap_or(false)) {
+        body["where"] = filter;
+    }
+    body
+}
+
+// WHAT:  The columnar query response → grid: `id`, `_distance`, `document`,
+//        metadata keys, `_embedding` when embeddings were requested.
+fn query_hits(resp: &Json, include_vectors: bool) -> ResultSet {
+    let objects = query_to_objects(resp);
+    let mut names: Vec<String> = vec![ID_COLUMN.to_string(), DISTANCE_COLUMN.to_string(), DOCUMENT_COLUMN.to_string()];
+    let mut types: Vec<Option<&'static str>> = vec![Some("string"), Some("number"), Some("string")];
+    for obj in objects.iter().filter_map(Json::as_object) {
+        for (k, v) in obj {
+            if k == "_embedding" {
+                continue;
+            }
+            match names.iter().position(|n| n == k) {
+                Some(i) => {
+                    if types[i].is_none() && !v.is_null() {
+                        types[i] = Some(json_type_name(v));
+                    }
+                }
+                None => {
+                    names.push(k.clone());
+                    types.push((!v.is_null()).then(|| json_type_name(v)));
+                }
+            }
+        }
+    }
+    if include_vectors {
+        names.push("_embedding".to_string());
+        types.push(Some("json"));
+    }
+    let rows = objects
+        .iter()
+        .map(|obj| {
+            let map = obj.as_object();
+            names.iter().map(|n| map.and_then(|m| m.get(n)).map(json_to_value).unwrap_or(Value::Null)).collect()
+        })
+        .collect();
+    ResultSet {
+        columns: names.into_iter().zip(types).map(|(name, ty)| ColumnMeta { name, type_name: ty.unwrap_or("json").to_string() }).collect(),
+        rows,
+        truncated: false,
+    }
+}
+
+impl ChromaIntegration {
+    async fn database_names(&self) -> Vec<String> {
+        if self.api == ApiVersion::V2 {
+            let path = format!("/api/v2/tenants/{}/databases?limit=1000", self.tenant);
+            if let Ok(resp) = self.http.get_json::<Json>(&path).await {
+                let names: Vec<String> = resp
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|d| d.get("name").and_then(Json::as_str).map(str::to_string)).collect())
+                    .unwrap_or_default();
+                if !names.is_empty() {
+                    return names;
+                }
+            }
+        }
+        vec![self.database.clone()]
     }
 
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
+    async fn list_databases(&self) -> AppResult<Vec<ObjectSummary>> {
+        Ok(database_summaries(&self.database_names().await, &self.database, &self.tenant))
+    }
+
+    async fn list_collections_summaries(&self) -> AppResult<Vec<ObjectSummary>> {
+        let list = self.list_collections().await?;
+        let mut out = Vec::new();
+        for c in &list {
+            let count = match c.get("name").and_then(Json::as_str) {
+                Some(name) => self.count_all(name).await.ok().map(|n| n as f64),
+                None => None,
+            };
+            if let Some(s) = collection_summary(c, count) {
+                out.push(s);
+            }
+        }
+        Ok(finish(out))
+    }
+
+    async fn database_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = reference.name.as_str();
+        let mut detail = ObjectDetail::empty(reference)
+            .property("Tenant", &self.tenant)
+            .property("Current", (name == self.database).to_string())
+            .property("API", if self.api == ApiVersion::V2 { "v2" } else { "v1" });
+        if self.api == ApiVersion::V2 {
+            if let Ok(body) = self.http.get_json::<Json>(&format!("/api/v2/tenants/{}/databases/{name}", self.tenant)).await {
+                detail = detail.definition(pretty(&body), CodeLanguage::Json);
+            }
+        }
+        if name == self.database {
+            let collections = self.list_collections().await.unwrap_or_default();
+            detail = detail.property("Collections", collections.len().to_string());
+            detail.rows = Some(rows_table(
+                &[("collection", "string"), ("id", "string")],
+                collections
+                    .iter()
+                    .map(|c| vec![Value::Text(text_of(c.get("name").unwrap_or(&Json::Null))), Value::Text(text_of(c.get("id").unwrap_or(&Json::Null)))])
+                    .collect(),
+            ));
+            detail.children = self.list_collections_summaries().await.unwrap_or_default();
+        }
+        Ok(detail)
+    }
+
+    async fn collection_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = reference.name.as_str();
+        let id = self.collection_id(name).await?;
+        let list = self.list_collections().await.unwrap_or_default();
+        let spec = list.iter().find(|c| c.get("name").and_then(Json::as_str) == Some(name)).cloned().unwrap_or(Json::Null);
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&spec), CodeLanguage::Json).property("Id", &id).property("Database", &self.database);
+        if let Ok(count) = self.count_all(name).await {
+            detail = detail.property("Records", crate::model::objects::format_number(count as f64));
+        }
+        if let Some(d) = spec.get("dimension").filter(|d| !d.is_null()) {
+            detail = detail.property("Dimension", text_of(d));
+        }
+        let sample = self.get_records(name, json!({"limit": 1, "include": ["embeddings"]})).await.unwrap_or_default();
+        if let Some(dim) = sample.first().and_then(|r| r.get("_embedding")).and_then(Json::as_array).map(Vec::len) {
+            detail = detail.property("Embedding length", dim.to_string());
+        }
+        let metadata: Vec<Vec<Value>> = spec
+            .get("metadata")
+            .and_then(Json::as_object)
+            .into_iter()
+            .flatten()
+            .map(|(k, v)| vec![Value::Text(k.clone()), Value::Text(text_of(v))])
+            .collect();
+        detail.rows = Some(rows_table(&[("metadata", "string"), ("value", "string")], metadata));
+        detail.columns = self.columns(&TableRef { schema: Some(self.database.clone()), name: name.to_string() }).await.unwrap_or_default();
+        let path = self.collection_path(&id, "");
+        Ok(detail.action(ObjectAction::destructive("delete", "Delete collection", json!({"method": "DELETE", "path": path}).to_string())))
+    }
+
+    async fn similarity(&self, req: &VectorSearchRequest) -> AppResult<ResultSet> {
+        if req.vector.is_empty() {
+            return Err(AppError::invalid_input("A query vector is required."));
+        }
+        let id = self.collection_id(&req.collection).await?;
+        let resp: Json = self.http.post_json(&self.collection_path(&id, "/query"), &query_body(req)).await?;
+        Ok(query_hits(&resp, req.include_vectors))
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities {
             sql: false,
             namespaces: true,
             fixed_columns: false,
@@ -475,7 +731,20 @@ impl Integration for ChromaIntegration {
             views: false,
             transactions: false,
             exact_estimate: true,
-        }
+        },
+        object_kinds: vec![K::Database, K::Collection],
+        tools: vec![T::VectorSearch],
+    }
+}
+
+#[async_trait]
+impl Integration for ChromaIntegration {
+    fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -576,6 +845,26 @@ impl Integration for ChromaIntegration {
         Ok(vec![self.run(cmd, max_rows).await?])
     }
 
+    async fn objects(&self, kind: ObjectKind, _parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        match kind {
+            ObjectKind::Database => self.list_databases().await,
+            ObjectKind::Collection => self.list_collections_summaries().await,
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        match reference.kind {
+            ObjectKind::Database => self.database_detail(reference).await,
+            ObjectKind::Collection => self.collection_detail(reference).await,
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    async fn vector_search(&self, req: &VectorSearchRequest) -> AppResult<ResultSet> {
+        self.similarity(req).await
+    }
+
     async fn close(&self) {}
 }
 
@@ -655,6 +944,79 @@ mod tests {
         assert_eq!(mk(ApiVersion::V2).collection_path("x", "/get"), "/api/v2/tenants/t/databases/d/collections/x/get");
         assert_eq!(mk(ApiVersion::V1).collection_path("x", "/get"), "/api/v1/collections/x/get");
         assert_eq!(mk(ApiVersion::V1).collections_path(), "/api/v1/collections?tenant=t&database=d");
+    }
+
+    #[test]
+    fn explorer_summaries_for_databases_and_collections() {
+        let dbs = database_summaries(&["default_database".to_string(), "other".to_string()], "default_database", "default_tenant");
+        assert_eq!(dbs[0].reference.name, "default_database");
+        assert_eq!(dbs[0].badge.as_deref(), Some("current"));
+        assert_eq!(dbs[0].detail.as_deref(), Some("tenant default_tenant"));
+        assert!(dbs[1].badge.is_none());
+
+        let c = json!({"name": "docs", "id": "uuid-1", "dimension": 384, "metadata": {"hnsw:space": "cosine", "owner": "team"}});
+        let s = collection_summary(&c, Some(1200.0)).unwrap_or_else(|| panic!("summary"));
+        assert_eq!(s.reference.name, "docs");
+        assert_eq!(s.badge.as_deref(), Some("cosine"));
+        assert_eq!(s.detail.as_deref(), Some("1,200 records · 384d · hnsw:space, owner"));
+        let bare = collection_summary(&json!({"name": "plain"}), None).unwrap_or_else(|| panic!("summary"));
+        assert!(bare.detail.is_none() && bare.badge.is_none());
+        let configured = collection_summary(&json!({"name": "x", "configuration_json": {"hnsw": {"space": "l2"}}}), None).unwrap_or_else(|| panic!("summary"));
+        assert_eq!(configured.badge.as_deref(), Some("l2"));
+        assert!(collection_summary(&json!({"id": "no-name"}), None).is_none());
+    }
+
+    #[test]
+    fn vector_search_body_and_hits() {
+        let req = VectorSearchRequest {
+            collection: "docs".into(),
+            vector: vec![0.1, 0.9],
+            vector_name: None,
+            top_k: 3,
+            filter: Some(json!({"year": {"$gt": 1970}})),
+            include_vectors: false,
+        };
+        let body = query_body(&req);
+        assert_eq!(body["query_embeddings"], json!([[0.1, 0.9]]));
+        assert_eq!(body["n_results"], 3);
+        assert_eq!(body["include"], json!(["metadatas", "documents", "distances"]));
+        assert_eq!(body["where"], json!({"year": {"$gt": 1970}}));
+        let with_vec = query_body(&VectorSearchRequest { include_vectors: true, filter: Some(json!({})), top_k: 0, ..req.clone() });
+        assert_eq!(with_vec["include"], json!(["metadatas", "documents", "distances", "embeddings"]));
+        assert_eq!(with_vec["n_results"], 1);
+        assert!(with_vec.get("where").is_none());
+
+        let resp = json!({
+            "ids": [["a", "b"]],
+            "documents": [["sand worms", null]],
+            "metadatas": [[{"year": 1965}, {"year": 1984, "genre": "cyber"}]],
+            "distances": [[0.02, 0.5]],
+            "embeddings": [[[0.1, 0.9], [0.9, 0.1]]]
+        });
+        let rs = query_hits(&resp, false);
+        let names: Vec<&str> = rs.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "_distance", "document", "year", "genre"]);
+        assert_eq!(rs.rows[0][0], Value::Text("a".into()));
+        assert_eq!(rs.rows[0][1], Value::Float(0.02));
+        assert_eq!(rs.rows[0][2], Value::Text("sand worms".into()));
+        assert_eq!(rs.rows[0][4], Value::Null);
+        assert_eq!(rs.rows[1][4], Value::Text("cyber".into()));
+        let with_vec = query_hits(&resp, true);
+        assert_eq!(with_vec.columns.last().map(|c| c.name.as_str()), Some("_embedding"));
+        assert_eq!(with_vec.rows[0][5], Value::Json(json!([0.1, 0.9])));
+        assert!(query_hits(&json!({"ids": []}), false).rows.is_empty());
+    }
+
+    #[test]
+    fn explorer_actions_parse_as_console_commands() {
+        let stmt = json!({"method": "DELETE", "path": "/api/v2/tenants/t/databases/d/collections/uuid-1"}).to_string();
+        match parse_command(&stmt) {
+            Ok(cmd @ Command::Raw { .. }) => {
+                assert!(cmd.is_mutation());
+                assert_eq!(cmd, Command::Raw { method: "DELETE".into(), path: "/api/v2/tenants/t/databases/d/collections/uuid-1".into(), body: None });
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[tokio::test]

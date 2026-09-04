@@ -8,6 +8,7 @@ pub mod changes;
 pub mod connections;
 pub mod data;
 pub mod library;
+pub mod objects;
 pub mod query;
 pub mod schema;
 pub mod settings;
@@ -58,10 +59,17 @@ pub enum CommandName {
     AiGenerate,
     ExplainQuery,
     RunWorkflow,
+    ListObjects,
+    LoadObject,
+    ServerStats,
+    VectorSearch,
+    SearchDocuments,
+    QueryRange,
+    LoadHistory,
 }
 
 impl CommandName {
-    pub const ALL: [CommandName; 34] = [
+    pub const ALL: [CommandName; 41] = [
         CommandName::ListConnections,
         CommandName::SaveConnection,
         CommandName::DeleteConnection,
@@ -96,6 +104,13 @@ impl CommandName {
         CommandName::AiGenerate,
         CommandName::ExplainQuery,
         CommandName::RunWorkflow,
+        CommandName::ListObjects,
+        CommandName::LoadObject,
+        CommandName::ServerStats,
+        CommandName::VectorSearch,
+        CommandName::SearchDocuments,
+        CommandName::QueryRange,
+        CommandName::LoadHistory,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -134,6 +149,13 @@ impl CommandName {
             CommandName::AiGenerate => "ai_generate",
             CommandName::ExplainQuery => "explain_query",
             CommandName::RunWorkflow => "run_workflow",
+            CommandName::ListObjects => "list_objects",
+            CommandName::LoadObject => "load_object",
+            CommandName::ServerStats => "server_stats",
+            CommandName::VectorSearch => "vector_search",
+            CommandName::SearchDocuments => "search_documents",
+            CommandName::QueryRange => "query_range",
+            CommandName::LoadHistory => "load_history",
         }
     }
 }
@@ -188,6 +210,13 @@ mod tests {
             CommandName::ExportTables | CommandName::ImportFile => "transfer",
             CommandName::AiGenerate | CommandName::ExplainQuery => "ai",
             CommandName::RunWorkflow => "workflows",
+            CommandName::ListObjects
+            | CommandName::LoadObject
+            | CommandName::ServerStats
+            | CommandName::VectorSearch
+            | CommandName::SearchDocuments
+            | CommandName::QueryRange
+            | CommandName::LoadHistory => "objects",
         }
     }
 }

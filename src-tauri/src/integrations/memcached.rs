@@ -1,11 +1,13 @@
-// SOT: memcached-integration, memcached-text-protocol, memcached-adapter, memcached-command-parser
+// SOT: memcached-integration, memcached-text-protocol, memcached-adapter, memcached-command-parser, memcached-object-explorer, memcached-server-stats, memcached-stats-parser
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::http::local;
 use crate::integrations::{Capabilities, Integration};
+use crate::model::objects::format_number;
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterRule, PageQuery, ResolvedConnection, ResultSet,
-    SchemaCatalog, SchemaInfo, StatementResult, TableInfo, TableKind, TableRef, Value,
+    ColumnInfo, ColumnMeta, Engine, FilterRule, ObjectDetail, ObjectKind, ObjectRef, ObjectSummary, PageQuery,
+    ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, ServerStats, Stat, StatGroup, StatementResult,
+    TableInfo, TableKind, TableRef, Value,
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -30,6 +32,10 @@ use tokio::sync::Mutex;
 //                      stats: `stats` → rows
 //        execute     = one raw protocol command per line; write commands are
 //                      refused on read-only connections
+//        objects     = Setting from `stats settings`, Session from `stats conns`
+//                      (empty on builds without it); no actions, the protocol
+//                      has none that target one setting or connection
+//        stats       = `stats` + `stats slabs` as grouped figures
 //        Memcached has NO key scan. `stats cachedump` is capped by the server
 //        (and removed in some builds, which answer CLIENT_ERROR); in that case
 //        the keys table is simply empty while stats still work.
@@ -522,6 +528,231 @@ impl MemcachedIntegration {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Object explorer / stats
+//
+// WHAT:  `stats settings` → Setting objects, `stats conns` → Session objects,
+//        `stats` + `stats slabs` → the Stats tab groups.
+// WHY:   Memcached has no catalog beyond its stats families, and no command
+//        that targets one setting or one connection, so these views are
+//        read-only: there are no actions to offer.
+// ---------------------------------------------------------------------------
+
+const MAX_OBJECTS: usize = 2_000;
+const DETAIL_PREVIEW: usize = 80;
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct SlabSummary {
+    slabs: u64,
+    pages: u64,
+    malloced: Option<f64>,
+}
+
+// WHAT:  `stats slabs` (`STAT <id>:total_pages N`, `STAT active_slabs N`,
+//        `STAT total_malloced N`) → slab class count / page total / bytes.
+fn summarise_slabs(stats: &BTreeMap<String, String>) -> SlabSummary {
+    let mut ids = std::collections::BTreeSet::new();
+    let mut pages = 0u64;
+    for (key, value) in stats {
+        if let Some((id, field)) = key.split_once(':') {
+            if let Ok(id) = id.parse::<u64>() {
+                ids.insert(id);
+                if field == "total_pages" {
+                    pages += value.parse::<u64>().unwrap_or(0);
+                }
+            }
+        }
+    }
+    let slabs = stats
+        .get("active_slabs")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or_else(|| u64::try_from(ids.len()).unwrap_or(u64::MAX));
+    SlabSummary { slabs, pages, malloced: stats.get("total_malloced").and_then(|v| v.parse::<f64>().ok()) }
+}
+
+// WHAT:  `stats conns` (`STAT <fd>:addr tcp:0.0.0.0:11211`, `STAT <fd>:state
+//        conn_listening`, `STAT <fd>:secs_since_last_cmd 4`) → one field map
+//        per connection, by descriptor.
+fn parse_conns(stats: &BTreeMap<String, String>) -> BTreeMap<u64, BTreeMap<String, String>> {
+    let mut out: BTreeMap<u64, BTreeMap<String, String>> = BTreeMap::new();
+    for (key, value) in stats {
+        if let Some((fd, field)) = key.split_once(':') {
+            if let Ok(fd) = fd.parse::<u64>() {
+                out.entry(fd).or_default().insert(field.to_string(), value.clone());
+            }
+        }
+    }
+    out
+}
+
+fn stat_num(stats: &BTreeMap<String, String>, key: &str) -> Option<f64> {
+    stats.get(key).and_then(|v| v.parse::<f64>().ok())
+}
+
+fn mib(bytes: f64) -> f64 {
+    (bytes / 1_048_576.0 * 100.0).round() / 100.0
+}
+
+// WHAT:  Seconds → `3d 4h 5m 6s`.
+fn format_duration(secs: f64) -> String {
+    let total = secs.max(0.0).round() as u64;
+    let (days, hours, minutes, seconds) = (total / 86_400, (total % 86_400) / 3_600, (total % 3_600) / 60, total % 60);
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 || days > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 || hours > 0 || days > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+    parts.push(format!("{seconds}s"));
+    parts.join(" ")
+}
+
+fn preview(text: &str, max: usize) -> String {
+    if text.chars().count() > max {
+        format!("{}…", text.chars().take(max).collect::<String>())
+    } else {
+        text.to_string()
+    }
+}
+
+fn group(title: &str, stats: Vec<Stat>) -> StatGroup {
+    StatGroup { title: title.to_string(), stats }
+}
+
+fn push_number(stats: &mut Vec<Stat>, label: &str, value: Option<f64>, unit: Option<&str>) {
+    if let Some(v) = value {
+        stats.push(Stat::number(label, v, unit));
+    }
+}
+
+fn push_bytes(stats: &mut Vec<Stat>, label: &str, bytes: Option<f64>) {
+    if let Some(b) = bytes {
+        stats.push(Stat::number(label, mib(b), Some("MiB")).with_hint(format!("{} bytes", format_number(b))));
+    }
+}
+
+fn ratio_percent(hits: Option<f64>, misses: Option<f64>) -> Option<f64> {
+    match (hits, misses) {
+        (Some(h), Some(m)) if h + m > 0.0 => Some((h / (h + m) * 10_000.0).round() / 100.0),
+        _ => None,
+    }
+}
+
+// WHAT:  `stats` + summarised `stats slabs` → Stats tab groups.
+fn stats_groups(stats: &BTreeMap<String, String>, slabs: &SlabSummary) -> Vec<StatGroup> {
+    let num = |key: &str| stat_num(stats, key);
+    let text = |key: &str| stats.get(key).cloned().unwrap_or_default();
+
+    let mut server = Vec::new();
+    if stats.contains_key("version") {
+        server.push(Stat::text("Version", text("version")));
+    }
+    if let Some(up) = num("uptime") {
+        server.push(Stat::text("Uptime", format_duration(up)).with_hint(format!("{} s", format_number(up))));
+    }
+    push_number(&mut server, "Threads", num("threads"), None);
+    push_number(&mut server, "CPU user", num("rusage_user"), Some("s"));
+    push_number(&mut server, "CPU system", num("rusage_system"), Some("s"));
+
+    let mut connections = Vec::new();
+    push_number(&mut connections, "Current", num("curr_connections"), None);
+    push_number(&mut connections, "Total", num("total_connections"), None);
+    push_number(&mut connections, "Rejected", num("rejected_connections"), None);
+    push_number(&mut connections, "Max simultaneous", num("max_connections"), None);
+    push_number(&mut connections, "Listen disabled", num("listen_disabled_num"), None);
+
+    let mut memory = Vec::new();
+    push_bytes(&mut memory, "Used", num("bytes"));
+    push_bytes(&mut memory, "Limit", num("limit_maxbytes"));
+    if let (Some(used), Some(limit)) = (num("bytes"), num("limit_maxbytes")) {
+        if limit > 0.0 {
+            memory.push(Stat::number("Usage", (used / limit * 10_000.0).round() / 100.0, Some("%")));
+        }
+    }
+
+    let mut items = Vec::new();
+    push_number(&mut items, "Current", num("curr_items"), None);
+    push_number(&mut items, "Total stored", num("total_items"), None);
+    push_number(&mut items, "Evictions", num("evictions"), None);
+    push_number(&mut items, "Reclaimed", num("reclaimed"), None);
+    push_number(&mut items, "Expired unfetched", num("expired_unfetched"), None);
+    push_number(&mut items, "Evicted unfetched", num("evicted_unfetched"), None);
+
+    let mut cache = Vec::new();
+    push_number(&mut cache, "Gets", num("cmd_get"), None);
+    push_number(&mut cache, "Sets", num("cmd_set"), None);
+    push_number(&mut cache, "Hits", num("get_hits"), None);
+    push_number(&mut cache, "Misses", num("get_misses"), None);
+    push_number(&mut cache, "Hit ratio", ratio_percent(num("get_hits"), num("get_misses")), Some("%"));
+    push_number(&mut cache, "Flushes", num("cmd_flush"), None);
+    push_number(&mut cache, "Touches", num("cmd_touch"), None);
+    push_bytes(&mut cache, "Read", num("bytes_read"));
+    push_bytes(&mut cache, "Written", num("bytes_written"));
+
+    let mut slab_stats = vec![
+        Stat::number("Slab classes", slabs.slabs as f64, None),
+        Stat::number("Pages", slabs.pages as f64, None),
+    ];
+    push_bytes(&mut slab_stats, "Malloced", slabs.malloced);
+
+    vec![
+        group("Server", server),
+        group("Connections", connections),
+        group("Memory", memory),
+        group("Items", items),
+        group("Cache", cache),
+        group("Slabs", slab_stats),
+    ]
+    .into_iter()
+    .filter(|g| !g.stats.is_empty())
+    .collect()
+}
+
+// WHAT:  A `stats <family>` the server answers with an error line (older
+//        builds without `stats conns`, builds compiled without slabs stats).
+fn is_unsupported(err: &AppError) -> bool {
+    err.message().contains("ERROR")
+}
+
+impl MemcachedIntegration {
+    // WHAT:  `stats <family>` that this build does not know → Ok(None).
+    async fn stats_opt(&self, arg: &str) -> AppResult<Option<BTreeMap<String, String>>> {
+        match self.stats(Some(arg)).await {
+            Ok(map) => Ok(Some(map)),
+            Err(err) if is_unsupported(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn session_summary(fd: u64, fields: &BTreeMap<String, String>) -> ObjectSummary {
+        let get = |k: &str| fields.get(k).cloned().unwrap_or_default();
+        let (addr, state, idle) = (get("addr"), get("state"), get("secs_since_last_cmd"));
+        let detail = if idle.is_empty() { addr } else { format!("{addr} · last command {idle}s ago") };
+        let mut summary = ObjectSummary::new(ObjectKind::Session, fd.to_string(), None).with_detail(detail);
+        if !state.is_empty() {
+            summary = summary.with_badge(state.trim_start_matches("conn_").to_string());
+        }
+        summary
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities { views: true, ..Capabilities::KEY_VALUE },
+        object_kinds: vec![K::Setting, K::Session],
+        tools: vec![T::Stats, T::KeyBrowser],
+    }
+}
+
 #[async_trait]
 impl Integration for MemcachedIntegration {
     fn engine(&self) -> Engine {
@@ -529,7 +760,7 @@ impl Integration for MemcachedIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { views: true, ..Capabilities::KEY_VALUE }
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -636,6 +867,67 @@ impl Integration for MemcachedIntegration {
         Ok(out)
     }
 
+    async fn objects(&self, kind: ObjectKind, _parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        match kind {
+            ObjectKind::Setting => {
+                let settings = self.stats(Some("settings")).await?;
+                Ok(settings
+                    .into_iter()
+                    .take(MAX_OBJECTS)
+                    .map(|(name, value)| ObjectSummary::new(ObjectKind::Setting, name, None).with_detail(preview(&value, DETAIL_PREVIEW)))
+                    .collect())
+            }
+            ObjectKind::Session => {
+                let Some(conns) = self.stats_opt("conns").await? else {
+                    return Ok(Vec::new());
+                };
+                Ok(parse_conns(&conns).iter().take(MAX_OBJECTS).map(|(fd, fields)| Self::session_summary(*fd, fields)).collect())
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        match reference.kind {
+            ObjectKind::Setting => {
+                let settings = self.stats(Some("settings")).await?;
+                let value = settings
+                    .get(&reference.name)
+                    .ok_or_else(|| AppError::not_found(format!("Setting \"{}\" is not reported by this server.", reference.name)))?;
+                Ok(ObjectDetail::empty(reference).property("setting", reference.name.clone()).property("value", value.clone()))
+            }
+            ObjectKind::Session => {
+                let fd = reference
+                    .name
+                    .parse::<u64>()
+                    .map_err(|_| AppError::invalid_input(format!("\"{}\" is not a connection descriptor.", reference.name)))?;
+                let conns = self
+                    .stats_opt("conns")
+                    .await?
+                    .ok_or_else(|| AppError::not_found("This memcached build does not report `stats conns`."))?;
+                let fields = parse_conns(&conns)
+                    .remove(&fd)
+                    .ok_or_else(|| AppError::not_found(format!("Connection {fd} is no longer open.")))?;
+                let mut detail = ObjectDetail::empty(reference).property("descriptor", fd.to_string());
+                for name in ["addr", "state", "secs_since_last_cmd"] {
+                    if let Some(v) = fields.get(name) {
+                        detail = detail.property(name, v.clone());
+                    }
+                }
+                let rows = fields.iter().map(|(k, v)| vec![Value::Text(k.clone()), Value::Text(v.clone())]).collect();
+                detail.rows = Some(ResultSet { columns: meta(&["field", "value"]), rows, truncated: false });
+                Ok(detail)
+            }
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        let stats = self.stats(None).await?;
+        let slabs = self.stats_opt("slabs").await?.map(|s| summarise_slabs(&s)).unwrap_or_default();
+        Ok(ServerStats::now(stats_groups(&stats, &slabs)))
+    }
+
     async fn close(&self) {
         let mut guard = self.stream.lock().await;
         if let Some(mut stream) = guard.take() {
@@ -735,6 +1027,80 @@ mod tests {
         assert_eq!(script[5], ("cas d 0 0 2 42".to_string(), Some("zz".to_string())));
         assert!(parse_script("set a\nb").is_ok());
         assert!(parse_script("set\nb").is_err());
+    }
+
+    #[test]
+    fn slab_and_conn_stats_summaries() {
+        let slabs = parse_stats(&lines(&[
+            "STAT 1:chunk_size 96",
+            "STAT 1:total_pages 2",
+            "STAT 5:chunk_size 240",
+            "STAT 5:total_pages 3",
+            "STAT active_slabs 2",
+            "STAT total_malloced 5242880",
+            "END",
+        ]));
+        assert_eq!(summarise_slabs(&slabs), SlabSummary { slabs: 2, pages: 5, malloced: Some(5_242_880.0) });
+        assert_eq!(summarise_slabs(&BTreeMap::new()), SlabSummary::default());
+        let conns = parse_stats(&lines(&[
+            "STAT 26:addr tcp:0.0.0.0:11211",
+            "STAT 26:state conn_listening",
+            "STAT 28:addr tcp:127.0.0.1:52345",
+            "STAT 28:state conn_waiting",
+            "STAT 28:secs_since_last_cmd 4",
+            "END",
+        ]));
+        let parsed = parse_conns(&conns);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.get(&28).and_then(|f| f.get("state")).map(String::as_str), Some("conn_waiting"));
+        let listening = parsed.get(&26).map(|f| MemcachedIntegration::session_summary(26, f)).unwrap_or_else(|| panic!("fd 26"));
+        assert_eq!(listening.badge.as_deref(), Some("listening"));
+        assert_eq!(listening.detail.as_deref(), Some("tcp:0.0.0.0:11211"));
+        let waiting = parsed.get(&28).map(|f| MemcachedIntegration::session_summary(28, f)).unwrap_or_else(|| panic!("fd 28"));
+        assert_eq!(waiting.detail.as_deref(), Some("tcp:127.0.0.1:52345 · last command 4s ago"));
+        assert!(is_unsupported(&AppError::driver("memcached: CLIENT_ERROR bad command line format")));
+        assert!(is_unsupported(&AppError::driver("memcached: ERROR")));
+        assert!(!is_unsupported(&AppError::driver("memcached closed the connection.")));
+    }
+
+    #[test]
+    fn stats_groups_from_stats() {
+        let stats = parse_stats(&lines(&[
+            "STAT pid 1",
+            "STAT uptime 3661",
+            "STAT version 1.6.22",
+            "STAT curr_connections 3",
+            "STAT total_connections 10",
+            "STAT cmd_get 100",
+            "STAT cmd_set 40",
+            "STAT get_hits 80",
+            "STAT get_misses 20",
+            "STAT bytes 524288",
+            "STAT limit_maxbytes 67108864",
+            "STAT curr_items 5",
+            "STAT total_items 45",
+            "STAT evictions 2",
+            "STAT threads 4",
+            "END",
+        ]));
+        let groups = stats_groups(&stats, &SlabSummary { slabs: 3, pages: 7, malloced: Some(1_048_576.0) });
+        let titles: Vec<&str> = groups.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(titles, vec!["Server", "Connections", "Memory", "Items", "Cache", "Slabs"]);
+        let find = |group: &str, label: &str| {
+            groups.iter().find(|g| g.title == group).and_then(|g| g.stats.iter().find(|s| s.label == label)).cloned()
+        };
+        assert_eq!(find("Server", "Uptime").map(|s| s.value), Some("1h 1m 1s".into()));
+        assert_eq!(find("Server", "Threads").and_then(|s| s.numeric), Some(4.0));
+        assert_eq!(find("Cache", "Hit ratio").and_then(|s| s.numeric), Some(80.0));
+        assert_eq!(find("Memory", "Used").and_then(|s| s.numeric), Some(0.5));
+        assert_eq!(find("Memory", "Usage").and_then(|s| s.numeric), Some(0.78));
+        assert_eq!(find("Items", "Evictions").and_then(|s| s.numeric), Some(2.0));
+        assert_eq!(find("Slabs", "Pages").and_then(|s| s.numeric), Some(7.0));
+        assert_eq!(find("Slabs", "Malloced").and_then(|s| s.numeric), Some(1.0));
+        assert!(find("Connections", "Rejected").is_none(), "absent stats are skipped, not zeroed");
+        // A bare `stats` with nothing numeric still yields the slab group only.
+        let empty = stats_groups(&BTreeMap::new(), &SlabSummary::default());
+        assert_eq!(empty.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(), vec!["Slabs"]);
     }
 
     // Live test: DBFREE_TEST_MEMCACHED_URL=host:port (e.g. `docker run --rm -d -p 11211:11211 memcached:alpine`).

@@ -225,5 +225,5 @@ fn every_engine_is_wired_end_to_end() {
             assert_eq!(engine.default_port(), None, "{engine:?} is file based but has a port");
         }
     }
-    assert_eq!(Engine::ALL.len(), 69, "Engine::ALL is out of step with the enum");
+    assert_eq!(Engine::ALL.len(), 73, "Engine::ALL is out of step with the enum");
 }

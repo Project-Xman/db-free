@@ -66,7 +66,10 @@ pub struct DashboardBody {
     pub refresh_seconds: u32,
 }
 
-// WHAT:  Widget kinds (DB Manager parity). `Metric` accepts the legacy "number" name.
+// WHAT:  Widget kinds (DB Manager parity). Dashboards saved before the rename
+//        still spell `Metric` as "number"; `widget_kind_compat` on `Widget.kind`
+//        accepts it (a `#[serde(alias)]` here would do the same, but ts-rs
+//        cannot parse that attribute and warns on every build).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -77,7 +80,6 @@ pub enum WidgetKind {
     Pie,
     Sankey,
     Table,
-    #[serde(alias = "number")]
     Metric,
     Sparkline,
     Map,
@@ -87,12 +89,36 @@ pub enum WidgetKind {
     Gif,
 }
 
+/// Legacy spelling of `WidgetKind::Metric` in stored dashboards.
+const LEGACY_METRIC_NAME: &str = "number";
+
+// WHAT:  `Widget.kind` codec: writes the enum as-is, reads the enum plus the
+//        legacy "number" spelling of `metric`. The TS shape stays `WidgetKind`
+//        (`#[ts(as)]` on the field).
+mod widget_kind_compat {
+    use super::{WidgetKind, LEGACY_METRIC_NAME};
+    use serde::de::IntoDeserializer;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(kind: &WidgetKind, serializer: S) -> Result<S::Ok, S::Error> {
+        kind.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<WidgetKind, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        let canonical = if name == LEGACY_METRIC_NAME { "metric" } else { name.as_str() };
+        WidgetKind::deserialize(IntoDeserializer::<D::Error>::into_deserializer(canonical))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct Widget {
     pub id: String,
     pub title: String,
+    #[serde(with = "widget_kind_compat")]
+    #[ts(as = "WidgetKind")]
     pub kind: WidgetKind,
     pub sql: String,
     pub x: u32,
@@ -249,4 +275,33 @@ pub struct WorkflowStepResult {
 pub struct WorkflowRunReport {
     pub steps: Vec<WorkflowStepResult>,
     pub stopped_early: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn widget_json(kind: &str) -> String {
+        format!(r#"{{"id":"w1","title":"Orders","kind":"{kind}","sql":"select 1","x":0,"y":0,"w":4,"h":2,"tint":null}}"#)
+    }
+
+    #[test]
+    fn widget_kind_reads_legacy_number_as_metric() {
+        let legacy: Widget = serde_json::from_str(&widget_json("number")).unwrap();
+        assert_eq!(legacy.kind, WidgetKind::Metric);
+        let current: Widget = serde_json::from_str(&widget_json("metric")).unwrap();
+        assert_eq!(current.kind, WidgetKind::Metric);
+    }
+
+    #[test]
+    fn widget_kind_writes_canonical_name() {
+        let legacy: Widget = serde_json::from_str(&widget_json("number")).unwrap();
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(json["kind"], "metric");
+    }
+
+    #[test]
+    fn widget_kind_rejects_unknown_names() {
+        assert!(serde_json::from_str::<Widget>(&widget_json("gauge")).is_err());
+    }
 }

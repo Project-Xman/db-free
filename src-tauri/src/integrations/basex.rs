@@ -1,10 +1,12 @@
-// SOT: basex-integration, xquery, basex-rest-api, basex-xml-listing
+// SOT: basex-integration, xquery, basex-rest-api, basex-xml-listing, basex-object-explorer, basex-server-stats, basex-info-parsing
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::http::{local, HttpClient};
+use crate::integrations::prometheus::{human_bytes, truncate};
 use crate::integrations::{Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterRule, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterRule, ObjectAction, ObjectDetail, ObjectKind, ObjectRef,
+    ObjectSummary, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, ServerStats, Stat, StatGroup,
     StatementResult, TableInfo, TableKind, TableRef, Value,
 };
 use async_trait::async_trait;
@@ -200,6 +202,362 @@ impl BasexIntegration {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Object explorer / stats
+// ---------------------------------------------------------------------------
+
+const OBJECT_CAP: usize = 2_000;
+const DOC_CAP: usize = 1_048_576;
+/// The index kinds `INFO INDEX` reports, in BaseX's own order.
+const INDEX_KINDS: [(&str, &str); 5] = [("text", "textindex"), ("attribute", "attrindex"), ("token", "tokenindex"), ("fulltext", "ftindex"), ("path", "pathindex")];
+
+// WHAT:  `INFO`-family output is `Key: Value` lines, sometimes indented under a
+//        heading and sometimes prefixed with `- `. Both spellings collapse here.
+pub fn parse_info(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let l = line.trim().trim_start_matches("- ").trim();
+            let (k, v) = l.split_once(':')?;
+            let (k, v) = (k.trim(), v.trim());
+            (!k.is_empty() && !v.is_empty() && !k.contains(' ') || k.contains(' ') && !v.is_empty()).then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+pub fn info_value(pairs: &[(String, String)], key: &str) -> Option<String> {
+    pairs.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.clone())
+}
+
+// WHAT:  `INFO INDEX` splits into blank-line-separated blocks, each headed by
+//        the index name ("Text Index", "Attribute Index"…) and followed by its
+//        facts. Returns (kind, detail, raw block) per block recognised.
+pub fn parse_info_index(text: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for block in text.split("\n\n") {
+        let block = block.trim();
+        if block.is_empty() {
+            continue;
+        }
+        let mut lines = block.lines();
+        let Some(head) = lines.next().map(str::trim) else { continue };
+        let lower = head.to_ascii_lowercase();
+        let Some((kind, _)) = INDEX_KINDS.iter().find(|(name, _)| lower.starts_with(name)) else { continue };
+        let facts = parse_info(block);
+        let entries = info_value(&facts, "Entries");
+        let size = info_value(&facts, "Size");
+        let detail = match (entries, size) {
+            (Some(e), Some(s)) => format!("{e} entries · {s}"),
+            (Some(e), None) => format!("{e} entries"),
+            (None, Some(s)) => s,
+            (None, None) => head.to_string(),
+        };
+        out.push(((*kind).to_string(), detail, block.to_string()));
+    }
+    out
+}
+
+// WHAT:  `SHOW USERS` prints a two-column table under a dashed rule.
+pub fn parse_users(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('-') && !l.to_ascii_lowercase().starts_with("username"))
+        .filter_map(|l| {
+            let mut parts = l.split_whitespace();
+            let name = parts.next()?;
+            // A trailing summary line ("2 users") is not a user row.
+            if name.parse::<u64>().is_ok() {
+                return None;
+            }
+            Some((name.to_string(), parts.next().unwrap_or_default().to_string()))
+        })
+        .collect()
+}
+
+fn size_detail(size: Option<&str>) -> Option<String> {
+    size.and_then(|s| s.parse::<f64>().ok()).map(human_bytes)
+}
+
+impl BasexIntegration {
+    /// `GET /rest/{db}?command=…` — a database command with the db as context.
+    async fn command(&self, db: Option<&str>, command: &str) -> AppResult<String> {
+        let path = match db {
+            Some(d) => format!("/rest/{}?command={}", encode(d), encode(command)),
+            None => format!("/rest?command={}", encode(command)),
+        };
+        self.http.get_text(&path).await
+    }
+
+    async fn db_names(&self) -> AppResult<Vec<String>> {
+        Ok(self.list_databases().await?.into_iter().map(|d| d.text).filter(|n| !n.is_empty()).collect())
+    }
+
+    fn scoped_dbs(&self, parent: Option<&str>) -> Option<Vec<String>> {
+        parent.map(|p| vec![p.to_string()]).or_else(|| self.database.clone().map(|d| vec![d]))
+    }
+
+    // WHAT:  Index list for one database: `INFO INDEX` first (its own wording
+    //        and entry counts), falling back to the `db:info` flags when the
+    //        command is unavailable to this user.
+    async fn indexes_of(&self, db: &str) -> Vec<ObjectSummary> {
+        if let Ok(text) = self.command(Some(db), "INFO INDEX").await {
+            let parsed = parse_info_index(&text);
+            if !parsed.is_empty() {
+                return parsed
+                    .into_iter()
+                    .map(|(kind, detail, _)| ObjectSummary::new(ObjectKind::Index, kind, Some(db.to_string())).with_detail(detail).with_badge("built"))
+                    .collect();
+            }
+        }
+        let quoted = format!("\"{}\"", db.replace('"', "&quot;"));
+        let xml = self.xquery(&format!("db:info({quoted})")).await.unwrap_or_default();
+        INDEX_KINDS
+            .iter()
+            .filter_map(|(kind, element)| {
+                let on = elements_named(&xml, element).first().map(|e| e.text.trim().eq_ignore_ascii_case("true"))?;
+                Some(
+                    ObjectSummary::new(ObjectKind::Index, *kind, Some(db.to_string()))
+                        .with_detail(if on { "available" } else { "not built" })
+                        .with_badge(if on { "built" } else { "off" }),
+                )
+            })
+            .collect()
+    }
+
+    async fn list_objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let mut out = match kind {
+            ObjectKind::Database => self
+                .list_databases()
+                .await?
+                .iter()
+                .filter(|d| !d.text.is_empty())
+                .map(|d| {
+                    let resources = d.attr("resources").unwrap_or("0");
+                    let detail = match size_detail(d.attr("size")) {
+                        Some(size) => format!("{resources} resources · {size}"),
+                        None => format!("{resources} resources"),
+                    };
+                    let mut s = ObjectSummary::new(ObjectKind::Database, d.text.clone(), None).with_detail(detail);
+                    if let Some(modified) = d.attr("modified-date").or_else(|| d.attr("modified")) {
+                        s = s.with_badge(truncate(modified, 10));
+                    }
+                    s
+                })
+                .collect(),
+            ObjectKind::Document => {
+                let dbs = match self.scoped_dbs(parent) {
+                    Some(d) => d,
+                    None => self.db_names().await?,
+                };
+                let mut out = Vec::new();
+                for db in dbs {
+                    for r in self.list_resources(&db).await.unwrap_or_default() {
+                        let mut s = ObjectSummary::new(ObjectKind::Document, r.text.clone(), Some(db.clone()));
+                        if let Some(size) = size_detail(r.attr("size")) {
+                            s = s.with_detail(size);
+                        }
+                        let kind = r.attr("type").or_else(|| r.attr("raw").map(|raw| if raw == "true" { "raw" } else { "xml" })).unwrap_or("xml");
+                        s = s.with_badge(kind);
+                        out.push(s);
+                    }
+                }
+                out
+            }
+            ObjectKind::Index => {
+                let dbs = match self.scoped_dbs(parent) {
+                    Some(d) => d,
+                    None => self.db_names().await?,
+                };
+                let mut out = Vec::new();
+                for db in dbs {
+                    out.extend(self.indexes_of(&db).await);
+                }
+                out
+            }
+            ObjectKind::User => {
+                let text = self.command(None, "SHOW USERS").await?;
+                parse_users(&text)
+                    .into_iter()
+                    .map(|(name, permission)| {
+                        let s = ObjectSummary::new(ObjectKind::User, name, None);
+                        if permission.is_empty() {
+                            s
+                        } else {
+                            s.with_badge(permission.to_lowercase())
+                        }
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        out.sort_by(|a, b| a.reference.parent.cmp(&b.reference.parent).then_with(|| a.reference.name.cmp(&b.reference.name)));
+        out.truncate(OBJECT_CAP);
+        Ok(out)
+    }
+
+    async fn database_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let db = &reference.name;
+        let info = self.command(Some(db), "INFO DB").await.unwrap_or_default();
+        let pairs = parse_info(&info);
+        let resources = self.list_resources(db).await.unwrap_or_default();
+        let mut detail = ObjectDetail::empty(reference)
+            .definition(if info.trim().is_empty() { format!("db:info(\"{db}\")") } else { info }, CodeLanguage::Text)
+            .property("resources", resources.len().to_string());
+        for key in ["Size", "Nodes", "Timestamp", "Path", "Input Path", "Up-to-date"] {
+            if let Some(v) = info_value(&pairs, key) {
+                detail = detail.property(&key.to_lowercase(), v);
+            }
+        }
+        let mut children: Vec<ObjectSummary> = resources
+            .iter()
+            .map(|r| {
+                let mut s = ObjectSummary::new(ObjectKind::Document, r.text.clone(), Some(db.clone()));
+                if let Some(size) = size_detail(r.attr("size")) {
+                    s = s.with_detail(size);
+                }
+                s.with_badge(r.attr("type").unwrap_or("xml"))
+            })
+            .collect();
+        children.extend(self.indexes_of(db).await);
+        children.truncate(OBJECT_CAP);
+        detail.children = children;
+        detail = detail
+            .action(ObjectAction::new("info", "Database info", "INFO DB".to_string()))
+            .action(ObjectAction::destructive("optimize", "Optimize", format!("db:optimize(\"{db}\")")))
+            .action(ObjectAction::destructive("drop", "Drop database", format!("DROP DB {db}")));
+        Ok(detail)
+    }
+
+    async fn document_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let db = reference.parent.clone().or_else(|| self.database.clone()).ok_or_else(|| AppError::invalid_input("A document needs its database."))?;
+        let resources = self.list_resources(&db).await.unwrap_or_default();
+        let meta = resources.iter().find(|r| r.text == reference.name);
+        let body = self.http.get_text(&format!("/rest/{}/{}", encode(&db), encode(&reference.name))).await.unwrap_or_default();
+        let truncated = body.len() > DOC_CAP;
+        let mut text: String = body.chars().take(DOC_CAP).collect();
+        if truncated {
+            text.push_str("\n<!-- truncated: the document is larger than 1 MB -->");
+        }
+        let content_type = meta.and_then(|m| m.attr("content-type").or_else(|| m.attr("type"))).unwrap_or("application/xml").to_string();
+        let language = if content_type.contains("xml") || reference.name.ends_with(".xml") { CodeLanguage::Xml } else { CodeLanguage::Text };
+        let mut detail = ObjectDetail::empty(reference).definition(text, language).property("database", db.clone()).property("content-type", content_type);
+        if let Some(size) = meta.and_then(|m| m.attr("size")) {
+            detail = detail.property("size", size_detail(Some(size)).unwrap_or_else(|| size.to_string()));
+        }
+        if let Some(modified) = meta.and_then(|m| m.attr("modified-date").or_else(|| m.attr("modified"))) {
+            detail = detail.property("modified", modified.to_string());
+        }
+        if truncated {
+            detail = detail.property("truncated", "shown: first 1 MB");
+        }
+        let path = reference.name.replace('"', "&quot;");
+        detail = detail
+            .action(ObjectAction::new("open", "Open document", format!("GET {}", reference.name)))
+            .action(ObjectAction::destructive("delete", "Delete document", format!("db:delete(\"{db}\", \"{path}\")")));
+        Ok(detail)
+    }
+
+    async fn index_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let db = reference.parent.clone().or_else(|| self.database.clone()).ok_or_else(|| AppError::invalid_input("An index needs its database."))?;
+        let raw = self.command(Some(&db), "INFO INDEX").await.unwrap_or_default();
+        let block = parse_info_index(&raw).into_iter().find(|(kind, _, _)| *kind == reference.name);
+        let (detail_text, body) = match block {
+            Some((_, d, b)) => (d, b),
+            None => (String::new(), raw.clone()),
+        };
+        let mut detail = ObjectDetail::empty(reference).definition(body.clone(), CodeLanguage::Text).property("database", db);
+        if !detail_text.is_empty() {
+            detail = detail.property("summary", detail_text);
+        }
+        for (k, v) in parse_info(&body) {
+            detail = detail.property(&k.to_lowercase(), v);
+        }
+        Ok(detail)
+    }
+
+    async fn user_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let text = self.command(None, "SHOW USERS").await.unwrap_or_default();
+        let permission = parse_users(&text)
+            .into_iter()
+            .find(|(name, _)| *name == reference.name)
+            .map(|(_, p)| p)
+            .ok_or_else(|| AppError::not_found(format!("User `{}` not found.", reference.name)))?;
+        Ok(ObjectDetail::empty(reference).definition(text, CodeLanguage::Text).property("permission", permission))
+    }
+
+    async fn detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        match reference.kind {
+            ObjectKind::Database => self.database_detail(reference).await,
+            ObjectKind::Document => self.document_detail(reference).await,
+            ObjectKind::Index => self.index_detail(reference).await,
+            ObjectKind::User => self.user_detail(reference).await,
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    async fn stats(&self) -> AppResult<ServerStats> {
+        let info = self.command(None, "INFO").await.unwrap_or_default();
+        let pairs = parse_info(&info);
+        let databases = self.list_databases().await.unwrap_or_default();
+        if info.trim().is_empty() && databases.is_empty() {
+            return Err(AppError::driver("BaseX answered neither INFO nor the database listing."));
+        }
+        let number = |key: &str| info_value(&pairs, key).and_then(|v| v.trim_end_matches(|c: char| !c.is_ascii_digit()).parse::<f64>().ok());
+
+        let mut server = Vec::new();
+        for (label, key) in [("Version", "Version"), ("Java", "Java Version"), ("OS", "Operating System"), ("Path", "Database Path")] {
+            if let Some(v) = info_value(&pairs, key) {
+                server.push(Stat::text(label, truncate(&v, 60)));
+            }
+        }
+        if server.is_empty() {
+            server.push(Stat::text("Server", "BaseX"));
+        }
+        if let Some(db) = &self.database {
+            server.push(Stat::text("Database", db.clone()));
+        }
+
+        let total_size: f64 = databases.iter().filter_map(|d| d.attr("size")).filter_map(|s| s.parse::<f64>().ok()).sum();
+        let total_resources: f64 = databases.iter().filter_map(|d| d.attr("resources")).filter_map(|s| s.parse::<f64>().ok()).sum();
+        let mut storage = vec![Stat::number("Databases", databases.len() as f64, None), Stat::number("Resources", total_resources, None)];
+        if total_size > 0.0 {
+            storage.push(Stat::number("Total size", crate::integrations::prometheus::mib(total_size), Some("MB")).with_hint(human_bytes(total_size)));
+        }
+        if let Some(largest) = databases.iter().max_by_key(|d| d.attr("size").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)) {
+            if !largest.text.is_empty() {
+                storage.push(Stat::text("Largest database", largest.text.clone()));
+            }
+        }
+
+        let mut memory = Vec::new();
+        for (label, key) in [("Used memory", "Used Memory"), ("Max memory", "Maximum Memory")] {
+            if let Some(v) = number(key) {
+                // BaseX prints these in MB already ("123 MB").
+                memory.push(Stat::number(label, v, Some("MB")));
+            }
+        }
+
+        let groups = [("Server", server), ("Storage", storage), ("Memory", memory)]
+            .into_iter()
+            .filter(|(_, stats)| !stats.is_empty())
+            .map(|(title, stats)| StatGroup { title: title.to_string(), stats })
+            .collect();
+        Ok(ServerStats::now(groups))
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities { sql: false, namespaces: true, fixed_columns: true, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: true },
+        object_kinds: vec![K::Database, K::Document, K::Index, K::User],
+        tools: vec![T::Stats, T::XmlViewer],
+    }
+}
+
 #[async_trait]
 impl Integration for BasexIntegration {
     fn engine(&self) -> Engine {
@@ -207,7 +565,7 @@ impl Integration for BasexIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { sql: false, namespaces: true, fixed_columns: true, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: true }
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -314,6 +672,18 @@ impl Integration for BasexIntegration {
     }
 
     async fn close(&self) {}
+
+    async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        self.list_objects(kind, parent).await
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        self.detail(reference).await
+    }
+
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        self.stats().await
+    }
 }
 
 #[cfg(test)]
@@ -350,6 +720,37 @@ mod tests {
         assert!(is_write_xquery("db:add('x', <a/>, 'a.xml')"));
         assert!(is_write_xquery("insert node <x/> into /a"));
         assert!(!is_write_xquery("for $x in //item return $x"));
+    }
+
+    #[test]
+    fn info_output_parses() {
+        let info = "General Information\n\nVersion: 10.7\nDatabase Path: /srv/basex/data\nUsed Memory: 123 MB\nMaximum Memory: 4096 MB\nJava Version: 17.0.9\n";
+        let pairs = parse_info(info);
+        assert_eq!(info_value(&pairs, "Version").as_deref(), Some("10.7"));
+        assert_eq!(info_value(&pairs, "used memory").as_deref(), Some("123 MB"));
+        assert_eq!(info_value(&pairs, "absent"), None);
+
+        let index = "Text Index\n- Entries: 1234\n- Size: 12 KB\n\nAttribute Index\n- Entries: 56\n\nToken Index\n- not available\n\nSomething Else\n- Entries: 1\n";
+        let parsed = parse_info_index(index);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].0, "text");
+        assert_eq!(parsed[0].1, "1234 entries · 12 KB");
+        assert_eq!(parsed[1].0, "attribute");
+        assert_eq!(parsed[1].1, "56 entries");
+        // A block with no facts still reports itself.
+        assert_eq!(parsed[2].0, "token");
+        assert!(parse_info_index("").is_empty());
+    }
+
+    #[test]
+    fn user_listing_parses() {
+        let text = "Username  Permission\n------------------\nadmin     ADMIN\nreader    READ\n\n2 users\n";
+        let users = parse_users(text);
+        assert_eq!(users, vec![("admin".to_string(), "ADMIN".to_string()), ("reader".to_string(), "READ".to_string())]);
+        assert!(parse_users("Username  Permission\n---\n").is_empty());
+        assert_eq!(size_detail(Some("2048")).as_deref(), Some("2.0 KB"));
+        assert_eq!(size_detail(Some("not a number")), None);
+        assert_eq!(size_detail(None), None);
     }
 
     #[test]

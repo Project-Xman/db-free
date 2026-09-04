@@ -1,11 +1,13 @@
-// SOT: typesense-integration, typesense-rest-api, typesense-filter-by, typesense-console
+// SOT: typesense-integration, typesense-rest-api, typesense-filter-by, typesense-console, object-explorer, server-stats, search-playground, typesense-admin-actions
 
 use crate::error::{AppError, AppResult};
-use crate::integrations::http::{json_result, local, objects_to_result_set, Auth, HttpClient};
+use crate::integrations::http::{json_result, json_to_value, json_type_name, local, objects_to_result_set, Auth, HttpClient};
 use crate::integrations::{Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, Engine, FilterOp, FilterRule, PageQuery, ResolvedConnection, ResultSet,
-    SchemaCatalog, SchemaInfo, SortRule, StatementResult, TableInfo, TableKind, TableRef,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FacetCounts, FacetValue, FilterOp, FilterRule, ObjectAction,
+    ObjectDetail, ObjectKind, ObjectRef, ObjectSummary, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog,
+    SchemaInfo, SearchRequest, SearchResult, ServerStats, SortRule, Stat, StatGroup, StatementResult, TableInfo,
+    TableKind, TableRef, Value,
 };
 use async_trait::async_trait;
 use reqwest::Method;
@@ -353,6 +355,650 @@ impl TypesenseIntegration {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Object explorer / server stats / search playground
+//
+// WHAT:  `objects()` lists collections, aliases, per-collection synonyms and
+//        curation rules, API keys and the node; `object_detail()` adds the
+//        JSON definition, a property sheet and `DELETE /path` actions that run
+//        back through this adapter's console; `server_stats()` folds
+//        `/stats.json`, `/metrics.json` and `/health`; `search()` is the
+//        playground over `GET /collections/{c}/documents/search`.
+// ---------------------------------------------------------------------------
+
+const OBJECT_CAP: usize = 2_000;
+const SCORE_FIELD: &str = "_text_match";
+const HIGHLIGHT_FIELD: &str = "_highlight";
+
+fn text_of(v: &Json) -> String {
+    match v {
+        Json::Null => String::new(),
+        Json::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn str_at<'a>(v: &'a Json, key: &str) -> &'a str {
+    v.get(key).and_then(Json::as_str).unwrap_or("")
+}
+
+fn str_list(v: Option<&Json>) -> Vec<String> {
+    v.and_then(Json::as_array).map(|a| a.iter().map(text_of).filter(|s| !s.is_empty()).collect()).unwrap_or_default()
+}
+
+fn pretty(v: &Json) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_default()
+}
+
+fn human_bytes(bytes: f64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut value = bytes;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} B", value as u64)
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn bytes_stat(label: &str, bytes: f64) -> Stat {
+    Stat { label: label.to_string(), value: human_bytes(bytes), unit: None, hint: None, numeric: Some(bytes) }
+}
+
+// WHAT:  `/metrics.json` and `/stats.json` report every figure as a string.
+fn num_at(v: &Json, key: &str) -> Option<f64> {
+    let node = v.get(key)?;
+    node.as_f64().or_else(|| node.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+}
+
+fn finish(mut list: Vec<ObjectSummary>) -> Vec<ObjectSummary> {
+    list.sort_by(|a, b| a.reference.name.cmp(&b.reference.name).then_with(|| a.reference.parent.cmp(&b.reference.parent)));
+    list.truncate(OBJECT_CAP);
+    list
+}
+
+fn summary(kind: ObjectKind, name: &str, parent: Option<&str>, detail: String, badge: Option<String>) -> ObjectSummary {
+    let mut s = ObjectSummary::new(kind, name, parent.map(str::to_string));
+    if !detail.is_empty() {
+        s = s.with_detail(detail);
+    }
+    if let Some(b) = badge.filter(|b| !b.is_empty()) {
+        s = s.with_badge(b);
+    }
+    s
+}
+
+fn rows_table(columns: &[(&str, &str)], rows: Vec<Vec<Value>>) -> ResultSet {
+    ResultSet {
+        columns: columns.iter().map(|(name, ty)| ColumnMeta { name: (*name).to_string(), type_name: (*ty).to_string() }).collect(),
+        rows,
+        truncated: false,
+    }
+}
+
+// WHAT:  Every string-ish field, which the playground needs for `query_by`.
+fn query_by_all(fields: &[Field]) -> String {
+    let names: Vec<&str> = fields.iter().filter(|f| f.type_name.starts_with("string") || f.type_name == "auto").map(|f| f.name.as_str()).collect();
+    if names.is_empty() {
+        query_by(fields)
+    } else {
+        names.join(",")
+    }
+}
+
+fn collection_summaries(list: &[Json]) -> Vec<ObjectSummary> {
+    let out = list
+        .iter()
+        .filter_map(|c| {
+            let name = c.get("name").and_then(Json::as_str)?;
+            let fields = fields_of(c).len();
+            let mut parts = Vec::new();
+            if let Some(n) = c.get("num_documents").and_then(Json::as_f64) {
+                parts.push(format!("{} docs", crate::model::objects::format_number(n)));
+            }
+            parts.push(format!("{fields} fields"));
+            let badge = c.get("default_sorting_field").and_then(Json::as_str).filter(|s| !s.is_empty()).map(|s| format!("sort {s}"));
+            Some(summary(ObjectKind::Collection, name, None, parts.join(" · "), badge))
+        })
+        .collect();
+    finish(out)
+}
+
+fn alias_summaries(body: &Json, parent: Option<&str>) -> Vec<ObjectSummary> {
+    let out = body
+        .get("aliases")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            let name = a.get("name").and_then(Json::as_str)?;
+            let target = str_at(a, "collection_name");
+            if parent.is_some_and(|p| p != target) {
+                return None;
+            }
+            Some(summary(ObjectKind::Alias, name, Some(target), format!("→ {target}"), None))
+        })
+        .collect();
+    finish(out)
+}
+
+fn synonym_summaries(collection: &str, body: &Json) -> Vec<ObjectSummary> {
+    body.get("synonyms")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let id = s.get("id").and_then(Json::as_str)?;
+            let words = str_list(s.get("synonyms"));
+            let root = str_at(s, "root");
+            let detail = if root.is_empty() { words.join(", ") } else { format!("{root} → {}", words.join(", ")) };
+            let badge = if root.is_empty() { "multi-way" } else { "one-way" };
+            Some(summary(ObjectKind::Synonym, id, Some(collection), detail, Some(badge.to_string())))
+        })
+        .collect()
+}
+
+fn rule_summaries(collection: &str, body: &Json) -> Vec<ObjectSummary> {
+    body.get("overrides")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|o| {
+            let id = o.get("id").and_then(Json::as_str)?;
+            let query = o.pointer("/rule/query").map(text_of).unwrap_or_default();
+            let mut parts = Vec::new();
+            if !query.is_empty() {
+                parts.push(format!("q: {query}"));
+            }
+            let pins = o.get("includes").and_then(Json::as_array).map(Vec::len).unwrap_or(0);
+            let hides = o.get("excludes").and_then(Json::as_array).map(Vec::len).unwrap_or(0);
+            if pins > 0 {
+                parts.push(format!("{pins} pinned"));
+            }
+            if hides > 0 {
+                parts.push(format!("{hides} hidden"));
+            }
+            let filter = str_at(o, "filter_by");
+            if !filter.is_empty() {
+                parts.push(filter.to_string());
+            }
+            let badge = o.pointer("/rule/match").map(text_of).filter(|m| !m.is_empty());
+            Some(summary(ObjectKind::Rule, id, Some(collection), parts.join(" · "), badge))
+        })
+        .collect()
+}
+
+fn api_key_summaries(body: &Json) -> Vec<ObjectSummary> {
+    let out = body
+        .get("keys")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|k| {
+            let id = k.get("id").map(text_of).filter(|i| !i.is_empty())?;
+            let actions = str_list(k.get("actions"));
+            let collections = str_list(k.get("collections"));
+            let mut parts = Vec::new();
+            let desc = str_at(k, "description");
+            if !desc.is_empty() {
+                parts.push(desc.to_string());
+            }
+            parts.push(actions.join(", "));
+            if !collections.is_empty() {
+                parts.push(format!("on {}", collections.join(", ")));
+            }
+            let prefix = str_at(k, "value_prefix");
+            if !prefix.is_empty() {
+                parts.push(format!("{prefix}…"));
+            }
+            let badge = actions.iter().any(|a| a == "*").then(|| "all actions".to_string());
+            Some(summary(ObjectKind::ApiKey, &id, None, parts.join(" · "), badge))
+        })
+        .collect();
+    finish(out)
+}
+
+// WHAT:  Typesense exposes one process per connection; `/debug` reports the raft
+//        state (1 = leader, 4 = follower) and the build version.
+fn node_state(debug: &Json) -> &'static str {
+    match debug.get("state").and_then(Json::as_i64) {
+        Some(1) => "leader",
+        Some(4) => "follower",
+        Some(_) => "voting",
+        None => "single",
+    }
+}
+
+fn node_summary(name: &str, debug: &Json, health: &Json, metrics: &Json) -> Vec<ObjectSummary> {
+    let mut parts = Vec::new();
+    let version = str_at(debug, "version");
+    if !version.is_empty() {
+        parts.push(format!("v{version}"));
+    }
+    parts.push(if health.get("ok").and_then(Json::as_bool) == Some(false) { "unhealthy".into() } else { "healthy".to_string() });
+    if let Some(cpu) = num_at(metrics, "system_cpu_active_percentage") {
+        parts.push(format!("cpu {cpu}%"));
+    }
+    if let Some(mem) = num_at(metrics, "system_memory_used_bytes") {
+        parts.push(format!("mem {}", human_bytes(mem)));
+    }
+    vec![summary(ObjectKind::Node, name, None, parts.join(" · "), Some(node_state(debug).to_string()))]
+}
+
+// ---- search playground ------------------------------------------------------
+
+// WHAT:  Playground request → the search endpoint's query string. `query_by`
+//        covers every string field unless the filter already names one; paging
+//        prefers `page`/`per_page` and falls back to `offset`/`limit` when the
+//        offset is not a whole number of pages.
+fn playground_params(req: &SearchRequest, fields: &[Field]) -> Vec<(String, String)> {
+    let q = req.query.trim();
+    let mut params: Vec<(String, String)> = vec![
+        ("q".into(), if q.is_empty() { "*".into() } else { q.to_string() }),
+        ("query_by".into(), query_by_all(fields)),
+    ];
+    if let Some(f) = req.filter.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+        params.push(("filter_by".into(), f.to_string()));
+    }
+    let facets: Vec<&str> = req.facets.iter().map(|f| f.trim()).filter(|f| !f.is_empty()).collect();
+    if !facets.is_empty() {
+        params.push(("facet_by".into(), facets.join(",")));
+        params.push(("max_facet_values".into(), "20".into()));
+    }
+    let sort: Vec<String> = req
+        .sort
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| if s.contains(':') { s.to_string() } else { format!("{s}:asc") })
+        .collect();
+    if !sort.is_empty() {
+        params.push(("sort_by".into(), sort.join(",")));
+    }
+    if req.highlight {
+        params.push(("highlight_full_fields".into(), query_by_all(fields)));
+    }
+    let limit = req.limit.clamp(1, PAGE_MAX);
+    if u64::from(req.offset) % u64::from(limit) == 0 {
+        params.push(("per_page".into(), limit.to_string()));
+        params.push(("page".into(), (u64::from(req.offset) / u64::from(limit) + 1).to_string()));
+    } else {
+        params.push(("limit".into(), limit.to_string()));
+        params.push(("offset".into(), req.offset.to_string()));
+    }
+    params
+}
+
+// WHAT:  Search response → hits grid (`id`, `_text_match`, document fields,
+//        `_highlight`), `facet_counts` → FacetCounts, `found`, `search_time_ms`.
+fn playground_result(body: &Json, highlight: bool) -> SearchResult {
+    let hits: Vec<&Json> = body.get("hits").and_then(Json::as_array).map(|h| h.iter().collect()).unwrap_or_default();
+    let docs: Vec<Json> = hits.iter().map(|h| h.get("document").cloned().unwrap_or(Json::Null)).collect();
+    let mut names: Vec<String> = vec!["id".to_string(), SCORE_FIELD.to_string()];
+    for obj in docs.iter().filter_map(Json::as_object) {
+        for k in obj.keys() {
+            if !names.iter().any(|n| n == k) {
+                names.push(k.clone());
+            }
+        }
+    }
+    if highlight {
+        names.push(HIGHLIGHT_FIELD.to_string());
+    }
+    let rows: Vec<Vec<Value>> = hits
+        .iter()
+        .zip(&docs)
+        .map(|(hit, doc)| {
+            let obj = doc.as_object();
+            names
+                .iter()
+                .map(|n| match n.as_str() {
+                    SCORE_FIELD => hit.get("text_match").map(json_to_value).unwrap_or(Value::Null),
+                    HIGHLIGHT_FIELD => hit
+                        .get("highlight")
+                        .or_else(|| hit.get("highlights"))
+                        .filter(|h| !h.is_null() && h.as_object().map(|o| !o.is_empty()).unwrap_or(true))
+                        .map(|h| Value::Json(h.clone()))
+                        .unwrap_or(Value::Null),
+                    other => obj.and_then(|o| o.get(other)).map(json_to_value).unwrap_or(Value::Null),
+                })
+                .collect()
+        })
+        .collect();
+    let columns = names
+        .iter()
+        .map(|n| {
+            let type_name = match n.as_str() {
+                SCORE_FIELD => "integer",
+                HIGHLIGHT_FIELD => "object",
+                other => docs.iter().find_map(|d| d.get(other).filter(|v| !v.is_null()).map(json_type_name)).unwrap_or("json"),
+            };
+            ColumnMeta { name: n.clone(), type_name: type_name.to_string() }
+        })
+        .collect();
+    let facets = body
+        .get("facet_counts")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|f| {
+            let field = f.get("field_name").and_then(Json::as_str)?;
+            let values = f
+                .get("counts")
+                .and_then(Json::as_array)
+                .into_iter()
+                .flatten()
+                .map(|c| FacetValue { value: text_of(c.get("value").unwrap_or(&Json::Null)), count: c.get("count").and_then(Json::as_u64).unwrap_or(0) })
+                .collect();
+            Some(FacetCounts { field: field.to_string(), values })
+        })
+        .collect();
+    SearchResult {
+        hits: ResultSet { columns, rows, truncated: false },
+        total: body.get("found").and_then(Json::as_u64),
+        facets,
+        took_ms: body.get("search_time_ms").and_then(Json::as_u64),
+    }
+}
+
+// ---- server stats -----------------------------------------------------------
+
+fn stats_groups(stats: &Json, metrics: &Json, health: &Json, debug: &Json, collections: &[Json]) -> Vec<StatGroup> {
+    let mut server = Vec::new();
+    let version = str_at(debug, "version");
+    if !version.is_empty() {
+        server.push(Stat::text("Version", version));
+    }
+    server.push(Stat::text("Health", if health.get("ok").and_then(Json::as_bool) == Some(false) { "unhealthy" } else { "ok" }));
+    server.push(Stat::text("State", node_state(debug)));
+    let docs: f64 = collections.iter().filter_map(|c| c.get("num_documents").and_then(Json::as_f64)).sum();
+    let storage = vec![
+        Stat::number("Collections", collections.len() as f64, None),
+        Stat::number("Documents", docs, None),
+    ];
+    let mut throughput = Vec::new();
+    for (label, key) in [
+        ("Requests/s", "total_requests_per_second"),
+        ("Searches/s", "search_requests_per_second"),
+        ("Writes/s", "write_requests_per_second"),
+        ("Imports/s", "import_requests_per_second"),
+    ] {
+        if let Some(v) = num_at(stats, key) {
+            throughput.push(Stat::number(label, v, Some("/s")));
+        }
+    }
+    for (label, key) in [("Search latency", "search_latency_ms"), ("Write latency", "write_latency_ms"), ("Overall latency", "overall_latency_ms")] {
+        if let Some(v) = stats.get("latency_ms").and_then(|l| num_at(l, key)).or_else(|| num_at(stats, key)) {
+            throughput.push(Stat::number(label, v, Some("ms")));
+        }
+    }
+    let mut system = Vec::new();
+    if let Some(v) = num_at(metrics, "system_cpu_active_percentage") {
+        system.push(Stat::number("CPU", v, Some("%")));
+    }
+    for (label, key) in [("Memory used", "system_memory_used_bytes"), ("Memory total", "system_memory_total_bytes"), ("Disk used", "system_disk_used_bytes"), ("Disk total", "system_disk_total_bytes"), ("Process memory", "typesense_memory_active_bytes")] {
+        if let Some(v) = num_at(metrics, key) {
+            system.push(bytes_stat(label, v));
+        }
+    }
+    let used = num_at(metrics, "system_memory_used_bytes");
+    let total = num_at(metrics, "system_memory_total_bytes");
+    if let (Some(u), Some(t)) = (used, total) {
+        if t > 0.0 {
+            system.push(Stat::number("Memory", (u / t * 100.0).round(), Some("%")));
+        }
+    }
+    let mut groups = vec![StatGroup { title: "Server".into(), stats: server }, StatGroup { title: "Storage".into(), stats: storage }];
+    for (title, stats) in [("Throughput", throughput), ("System", system)] {
+        if !stats.is_empty() {
+            groups.push(StatGroup { title: title.into(), stats });
+        }
+    }
+    groups
+}
+
+impl TypesenseIntegration {
+    async fn collection_list(&self) -> AppResult<Vec<Json>> {
+        self.http.get_json::<Vec<Json>>("/collections").await
+    }
+
+    async fn collection_names(&self, parent: Option<&str>) -> AppResult<Vec<String>> {
+        match parent {
+            Some(p) => Ok(vec![p.to_string()]),
+            None => {
+                let mut names: Vec<String> = self.collection_list().await?.iter().filter_map(|c| c.get("name").and_then(Json::as_str).map(str::to_string)).collect();
+                names.sort();
+                Ok(names)
+            }
+        }
+    }
+
+    async fn list_collections(&self) -> AppResult<Vec<ObjectSummary>> {
+        Ok(collection_summaries(&self.collection_list().await?))
+    }
+
+    async fn list_aliases(&self, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let body: Json = self.http.get_json("/aliases").await?;
+        Ok(alias_summaries(&body, parent))
+    }
+
+    async fn list_synonyms(&self, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let mut list = Vec::new();
+        for name in self.collection_names(parent).await? {
+            let body: Json = self.http.get_json(&format!("/collections/{}/synonyms", encode(&name))).await?;
+            list.extend(synonym_summaries(&name, &body));
+            if list.len() >= OBJECT_CAP {
+                break;
+            }
+        }
+        Ok(finish(list))
+    }
+
+    async fn list_rules(&self, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let mut list = Vec::new();
+        for name in self.collection_names(parent).await? {
+            let body: Json = self.http.get_json(&format!("/collections/{}/overrides", encode(&name))).await?;
+            list.extend(rule_summaries(&name, &body));
+            if list.len() >= OBJECT_CAP {
+                break;
+            }
+        }
+        Ok(finish(list))
+    }
+
+    async fn list_keys(&self) -> AppResult<Vec<ObjectSummary>> {
+        match self.http.get_json::<Json>("/keys").await {
+            Ok(body) => Ok(api_key_summaries(&body)),
+            Err(AppError::NotConnected { .. }) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn node_name(&self) -> String {
+        self.http.base().trim_start_matches("https://").trim_start_matches("http://").to_string()
+    }
+
+    async fn list_nodes(&self) -> AppResult<Vec<ObjectSummary>> {
+        let debug: Json = self.http.get_json("/debug").await.unwrap_or(Json::Null);
+        let health: Json = self.http.get_json("/health").await.unwrap_or(Json::Null);
+        let metrics: Json = self.http.get_json("/metrics.json").await.unwrap_or(Json::Null);
+        Ok(node_summary(&self.node_name(), &debug, &health, &metrics))
+    }
+
+    async fn collection_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = reference.name.as_str();
+        let p = encode(name);
+        let coll = self.collection(name).await?;
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&coll), CodeLanguage::Json);
+        for (label, key) in [("Documents", "num_documents"), ("Default sorting field", "default_sorting_field"), ("Memory shards", "num_memory_shards"), ("Created", "created_at"), ("Nested fields", "enable_nested_fields")] {
+            let v = coll.get(key).map(text_of).unwrap_or_default();
+            if !v.is_empty() {
+                detail = detail.property(label, v);
+            }
+        }
+        detail = detail.property("Fields", fields_of(&coll).len().to_string());
+        detail.columns = columns_of(&coll);
+        let mut children = Vec::new();
+        if let Ok(body) = self.http.get_json::<Json>("/aliases").await {
+            children.extend(alias_summaries(&body, Some(name)));
+        }
+        if let Ok(body) = self.http.get_json::<Json>(&format!("/collections/{p}/synonyms")).await {
+            children.extend(synonym_summaries(name, &body));
+        }
+        if let Ok(body) = self.http.get_json::<Json>(&format!("/collections/{p}/overrides")).await {
+            children.extend(rule_summaries(name, &body));
+        }
+        detail.children = finish(children);
+        Ok(detail.action(ObjectAction::destructive("delete", "Delete collection", format!("DELETE /collections/{p}"))))
+    }
+
+    async fn alias_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = reference.name.as_str();
+        let body: Json = self.http.get_json(&format!("/aliases/{}", encode(name))).await?;
+        let target = str_at(&body, "collection_name").to_string();
+        let detail = ObjectDetail::empty(reference).definition(pretty(&body), CodeLanguage::Json).property("Collection", &target);
+        Ok(detail.action(ObjectAction::destructive("delete", "Delete alias", format!("DELETE /aliases/{}", encode(name)))))
+    }
+
+    async fn synonym_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let collection = reference.parent.as_deref().ok_or_else(|| AppError::invalid_input("A synonym needs its collection as parent."))?;
+        let path = format!("/collections/{}/synonyms/{}", encode(collection), encode(&reference.name));
+        let body: Json = self.http.get_json(&path).await?;
+        let words = str_list(body.get("synonyms"));
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&body), CodeLanguage::Json).property("Collection", collection);
+        let root = str_at(&body, "root");
+        if !root.is_empty() {
+            detail = detail.property("Root", root);
+        }
+        detail = detail.property("Type", if root.is_empty() { "multi-way" } else { "one-way" });
+        detail.rows = Some(rows_table(&[("synonym", "string")], words.into_iter().map(|w| vec![Value::Text(w)]).collect()));
+        Ok(detail.action(ObjectAction::destructive("delete", "Delete synonym", format!("DELETE {path}"))))
+    }
+
+    async fn rule_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let collection = reference.parent.as_deref().ok_or_else(|| AppError::invalid_input("A curation rule needs its collection as parent."))?;
+        let path = format!("/collections/{}/overrides/{}", encode(collection), encode(&reference.name));
+        let body: Json = self.http.get_json(&path).await?;
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&body), CodeLanguage::Json).property("Collection", collection);
+        if let Some(rule) = body.get("rule") {
+            for (label, key) in [("Query", "query"), ("Match", "match"), ("Filter", "filter_by"), ("Tags", "tags")] {
+                let v = rule.get(key).map(text_of).unwrap_or_default();
+                if !v.is_empty() {
+                    detail = detail.property(label, v);
+                }
+            }
+        }
+        for (label, key) in [("Filter by", "filter_by"), ("Sort by", "sort_by"), ("Replace query", "replace_query")] {
+            let v = str_at(&body, key);
+            if !v.is_empty() {
+                detail = detail.property(label, v);
+            }
+        }
+        let mut rows: Vec<Vec<Value>> = body
+            .get("includes")
+            .and_then(Json::as_array)
+            .into_iter()
+            .flatten()
+            .map(|i| vec![Value::Text("pin".into()), Value::Text(text_of(i.get("id").unwrap_or(&Json::Null))), Value::Text(text_of(i.get("position").unwrap_or(&Json::Null)))])
+            .collect();
+        rows.extend(
+            body.get("excludes")
+                .and_then(Json::as_array)
+                .into_iter()
+                .flatten()
+                .map(|e| vec![Value::Text("hide".into()), Value::Text(text_of(e.get("id").unwrap_or(&Json::Null))), Value::Null]),
+        );
+        detail.rows = Some(rows_table(&[("action", "string"), ("document_id", "string"), ("position", "string")], rows));
+        Ok(detail.action(ObjectAction::destructive("delete", "Delete rule", format!("DELETE {path}"))))
+    }
+
+    async fn key_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let body: Json = self.http.get_json(&format!("/keys/{}", encode(&reference.name))).await?;
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&body), CodeLanguage::Json);
+        for (label, key) in [("Description", "description"), ("Prefix", "value_prefix")] {
+            let v = str_at(&body, key);
+            if !v.is_empty() {
+                detail = detail.property(label, v);
+            }
+        }
+        detail = detail.property("Actions", str_list(body.get("actions")).join(", ")).property("Collections", str_list(body.get("collections")).join(", "));
+        if let Some(exp) = body.get("expires_at").and_then(Json::as_i64) {
+            detail = detail.property("Expires at", if exp > 4_000_000_000 { "never".to_string() } else { exp.to_string() });
+        }
+        Ok(detail.action(ObjectAction::destructive("delete", "Delete API key", format!("DELETE /keys/{}", encode(&reference.name)))))
+    }
+
+    async fn node_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let debug: Json = self.http.get_json("/debug").await.unwrap_or(Json::Null);
+        let health: Json = self.http.get_json("/health").await.unwrap_or(Json::Null);
+        let metrics: Json = self.http.get_json("/metrics.json").await.unwrap_or(Json::Null);
+        let stats: Json = self.http.get_json("/stats.json").await.unwrap_or(Json::Null);
+        let mut detail = ObjectDetail::empty(reference)
+            .definition(pretty(&json!({"debug": debug, "health": health, "metrics": metrics})), CodeLanguage::Json)
+            .property("Address", self.node_name())
+            .property("State", node_state(&debug))
+            .property("Healthy", (health.get("ok").and_then(Json::as_bool) != Some(false)).to_string());
+        let version = str_at(&debug, "version");
+        if !version.is_empty() {
+            detail = detail.property("Version", version);
+        }
+        if let (Some(u), Some(t)) = (num_at(&metrics, "system_memory_used_bytes"), num_at(&metrics, "system_memory_total_bytes")) {
+            detail = detail.property("Memory", format!("{} / {}", human_bytes(u), human_bytes(t)));
+        }
+        if let (Some(u), Some(t)) = (num_at(&metrics, "system_disk_used_bytes"), num_at(&metrics, "system_disk_total_bytes")) {
+            detail = detail.property("Disk", format!("{} / {}", human_bytes(u), human_bytes(t)));
+        }
+        if let Some(c) = num_at(&metrics, "system_cpu_active_percentage") {
+            detail = detail.property("CPU", format!("{c}%"));
+        }
+        let mut rows: Vec<Vec<Value>> = stats
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, v)| !v.is_object())
+            .map(|(k, v)| vec![Value::Text(k.clone()), Value::Text(text_of(v))])
+            .collect();
+        rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        detail.rows = Some(rows_table(&[("metric", "string"), ("value", "string")], rows));
+        Ok(detail)
+    }
+
+    async fn playground(&self, req: &SearchRequest) -> AppResult<SearchResult> {
+        let coll = self.collection(&req.index).await?;
+        let fields = fields_of(&coll);
+        let owned = playground_params(req, &fields);
+        let params: Vec<(&str, String)> = owned.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        let out = self.search(&req.index, &params).await?;
+        Ok(playground_result(&out, req.highlight))
+    }
+
+    async fn stats(&self) -> AppResult<ServerStats> {
+        let stats: Json = self.http.get_json("/stats.json").await.unwrap_or(Json::Null);
+        let metrics: Json = self.http.get_json("/metrics.json").await.unwrap_or(Json::Null);
+        let health: Json = self.http.get_json("/health").await.unwrap_or(Json::Null);
+        let debug: Json = self.http.get_json("/debug").await.unwrap_or(Json::Null);
+        let collections = self.collection_list().await.unwrap_or_default();
+        Ok(ServerStats::now(stats_groups(&stats, &metrics, &health, &debug, &collections)))
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities { sql: false, namespaces: false, fixed_columns: true, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: true },
+        object_kinds: vec![K::Collection, K::Alias, K::Synonym, K::Rule, K::ApiKey, K::Node],
+        tools: vec![T::Stats, T::SearchPlayground],
+    }
+}
+
 #[async_trait]
 impl Integration for TypesenseIntegration {
     fn engine(&self) -> Engine {
@@ -360,7 +1006,7 @@ impl Integration for TypesenseIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { sql: false, namespaces: false, fixed_columns: true, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: true }
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -468,6 +1114,38 @@ impl Integration for TypesenseIntegration {
         Ok(results)
     }
 
+    async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        match kind {
+            ObjectKind::Collection => self.list_collections().await,
+            ObjectKind::Alias => self.list_aliases(parent).await,
+            ObjectKind::Synonym => self.list_synonyms(parent).await,
+            ObjectKind::Rule => self.list_rules(parent).await,
+            ObjectKind::ApiKey => self.list_keys().await,
+            ObjectKind::Node => self.list_nodes().await,
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        match reference.kind {
+            ObjectKind::Collection => self.collection_detail(reference).await,
+            ObjectKind::Alias => self.alias_detail(reference).await,
+            ObjectKind::Synonym => self.synonym_detail(reference).await,
+            ObjectKind::Rule => self.rule_detail(reference).await,
+            ObjectKind::ApiKey => self.key_detail(reference).await,
+            ObjectKind::Node => self.node_detail(reference).await,
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        self.stats().await
+    }
+
+    async fn search(&self, req: &SearchRequest) -> AppResult<SearchResult> {
+        self.playground(req).await
+    }
+
     async fn close(&self) {}
 }
 
@@ -496,7 +1174,7 @@ impl TypesenseIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ConnectionInput, ConnectionSummary, Environment, SslMode, Value};
+    use crate::model::{ConnectionInput, ConnectionSummary, Environment, SslMode};
 
     fn fields() -> Vec<Field> {
         vec![
@@ -576,6 +1254,166 @@ mod tests {
         assert!(is_read_request("GET", "/collections"));
         assert!(is_read_request("POST", "/collections/b/documents/search"));
         assert!(!is_read_request("POST", "/collections/b/documents/import"));
+    }
+
+    #[test]
+    fn explorer_lists_collections_aliases_synonyms_rules_keys() {
+        let collections = vec![
+            json!({"name": "books", "num_documents": 1200, "default_sorting_field": "year", "fields": [{"name": "title", "type": "string"}, {"name": "year", "type": "int32"}]}),
+            json!({"name": "authors", "num_documents": 3, "fields": [{"name": "name", "type": "string"}]}),
+        ];
+        let list = collection_summaries(&collections);
+        assert_eq!(list[0].reference.name, "authors");
+        assert_eq!(list[0].detail.as_deref(), Some("3 docs · 1 fields"));
+        assert!(list[0].badge.is_none());
+        assert_eq!(list[1].detail.as_deref(), Some("1,200 docs · 2 fields"));
+        assert_eq!(list[1].badge.as_deref(), Some("sort year"));
+
+        let aliases = json!({"aliases": [{"name": "current", "collection_name": "books"}, {"name": "people", "collection_name": "authors"}]});
+        let all = alias_summaries(&aliases, None);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].reference.parent.as_deref(), Some("books"));
+        assert_eq!(all[0].detail.as_deref(), Some("→ books"));
+        assert_eq!(alias_summaries(&aliases, Some("authors")).len(), 1);
+
+        let syn = synonym_summaries("books", &json!({"synonyms": [{"id": "s1", "synonyms": ["blazer", "coat"]}, {"id": "s2", "root": "shoe", "synonyms": ["sneaker"]}]}));
+        assert_eq!(syn[0].badge.as_deref(), Some("multi-way"));
+        assert_eq!(syn[0].detail.as_deref(), Some("blazer, coat"));
+        assert_eq!(syn[1].badge.as_deref(), Some("one-way"));
+        assert_eq!(syn[1].detail.as_deref(), Some("shoe → sneaker"));
+        assert_eq!(syn[1].reference.parent.as_deref(), Some("books"));
+
+        let rules = rule_summaries("books", &json!({"overrides": [{"id": "r1", "rule": {"query": "dune", "match": "exact"}, "includes": [{"id": "1", "position": 1}], "excludes": [{"id": "9"}], "filter_by": "year:>1960"}]}));
+        assert_eq!(rules[0].badge.as_deref(), Some("exact"));
+        assert_eq!(rules[0].detail.as_deref(), Some("q: dune · 1 pinned · 1 hidden · year:>1960"));
+
+        let keys = api_key_summaries(&json!({"keys": [
+            {"id": 1, "description": "Admin", "actions": ["*"], "collections": ["*"], "value_prefix": "abcd"},
+            {"id": 2, "description": "", "actions": ["documents:search"], "collections": ["books"], "value_prefix": "xy"}
+        ]}));
+        assert_eq!(keys[0].reference.name, "1");
+        assert_eq!(keys[0].badge.as_deref(), Some("all actions"));
+        assert_eq!(keys[0].detail.as_deref(), Some("Admin · * · on * · abcd…"));
+        assert_eq!(keys[1].detail.as_deref(), Some("documents:search · on books · xy…"));
+        assert!(keys[1].badge.is_none());
+    }
+
+    #[test]
+    fn node_summary_reports_state_and_health() {
+        let debug = json!({"version": "0.25.2", "state": 1});
+        let metrics = json!({"system_cpu_active_percentage": "12.5", "system_memory_used_bytes": "2048"});
+        let list = node_summary("localhost:8108", &debug, &json!({"ok": true}), &metrics);
+        assert_eq!(list[0].reference.name, "localhost:8108");
+        assert_eq!(list[0].badge.as_deref(), Some("leader"));
+        assert_eq!(list[0].detail.as_deref(), Some("v0.25.2 · healthy · cpu 12.5% · mem 2.0 KB"));
+        assert_eq!(node_state(&json!({"state": 4})), "follower");
+        assert_eq!(node_state(&json!({})), "single");
+        let unhealthy = node_summary("h", &json!({}), &json!({"ok": false}), &Json::Null);
+        assert_eq!(unhealthy[0].detail.as_deref(), Some("unhealthy"));
+    }
+
+    #[test]
+    fn playground_params_cover_query_by_and_paging() {
+        let fs = vec![
+            Field { name: "id".into(), type_name: "string".into() },
+            Field { name: "title".into(), type_name: "string".into() },
+            Field { name: "tags".into(), type_name: "string[]".into() },
+            Field { name: "year".into(), type_name: "int32".into() },
+        ];
+        assert_eq!(query_by_all(&fs), "id,title,tags");
+        assert_eq!(query_by_all(&fs[3..]), "id");
+        let req = SearchRequest {
+            index: "books".into(),
+            query: "dune".into(),
+            filter: Some("year:>1960".into()),
+            facets: vec!["tags".into(), "".into()],
+            sort: vec!["year:desc".into(), "title".into()],
+            highlight: true,
+            limit: 20,
+            offset: 40,
+        };
+        let params = playground_params(&req, &fs);
+        let get = |k: &str| params.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        assert_eq!(get("q").as_deref(), Some("dune"));
+        assert_eq!(get("query_by").as_deref(), Some("id,title,tags"));
+        assert_eq!(get("filter_by").as_deref(), Some("year:>1960"));
+        assert_eq!(get("facet_by").as_deref(), Some("tags"));
+        assert_eq!(get("sort_by").as_deref(), Some("year:desc,title:asc"));
+        assert_eq!(get("highlight_full_fields").as_deref(), Some("id,title,tags"));
+        assert_eq!(get("per_page").as_deref(), Some("20"));
+        assert_eq!(get("page").as_deref(), Some("3"));
+        assert!(get("offset").is_none());
+
+        let odd = playground_params(&SearchRequest { query: "".into(), filter: None, facets: vec![], sort: vec![], highlight: false, offset: 5, limit: 20, ..req.clone() }, &fs);
+        let get = |k: &str| odd.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        assert_eq!(get("q").as_deref(), Some("*"));
+        assert_eq!(get("offset").as_deref(), Some("5"));
+        assert_eq!(get("limit").as_deref(), Some("20"));
+        assert!(get("page").is_none() && get("facet_by").is_none() && get("highlight_full_fields").is_none());
+        let path = search_path("books", &odd.iter().map(|(k, v)| (k.as_str(), v.clone())).collect::<Vec<_>>());
+        assert!(path.starts_with("/collections/books/documents/search?q=%2A&query_by="));
+    }
+
+    #[test]
+    fn playground_maps_hits_facets_and_highlights() {
+        let body = json!({
+            "found": 12,
+            "search_time_ms": 4,
+            "hits": [
+                {"document": {"id": "1", "title": "Dune", "year": 1965}, "text_match": 130, "highlight": {"title": {"snippet": "<mark>Dune</mark>"}}},
+                {"document": {"id": "2", "title": "Neuromancer"}, "text_match": 90, "highlight": {}}
+            ],
+            "facet_counts": [{"field_name": "tags", "counts": [{"value": "scifi", "count": 7}, {"value": 3, "count": 1}]}]
+        });
+        let out = playground_result(&body, true);
+        let names: Vec<&str> = out.hits.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "_text_match", "title", "year", "_highlight"]);
+        assert_eq!(out.hits.rows[0][1], Value::Int(130));
+        assert_eq!(out.hits.rows[0][4], Value::Json(json!({"title": {"snippet": "<mark>Dune</mark>"}})));
+        assert_eq!(out.hits.rows[1][3], Value::Null);
+        assert_eq!(out.hits.rows[1][4], Value::Null);
+        assert_eq!(out.total, Some(12));
+        assert_eq!(out.took_ms, Some(4));
+        assert_eq!(out.facets[0].field, "tags");
+        assert_eq!(out.facets[0].values[1], FacetValue { value: "3".into(), count: 1 });
+        let plain = playground_result(&body, false);
+        assert!(!plain.hits.columns.iter().any(|c| c.name == "_highlight"));
+        let empty = playground_result(&json!({"hits": []}), false);
+        assert_eq!(empty.hits.columns.len(), 2);
+    }
+
+    #[test]
+    fn stats_groups_fold_server_figures() {
+        let stats = json!({"latency_ms": {"search_latency_ms": 3.5, "write_latency_ms": 1.0}, "total_requests_per_second": 12.0, "search_requests_per_second": "10.0"});
+        let metrics = json!({"system_cpu_active_percentage": "25", "system_memory_used_bytes": "1024", "system_memory_total_bytes": "2048", "system_disk_used_bytes": "10", "system_disk_total_bytes": "100"});
+        let collections = vec![json!({"name": "a", "num_documents": 10}), json!({"name": "b", "num_documents": 5})];
+        let groups = stats_groups(&stats, &metrics, &json!({"ok": true}), &json!({"version": "0.25.2", "state": 1}), &collections);
+        let find = |group: &str, label: &str| groups.iter().find(|g| g.title == group).and_then(|g| g.stats.iter().find(|s| s.label == label).cloned());
+        assert_eq!(find("Server", "Version").map(|s| s.value), Some("0.25.2".into()));
+        assert_eq!(find("Server", "State").map(|s| s.value), Some("leader".into()));
+        assert_eq!(find("Storage", "Collections").and_then(|s| s.numeric), Some(2.0));
+        assert_eq!(find("Storage", "Documents").and_then(|s| s.numeric), Some(15.0));
+        assert_eq!(find("Throughput", "Requests/s").and_then(|s| s.numeric), Some(12.0));
+        assert_eq!(find("Throughput", "Searches/s").and_then(|s| s.numeric), Some(10.0));
+        assert_eq!(find("Throughput", "Search latency").and_then(|s| s.numeric), Some(3.5));
+        assert_eq!(find("System", "CPU").and_then(|s| s.numeric), Some(25.0));
+        assert_eq!(find("System", "Memory used").map(|s| s.value), Some("1.0 KB".into()));
+        assert_eq!(find("System", "Memory").and_then(|s| s.numeric), Some(50.0));
+    }
+
+    #[test]
+    fn explorer_actions_parse_as_console_commands() {
+        for stmt in ["DELETE /collections/books", "DELETE /aliases/current", "DELETE /collections/books/synonyms/s1", "DELETE /collections/books/overrides/r1", "DELETE /keys/2"] {
+            match parse_command(stmt, None) {
+                Ok(Command::Rest { method, path, body }) => {
+                    assert_eq!(method, "DELETE");
+                    assert!(path.starts_with('/') && !path.is_empty());
+                    assert!(body.is_none());
+                }
+                other => panic!("unexpected {other:?} for {stmt}"),
+            }
+            assert!(!is_read_request("DELETE", stmt));
+        }
     }
 
     // WHAT:  Live round trip. Skipped unless DBFREE_TEST_TYPESENSE_URL is set.

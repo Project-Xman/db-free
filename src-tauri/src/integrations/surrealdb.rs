@@ -1,12 +1,13 @@
-// SOT: surrealdb-integration, surrealql, surreal-http-api, surreal-sql-endpoint
+// SOT: surrealdb-integration, surrealql, surreal-http-api, surreal-sql-endpoint, surreal-object-explorer, surreal-server-stats, surreal-info-statements
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::http::{base_url, json_result, json_to_value, json_type_name, HttpClient};
 use crate::integrations::sql::validate_columns;
 use crate::integrations::{Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog,
-    SchemaInfo, SortRule, SslMode, StatementResult, TableInfo, TableKind, TableRef, Value,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, ObjectAction, ObjectDetail, ObjectKind, ObjectRef,
+    ObjectSummary, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, ServerStats, SortRule, SslMode,
+    Stat, StatGroup, StatementResult, TableInfo, TableKind, TableRef, Value,
 };
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -401,6 +402,486 @@ impl SurrealIntegration {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Object explorer / administration
+//
+// WHAT:  Everything the explorer shows comes from the `INFO FOR …` family:
+//        ROOT (namespaces, users, system), NS (databases, users), DB (tables,
+//        functions, params, accesses, users) and TABLE (fields, indexes,
+//        events). Each section is a map of name → the DEFINE statement that
+//        created it, so the definition pane is the server's own DDL.
+// WHY:   One statement per kind, no schema guessing, and the definitions are
+//        exactly what a user would type to recreate the object.
+// HOW:   Actions are SurrealQL REMOVE statements, which `is_write_statement`
+//        already blocks on a read-only connection.
+// ---------------------------------------------------------------------------
+
+const LIST_CAP: usize = 2_000;
+
+// WHAT:  An `INFO FOR …` section as (name, DEFINE statement) pairs, sorted.
+fn info_entries(info: &Json, section: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = info
+        .get(section)
+        .and_then(Json::as_object)
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    let text = match v {
+                        Json::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    (k.clone(), text)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.truncate(LIST_CAP);
+    out
+}
+
+// WHAT:  The word(s) following `keyword` in a DEFINE statement, up to the next
+//        clause; used to read ROLES / TYPE / COMMENT out of the server's DDL.
+fn clause_after(definition: &str, keyword: &str) -> Option<String> {
+    let upper = definition.to_ascii_uppercase();
+    let at = upper.find(&format!(" {keyword} "))? + keyword.len() + 2;
+    // THEN closes an event's WHEN condition; without it the whole event body
+    // would be reported as the condition.
+    const STOPS: [&str; 9] = [" DURATION ", " COMMENT ", " PERMISSIONS ", " SESSION ", " SIGNIN ", " SIGNUP ", " ON ", " WITH ", " THEN "];
+    let rest = &definition[at..];
+    let upper_rest = &upper[at..];
+    let end = STOPS.iter().filter_map(|s| upper_rest.find(s)).min().unwrap_or(rest.len());
+    let value = rest[..end].trim().trim_matches('"').trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn has_word(definition: &str, word: &str) -> bool {
+    definition.to_ascii_uppercase().split(|c: char| !c.is_ascii_alphanumeric() && c != '_').any(|w| w == word)
+}
+
+fn preview(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        format!("{}…", flat.chars().take(max).collect::<String>())
+    }
+}
+
+fn table_badge(definition: &str) -> Option<String> {
+    if has_word(definition, "RELATION") {
+        Some("relation".into())
+    } else if has_word(definition, "SCHEMAFULL") {
+        Some("schemafull".into())
+    } else if has_word(definition, "SCHEMALESS") {
+        Some("schemaless".into())
+    } else {
+        None
+    }
+}
+
+fn index_badge(definition: &str) -> Option<String> {
+    for (word, badge) in [("UNIQUE", "unique"), ("SEARCH", "search"), ("MTREE", "mtree"), ("HNSW", "hnsw")] {
+        if has_word(definition, word) {
+            return Some(badge.into());
+        }
+    }
+    Some("index".into())
+}
+
+fn definition_summary(kind: ObjectKind, name: &str, definition: &str, parent: Option<String>, badge: Option<String>) -> ObjectSummary {
+    let detail = match kind {
+        ObjectKind::Index => clause_after(definition, "FIELDS").or_else(|| clause_after(definition, "COLUMNS")),
+        ObjectKind::Event => clause_after(definition, "WHEN"),
+        ObjectKind::User => clause_after(definition, "ROLES"),
+        _ => None,
+    }
+    .unwrap_or_else(|| preview(definition, 120));
+    ObjectSummary { reference: ObjectRef { kind, name: name.to_string(), parent }, detail: Some(detail), badge }
+}
+
+fn summaries(kind: ObjectKind, entries: &[(String, String)], parent: Option<&str>, badge: impl Fn(&str) -> Option<String>) -> Vec<ObjectSummary> {
+    entries
+        .iter()
+        .map(|(name, def)| definition_summary(kind, name, def, parent.map(str::to_string), badge(def)))
+        .collect()
+}
+
+// WHAT:  The REMOVE statement that undoes a DEFINE, per kind.
+fn remove_statement(kind: ObjectKind, name: &str, parent: Option<&str>) -> Option<String> {
+    let id = ident(name);
+    match kind {
+        ObjectKind::Namespace => Some(format!("REMOVE NAMESPACE {id}")),
+        ObjectKind::Database => Some(format!("REMOVE DATABASE {id}")),
+        ObjectKind::Table => Some(format!("REMOVE TABLE {id}")),
+        ObjectKind::Index => parent.map(|t| format!("REMOVE INDEX {id} ON TABLE {}", ident(t))),
+        ObjectKind::Event => parent.map(|t| format!("REMOVE EVENT {id} ON TABLE {}", ident(t))),
+        ObjectKind::Function => Some(format!("REMOVE FUNCTION fn::{name}")),
+        ObjectKind::Setting => Some(format!("REMOVE PARAM ${name}")),
+        ObjectKind::Role => Some(format!("REMOVE ACCESS {id} ON DATABASE")),
+        ObjectKind::User => {
+            let level = match parent {
+                Some("root") => "ROOT",
+                Some("namespace") => "NAMESPACE",
+                _ => "DATABASE",
+            };
+            Some(format!("REMOVE USER {id} ON {level}"))
+        }
+        _ => None,
+    }
+}
+
+fn definition_detail(reference: &ObjectRef, definition: &str) -> ObjectDetail {
+    let mut d = ObjectDetail::empty(reference).definition(definition, CodeLanguage::Sql);
+    for (label, keyword) in [("type", "TYPE"), ("fields", "FIELDS"), ("when", "WHEN"), ("then", "THEN"), ("roles", "ROLES"), ("value", "VALUE"), ("comment", "COMMENT"), ("permissions", "PERMISSIONS")] {
+        if let Some(v) = clause_after(definition, keyword) {
+            d = d.property(label, preview(&v, 300));
+        }
+    }
+    if let Some(statement) = remove_statement(reference.kind, &reference.name, reference.parent.as_deref()) {
+        let label = format!("Remove {}", format!("{:?}", reference.kind).to_lowercase());
+        d = d.action(ObjectAction::destructive("remove", &label, statement));
+    }
+    d
+}
+
+fn table_detail(reference: &ObjectRef, definition: &str, info: &Json, columns: Vec<ColumnInfo>, count: Option<i64>) -> ObjectDetail {
+    let mut d = definition_detail(reference, definition);
+    if let Some(c) = count {
+        d = d.property("records", crate::model::objects::format_number(c as f64));
+    }
+    let fields = info_entries(info, "fields");
+    d = d.property("fields", fields.len().to_string());
+    d.columns = columns;
+    d.rows = Some(ResultSet {
+        columns: vec![ColumnMeta { name: "field".into(), type_name: "string".into() }, ColumnMeta { name: "definition".into(), type_name: "string".into() }],
+        rows: fields.iter().map(|(n, def)| vec![Value::Text(n.clone()), Value::Text(def.clone())]).collect(),
+        truncated: false,
+    });
+    let name = reference.name.as_str();
+    d.children = summaries(ObjectKind::Index, &info_entries(info, "indexes"), Some(name), index_badge)
+        .into_iter()
+        .chain(summaries(ObjectKind::Event, &info_entries(info, "events"), Some(name), |_| Some("event".into())))
+        .collect();
+    let id = ident(name);
+    d.action(ObjectAction::new("sample", "Sample 20", format!("SELECT * FROM {id} LIMIT 20")))
+        .action(ObjectAction::new("count", "Count", format!("SELECT count() FROM {id} GROUP ALL")))
+        .action(ObjectAction::destructive("delete-all", "Delete all records", format!("DELETE {id}")))
+}
+
+// WHAT:  `INFO FOR ROOT`'s `system` section (2.x) → the Server stat group.
+fn system_stats(root: &Json) -> Vec<Stat> {
+    let Some(system) = root.get("system") else { return Vec::new() };
+    let num = |k: &str| system.get(k).and_then(Json::as_f64);
+    let mut out = Vec::new();
+    for (key, label, unit) in [
+        ("available_parallelism", "Parallelism", None),
+        ("physical_cores", "Physical cores", None),
+        ("threads", "Threads", None),
+        ("cpu_usage", "CPU usage", Some("%")),
+        ("load_average", "Load average", None),
+    ] {
+        if let Some(v) = num(key) {
+            out.push(Stat::number(label, (v * 100.0).round() / 100.0, unit));
+        }
+    }
+    for (key, label) in [("memory_usage", "Memory usage"), ("memory_allocated", "Memory allocated")] {
+        if let Some(v) = num(key) {
+            out.push(Stat { label: label.to_string(), value: bytes_text(v), unit: None, hint: None, numeric: Some(v) });
+        }
+    }
+    out
+}
+
+fn bytes_text(bytes: f64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{v:.0} {}", UNITS[i])
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+fn stat_groups(version: Option<&str>, namespace: &str, database: &str, root: Option<&Json>, ns: Option<&Json>, db: Option<&Json>, records: Option<i64>) -> Vec<StatGroup> {
+    let mut server = vec![Stat::text("Version", version.unwrap_or("SurrealDB"))];
+    server.push(Stat::text("Namespace", namespace));
+    server.push(Stat::text("Database", database));
+    if let Some(r) = root {
+        server.push(Stat::number("Namespaces", info_entries(r, "namespaces").len() as f64, None));
+        if let Some(nodes) = r.get("nodes").and_then(Json::as_object) {
+            server.push(Stat::number("Cluster nodes", nodes.len() as f64, None));
+        }
+        server.extend(system_stats(r));
+    }
+    let mut groups = vec![StatGroup { title: "Server".into(), stats: server }];
+    let mut catalog = Vec::new();
+    if let Some(n) = ns {
+        catalog.push(Stat::number("Databases", info_entries(n, "databases").len() as f64, None));
+    }
+    if let Some(d) = db {
+        catalog.push(Stat::number("Tables", info_entries(d, "tables").len() as f64, None));
+        catalog.push(Stat::number("Functions", info_entries(d, "functions").len() as f64, None));
+        catalog.push(Stat::number("Parameters", info_entries(d, "params").len() as f64, None));
+        catalog.push(Stat::number("Analyzers", info_entries(d, "analyzers").len() as f64, None));
+        catalog.push(Stat::number("Accesses", info_entries(d, "accesses").len() as f64, None));
+    }
+    if let Some(r) = records {
+        catalog.push(Stat::number("Records", r as f64, None).with_hint("all tables"));
+    }
+    if !catalog.is_empty() {
+        groups.push(StatGroup { title: "Catalog".into(), stats: catalog });
+    }
+    let users = |info: Option<&Json>| info.map(|i| info_entries(i, "users").len()).unwrap_or(0);
+    groups.push(StatGroup {
+        title: "Security".into(),
+        stats: vec![
+            Stat::number("Root users", users(root) as f64, None),
+            Stat::number("Namespace users", users(ns) as f64, None),
+            Stat::number("Database users", users(db) as f64, None),
+        ],
+    });
+    groups
+}
+
+impl SurrealIntegration {
+    // WHAT:  One statement with the namespace / database headers overridden, so
+    //        another namespace's databases can be listed without reconnecting.
+    async fn one_scoped(&self, statement: &str, ns: Option<&str>, db: Option<&str>) -> AppResult<Json> {
+        let mut headers = self.headers();
+        for (v2, v1, value) in [("surreal-ns", "NS", ns), ("surreal-db", "DB", db)] {
+            match value {
+                Some(v) => {
+                    if let Ok(hv) = HeaderValue::from_str(v) {
+                        headers.insert(v2, hv.clone());
+                        headers.insert(v1, hv);
+                    }
+                }
+                None => {
+                    headers.remove(v2);
+                    headers.remove(v1);
+                }
+            }
+        }
+        let req = self.http.request(Method::POST, "/sql").headers(headers).body(statement.to_string());
+        let resp = self.http.send(req).await?;
+        let body: Json = resp.json().await.map_err(|e| AppError::driver(format!("Malformed response: {e}")))?;
+        let first = body.as_array().and_then(|a| a.first()).cloned().ok_or_else(|| AppError::driver("SurrealDB returned no statement result."))?;
+        if first.get("status").and_then(Json::as_str) != Some("OK") {
+            let result = first.get("result").cloned().unwrap_or(Json::Null);
+            let msg = result.as_str().map(str::to_string).unwrap_or_else(|| result.to_string());
+            return Err(AppError::driver(format!("SurrealQL error: {msg}")));
+        }
+        Ok(first.get("result").cloned().unwrap_or(Json::Null))
+    }
+
+    async fn info_root(&self) -> AppResult<Json> {
+        self.one_scoped("INFO FOR ROOT", None, None).await
+    }
+
+    async fn info_ns(&self, ns: &str) -> AppResult<Json> {
+        self.one_scoped("INFO FOR NS", Some(ns), None).await
+    }
+
+    async fn info_db(&self) -> AppResult<Json> {
+        self.one("INFO FOR DB").await
+    }
+
+    async fn info_table(&self, table: &str) -> AppResult<Json> {
+        self.one(&format!("INFO FOR TABLE {}", ident(table))).await
+    }
+
+    // WHAT:  Users live at three levels; the badge says which one an entry came from.
+    async fn all_users(&self) -> Vec<ObjectSummary> {
+        let mut out = Vec::new();
+        for (level, info) in [
+            ("root", self.info_root().await.ok()),
+            ("namespace", self.info_ns(&self.namespace).await.ok()),
+            ("database", self.info_db().await.ok()),
+        ] {
+            if let Some(info) = info {
+                out.extend(summaries(ObjectKind::User, &info_entries(&info, "users"), Some(level), |_| Some(level.to_string())));
+            }
+        }
+        out.truncate(LIST_CAP);
+        out
+    }
+
+    async fn table_members(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let section = if kind == ObjectKind::Index { "indexes" } else { "events" };
+        let badge = |def: &str| if kind == ObjectKind::Index { index_badge(def) } else { Some("event".to_string()) };
+        let tables: Vec<String> = match parent.map(str::trim).filter(|p| !p.is_empty() && *p != self.database) {
+            Some(t) => vec![t.to_string()],
+            None => self.table_names().await?,
+        };
+        let mut out = Vec::new();
+        for table in tables {
+            if let Ok(info) = self.info_table(&table).await {
+                out.extend(summaries(kind, &info_entries(&info, section), Some(&table), badge));
+            }
+            if out.len() >= LIST_CAP {
+                break;
+            }
+        }
+        out.truncate(LIST_CAP);
+        Ok(out)
+    }
+
+    async fn total_records(&self) -> Option<i64> {
+        let tables = self.table_names().await.ok()?;
+        let mut total = 0;
+        for t in tables.iter().take(200) {
+            let sql = format!("SELECT count() FROM {} GROUP ALL", ident(t));
+            if let Ok(r) = self.one(&sql).await {
+                total += r.as_array().and_then(|a| a.first()).and_then(|f| f.get("count")).and_then(Json::as_i64).unwrap_or(0);
+            }
+        }
+        Some(total)
+    }
+
+    async fn explorer_objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        match kind {
+            ObjectKind::Namespace => {
+                let root = self.info_root().await?;
+                Ok(summaries(ObjectKind::Namespace, &info_entries(&root, "namespaces"), None, |_| Some("namespace".into())))
+            }
+            ObjectKind::Database => {
+                let ns = parent.map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&self.namespace);
+                let info = self.info_ns(ns).await?;
+                Ok(summaries(ObjectKind::Database, &info_entries(&info, "databases"), Some(ns), |_| Some("database".into())))
+            }
+            ObjectKind::Table => {
+                let info = self.info_db().await?;
+                Ok(summaries(ObjectKind::Table, &info_entries(&info, "tables"), Some(&self.database), table_badge))
+            }
+            ObjectKind::Index | ObjectKind::Event => self.table_members(kind, parent).await,
+            ObjectKind::Function => {
+                let info = self.info_db().await?;
+                Ok(summaries(ObjectKind::Function, &info_entries(&info, "functions"), Some(&self.database), |_| Some("function".into())))
+            }
+            ObjectKind::Setting => {
+                let info = self.info_db().await?;
+                Ok(summaries(ObjectKind::Setting, &info_entries(&info, "params"), Some(&self.database), |_| Some("param".into())))
+            }
+            ObjectKind::User => Ok(self.all_users().await),
+            ObjectKind::Role => {
+                // 2.x calls them accesses; 1.x had scopes and tokens.
+                let info = self.info_db().await?;
+                let mut out = summaries(ObjectKind::Role, &info_entries(&info, "accesses"), Some(&self.database), |def| {
+                    clause_after(def, "TYPE").map(|t| t.split_whitespace().next().unwrap_or("access").to_lowercase())
+                });
+                if out.is_empty() {
+                    out = summaries(ObjectKind::Role, &info_entries(&info, "scopes"), Some(&self.database), |_| Some("scope".into()));
+                    out.extend(summaries(ObjectKind::Role, &info_entries(&info, "tokens"), Some(&self.database), |_| Some("token".into())));
+                }
+                Ok(out)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    async fn explorer_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = reference.name.as_str();
+        let missing = || AppError::not_found(format!("`{name}` no longer exists."));
+        let lookup = |entries: Vec<(String, String)>| entries.into_iter().find(|(n, _)| n == name).map(|(_, d)| d);
+        match reference.kind {
+            ObjectKind::Namespace => {
+                let root = self.info_root().await?;
+                let def = lookup(info_entries(&root, "namespaces")).ok_or_else(missing)?;
+                let info = self.info_ns(name).await.ok();
+                let mut d = definition_detail(reference, &def);
+                if let Some(info) = &info {
+                    let dbs = info_entries(info, "databases");
+                    d = d.property("databases", dbs.len().to_string());
+                    d.children = summaries(ObjectKind::Database, &dbs, Some(name), |_| Some("database".into()));
+                    d.children.extend(summaries(ObjectKind::User, &info_entries(info, "users"), Some("namespace"), |_| Some("namespace".into())));
+                }
+                Ok(d)
+            }
+            ObjectKind::Database => {
+                let ns = reference.parent.as_deref().filter(|p| !p.is_empty()).unwrap_or(&self.namespace);
+                let info = self.info_ns(ns).await?;
+                let def = lookup(info_entries(&info, "databases")).ok_or_else(missing)?;
+                let mut d = definition_detail(reference, &def);
+                if name == self.database {
+                    let db = self.info_db().await?;
+                    let tables = info_entries(&db, "tables");
+                    d = d.property("tables", tables.len().to_string());
+                    d.children = summaries(ObjectKind::Table, &tables, Some(name), table_badge);
+                }
+                Ok(d)
+            }
+            ObjectKind::Table => {
+                let db = self.info_db().await?;
+                let def = lookup(info_entries(&db, "tables")).ok_or_else(missing)?;
+                let info = self.info_table(name).await?;
+                let columns = self.columns(&TableRef { schema: Some(self.database.clone()), name: name.to_string() }).await.unwrap_or_default();
+                let count = self.count(&TableRef { schema: None, name: name.to_string() }, &[]).await.ok();
+                Ok(table_detail(reference, &def, &info, columns, count))
+            }
+            ObjectKind::Index | ObjectKind::Event => {
+                let table = reference.parent.as_deref().filter(|p| !p.is_empty()).ok_or_else(|| AppError::invalid_input("This object needs its table as parent."))?;
+                let info = self.info_table(table).await?;
+                let section = if reference.kind == ObjectKind::Index { "indexes" } else { "events" };
+                let def = lookup(info_entries(&info, section)).ok_or_else(missing)?;
+                Ok(definition_detail(reference, &def))
+            }
+            ObjectKind::Function | ObjectKind::Setting | ObjectKind::Role => {
+                let db = self.info_db().await?;
+                let section = match reference.kind {
+                    ObjectKind::Function => "functions",
+                    ObjectKind::Setting => "params",
+                    _ => "accesses",
+                };
+                let def = lookup(info_entries(&db, section))
+                    .or_else(|| lookup(info_entries(&db, "scopes")))
+                    .or_else(|| lookup(info_entries(&db, "tokens")))
+                    .ok_or_else(missing)?;
+                Ok(definition_detail(reference, &def))
+            }
+            ObjectKind::User => {
+                let level = reference.parent.as_deref().unwrap_or("database");
+                let info = match level {
+                    "root" => self.info_root().await?,
+                    "namespace" => self.info_ns(&self.namespace).await?,
+                    _ => self.info_db().await?,
+                };
+                let def = lookup(info_entries(&info, "users")).ok_or_else(missing)?;
+                Ok(definition_detail(reference, &def).property("level", level))
+            }
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    async fn explorer_stats(&self) -> AppResult<ServerStats> {
+        let version = self.server_version().await.unwrap_or(None);
+        let root = self.info_root().await.ok();
+        let ns = self.info_ns(&self.namespace).await.ok();
+        let db = self.info_db().await.ok();
+        let records = self.total_records().await;
+        Ok(ServerStats::now(stat_groups(version.as_deref(), &self.namespace, &self.database, root.as_ref(), ns.as_ref(), db.as_ref(), records)))
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities { exact_estimate: true, ..Capabilities::DOCUMENT },
+        object_kinds: vec![K::Namespace, K::Database, K::Table, K::Index, K::Event, K::Function, K::Setting, K::User, K::Role],
+        // RELATE edges carry in / out, which the graph view can draw.
+        tools: vec![T::Stats, T::GraphView],
+    }
+}
+
 #[async_trait]
 impl Integration for SurrealIntegration {
     fn engine(&self) -> Engine {
@@ -408,7 +889,7 @@ impl Integration for SurrealIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { exact_estimate: true, ..Capabilities::DOCUMENT }
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -547,6 +1028,18 @@ impl Integration for SurrealIntegration {
     }
 
     async fn close(&self) {}
+
+    async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        self.explorer_objects(kind, parent).await
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        self.explorer_detail(reference).await
+    }
+
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        self.explorer_stats().await
+    }
 }
 
 #[cfg(test)]
@@ -620,6 +1113,121 @@ mod tests {
         assert!(cols[0].primary_key);
         let info = json!({"tables": {"b": "DEFINE TABLE b", "a": "DEFINE TABLE a"}});
         assert_eq!(info_keys(&info, "tables"), vec!["a", "b"]);
+    }
+
+    fn db_info() -> Json {
+        json!({
+            "accesses": {"account": "DEFINE ACCESS account ON DATABASE TYPE RECORD SIGNIN (SELECT * FROM user) DURATION FOR SESSION 1h"},
+            "analyzers": {"ascii": "DEFINE ANALYZER ascii TOKENIZERS class"},
+            "functions": {"greet": "DEFINE FUNCTION fn::greet($name: string) { RETURN 'hi ' + $name; }"},
+            "params": {"limit": "DEFINE PARAM $limit VALUE 50"},
+            "tables": {
+                "person": "DEFINE TABLE person TYPE NORMAL SCHEMAFULL PERMISSIONS NONE",
+                "wrote": "DEFINE TABLE wrote TYPE RELATION IN person OUT post SCHEMALESS"
+            },
+            "users": {"app": "DEFINE USER app ON DATABASE PASSHASH '...' ROLES EDITOR DURATION FOR SESSION NONE"}
+        })
+    }
+
+    fn table_info() -> Json {
+        json!({
+            "events": {"on_update": "DEFINE EVENT on_update ON person WHEN $event = 'UPDATE' THEN (UPDATE audit SET at = time::now())"},
+            "fields": {"email": "DEFINE FIELD email ON person TYPE string", "name": "DEFINE FIELD name ON person TYPE string"},
+            "indexes": {"email_idx": "DEFINE INDEX email_idx ON person FIELDS email UNIQUE", "name_idx": "DEFINE INDEX name_idx ON person FIELDS name"},
+            "lives": {}
+        })
+    }
+
+    #[test]
+    fn info_sections_become_summaries() {
+        let db = db_info();
+        let entries = info_entries(&db, "tables");
+        assert_eq!(entries.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), vec!["person", "wrote"]);
+        let tables = summaries(ObjectKind::Table, &entries, Some("app"), table_badge);
+        assert_eq!(tables[0].badge.as_deref(), Some("schemafull"));
+        assert_eq!(tables[1].badge.as_deref(), Some("relation"));
+        assert_eq!(tables[0].reference.parent.as_deref(), Some("app"));
+        assert!(tables[0].detail.as_deref().is_some_and(|d| d.starts_with("DEFINE TABLE person")));
+
+        let idx = summaries(ObjectKind::Index, &info_entries(&table_info(), "indexes"), Some("person"), index_badge);
+        assert_eq!(idx[0].reference.name, "email_idx");
+        assert_eq!(idx[0].badge.as_deref(), Some("unique"));
+        assert_eq!(idx[0].detail.as_deref(), Some("email UNIQUE"));
+        assert_eq!(idx[1].badge.as_deref(), Some("index"));
+        let ev = summaries(ObjectKind::Event, &info_entries(&table_info(), "events"), Some("person"), |_| Some("event".into()));
+        assert_eq!(ev[0].detail.as_deref(), Some("$event = 'UPDATE'"));
+        let users = summaries(ObjectKind::User, &info_entries(&db, "users"), Some("database"), |_| Some("database".into()));
+        assert_eq!(users[0].detail.as_deref(), Some("EDITOR"));
+    }
+
+    #[test]
+    fn remove_statements_are_write_blocked() {
+        assert_eq!(remove_statement(ObjectKind::Index, "email_idx", Some("person")).as_deref(), Some("REMOVE INDEX `email_idx` ON TABLE `person`"));
+        assert_eq!(remove_statement(ObjectKind::Event, "on_update", Some("person")).as_deref(), Some("REMOVE EVENT `on_update` ON TABLE `person`"));
+        assert_eq!(remove_statement(ObjectKind::Function, "greet", None).as_deref(), Some("REMOVE FUNCTION fn::greet"));
+        assert_eq!(remove_statement(ObjectKind::Setting, "limit", None).as_deref(), Some("REMOVE PARAM $limit"));
+        assert_eq!(remove_statement(ObjectKind::User, "root", Some("root")).as_deref(), Some("REMOVE USER `root` ON ROOT"));
+        assert_eq!(remove_statement(ObjectKind::Role, "account", None).as_deref(), Some("REMOVE ACCESS `account` ON DATABASE"));
+        assert_eq!(remove_statement(ObjectKind::Namespace, "test", None).as_deref(), Some("REMOVE NAMESPACE `test`"));
+        assert!(remove_statement(ObjectKind::Index, "x", None).is_none());
+        for kind in [ObjectKind::Index, ObjectKind::Table, ObjectKind::Function, ObjectKind::Role] {
+            let stmt = remove_statement(kind, "x", Some("t")).unwrap_or_default();
+            assert!(is_write_statement(&stmt), "{stmt}");
+        }
+    }
+
+    #[test]
+    fn details_carry_definition_and_actions() {
+        let r = ObjectRef { kind: ObjectKind::Index, name: "email_idx".into(), parent: Some("person".into()) };
+        let d = definition_detail(&r, "DEFINE INDEX email_idx ON person FIELDS email UNIQUE");
+        assert_eq!(d.language, CodeLanguage::Sql);
+        assert!(d.properties.iter().any(|p| p.name == "fields" && p.value == "email UNIQUE"));
+        assert!(d.actions[0].destructive && d.actions[0].statement.contains("REMOVE INDEX"));
+
+        let tr = ObjectRef { kind: ObjectKind::Table, name: "person".into(), parent: Some("app".into()) };
+        let td = table_detail(&tr, "DEFINE TABLE person TYPE NORMAL SCHEMAFULL", &table_info(), vec![], Some(1234));
+        assert!(td.properties.iter().any(|p| p.name == "records" && p.value == "1,234"));
+        assert!(td.properties.iter().any(|p| p.name == "fields" && p.value == "2"));
+        assert_eq!(td.rows.as_ref().map(|r| r.rows.len()), Some(2));
+        let kids: Vec<(ObjectKind, &str)> = td.children.iter().map(|c| (c.reference.kind, c.reference.name.as_str())).collect();
+        assert_eq!(kids, vec![(ObjectKind::Index, "email_idx"), (ObjectKind::Index, "name_idx"), (ObjectKind::Event, "on_update")]);
+        assert_eq!(td.actions.len(), 4);
+        assert_eq!(td.actions[3].statement, "DELETE `person`");
+        assert!(td.actions[3].destructive && !td.actions[1].destructive);
+        assert!(!is_write_statement(&td.actions[1].statement));
+
+        assert_eq!(clause_after("DEFINE USER a ON ROOT PASSHASH 'x' ROLES OWNER DURATION FOR SESSION NONE", "ROLES").as_deref(), Some("OWNER"));
+        assert_eq!(clause_after("DEFINE PARAM $limit VALUE 50", "VALUE").as_deref(), Some("50"));
+        assert!(clause_after("DEFINE TABLE person", "ROLES").is_none());
+        assert!(has_word("DEFINE TABLE t TYPE RELATION", "RELATION"));
+        assert!(!has_word("DEFINE TABLE relationships", "RELATION"));
+    }
+
+    #[test]
+    fn stats_groups_count_the_catalog() {
+        let root = json!({
+            "namespaces": {"test": "DEFINE NAMESPACE test", "other": "DEFINE NAMESPACE other"},
+            "nodes": {"n1": "NODE n1"},
+            "users": {"root": "DEFINE USER root ON ROOT ROLES OWNER"},
+            "system": {"available_parallelism": 8, "cpu_usage": 12.5, "memory_usage": 268435456.0, "physical_cores": 4, "threads": 16}
+        });
+        let ns = json!({"databases": {"app": "DEFINE DATABASE app"}, "users": {}});
+        let groups = stat_groups(Some("SurrealDB 2.1.0"), "test", "app", Some(&root), Some(&ns), Some(&db_info()), Some(99));
+        assert_eq!(groups.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(), vec!["Server", "Catalog", "Security"]);
+        let server = &groups[0].stats;
+        assert_eq!(server[0].value, "SurrealDB 2.1.0");
+        assert!(server.iter().any(|s| s.label == "Namespaces" && s.numeric == Some(2.0)));
+        assert!(server.iter().any(|s| s.label == "Cluster nodes" && s.numeric == Some(1.0)));
+        assert!(server.iter().any(|s| s.label == "Memory usage" && s.value == "256.0 MB"));
+        assert!(server.iter().any(|s| s.label == "CPU usage" && s.unit.as_deref() == Some("%")));
+        let catalog = &groups[1].stats;
+        assert_eq!(catalog[0].numeric, Some(1.0));
+        assert!(catalog.iter().any(|s| s.label == "Tables" && s.numeric == Some(2.0)));
+        assert!(catalog.iter().any(|s| s.label == "Records" && s.hint.as_deref() == Some("all tables")));
+        assert_eq!(groups[2].stats[0].numeric, Some(1.0));
+        assert_eq!(groups[2].stats[2].numeric, Some(1.0));
+        assert_eq!(stat_groups(None, "test", "app", None, None, None, None).len(), 2);
+        assert_eq!(bytes_text(1536.0), "1.5 KB");
     }
 
     #[tokio::test]

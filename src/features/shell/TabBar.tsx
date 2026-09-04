@@ -2,6 +2,7 @@
 import { Button, Chip, CloseButton } from "@heroui/react";
 import { usePendingCount, useWorkspace, type Tab } from "@/stores/workspace";
 import { Icon, type IconName } from "@/lib/icons";
+import { OBJECT_KINDS, TOOLS } from "@/lib/objects";
 import { cn } from "@/lib/cn";
 
 // WHAT:  Open tabs above the main area (also a drag region) + the Changes button.
@@ -74,6 +75,12 @@ function tabPresentation(tab: Tab): { label: string; icon: IconName } {
       return { label: tab.documentKind === "dashboard" ? "Dashboard" : tab.documentKind === "workflow" ? "Workflow" : "Diagram", icon: tab.documentKind === "dashboard" ? "columns" : tab.documentKind === "workflow" ? "play" : "view" };
     case "chat":
       return { label: "Chat DB", icon: "braces" };
+    case "object":
+      return { label: tab.reference.name, icon: OBJECT_KINDS[tab.reference.kind].icon };
+    case "admin":
+      return { label: "Server", icon: "server" };
+    case "tool":
+      return { label: TOOLS[tab.tool].label, icon: TOOLS[tab.tool].icon };
   }
 }
 

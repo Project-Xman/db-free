@@ -1,13 +1,13 @@
-// SOT: cassandra-integration, scylla-adapter, cql, cql-value-decoding, cassandra-paging, system-schema-catalog
+// SOT: cassandra-integration, scylla-adapter, cql, cql-value-decoding, cassandra-paging, system-schema-catalog, cql-ddl-reconstruction, cassandra-object-explorer, cassandra-server-stats
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::http::local;
 use crate::integrations::sql::{order_clause, quote_literal};
 use crate::integrations::{quote_ident, Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, PageQuery, ResolvedConnection, ResultSet,
-    SchemaCatalog, SchemaInfo, SortRule, SslMode, StatementResult, TableInfo, TableKind, TableRef,
-    Value,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, ObjectAction, ObjectDetail, ObjectKind,
+    ObjectRef, ObjectSummary, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, ServerStats,
+    SortRule, SslMode, Stat, StatGroup, StatementResult, TableInfo, TableKind, TableRef, Value,
 };
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -759,6 +759,922 @@ impl CassandraIntegration {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Object explorer / administration
+//
+// WHAT:  Lists and describes keyspaces, tables, materialized views, indexes,
+//        UDTs, UDFs / UDAs, roles, grants, nodes and settings straight from
+//        the system keyspaces, and reconstructs the CQL DDL from them (there
+//        is no SHOW CREATE in CQL).
+// WHY:   The explorer / admin UI is generic; this is where the family maps
+//        system_schema / system_auth / system / system_views onto it.
+// HOW:   One SELECT per kind, filtered on the partition key (keyspace_name)
+//        when a parent is given, client-side otherwise. Nested lookups
+//        (indexes of a table, views of a base table) filter client-side too
+//        because those are clustering columns. Every action is plain CQL that
+//        runs back through `execute`, so the guard's read-only lock and
+//        destructive confirmation apply unchanged.
+// ---------------------------------------------------------------------------
+
+const MAX_OBJECTS: usize = 2_000;
+
+fn column_index(set: &ResultSet, name: &str) -> Option<usize> {
+    set.columns.iter().position(|c| c.name == name)
+}
+
+fn named_value<'a>(set: &ResultSet, row: &'a [Value], name: &str) -> Option<&'a Value> {
+    column_index(set, name).and_then(|i| row.get(i)).filter(|v| !matches!(v, Value::Null))
+}
+
+fn named_text(set: &ResultSet, row: &[Value], name: &str) -> String {
+    named_value(set, row, name).map(local_text).unwrap_or_default()
+}
+
+fn named_i64(set: &ResultSet, row: &[Value], name: &str) -> Option<i64> {
+    match named_value(set, row, name) {
+        Some(Value::Int(i)) => Some(*i),
+        Some(Value::Float(f)) => Some(*f as i64),
+        Some(Value::Text(s)) | Some(Value::Decimal(s)) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn named_bool(set: &ResultSet, row: &[Value], name: &str) -> Option<bool> {
+    match named_value(set, row, name) {
+        Some(Value::Bool(b)) => Some(*b),
+        Some(Value::Text(s)) => Some(s.eq_ignore_ascii_case("true")),
+        _ => None,
+    }
+}
+
+fn json_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// A `list<text>` / `set<text>` / `frozen<list<text>>` cell as strings.
+fn named_list(set: &ResultSet, row: &[Value], name: &str) -> Vec<String> {
+    match named_value(set, row, name) {
+        Some(Value::Json(serde_json::Value::Array(items))) => items.iter().map(json_text).collect(),
+        Some(Value::Text(s)) if !s.is_empty() => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// A `map<text, text>` cell as sorted pairs.
+fn named_map(set: &ResultSet, row: &[Value], name: &str) -> BTreeMap<String, String> {
+    match named_value(set, row, name) {
+        Some(Value::Json(serde_json::Value::Object(obj))) => obj.iter().map(|(k, v)| (k.clone(), json_text(v))).collect(),
+        _ => BTreeMap::new(),
+    }
+}
+
+fn format_bytes(bytes: f64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut value = bytes.max(0.0);
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", value as u64, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+// ---- CQL DDL reconstruction (pure, unit-tested) ----------------------------
+
+/// `{'class': 'SimpleStrategy', 'replication_factor': '1'}`
+fn cql_map_literal(map: &BTreeMap<String, String>) -> String {
+    let pairs: Vec<String> = map.iter().map(|(k, v)| format!("{}: {}", quote_literal(k), quote_literal(v))).collect();
+    format!("{{{}}}", pairs.join(", "))
+}
+
+/// `NetworkTopologyStrategy dc1=3, dc2=2` / `SimpleStrategy rf=1`.
+fn replication_summary(map: &BTreeMap<String, String>) -> String {
+    let class = map
+        .get("class")
+        .map(|c| c.rsplit('.').next().unwrap_or(c).to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let factors: Vec<String> = map
+        .iter()
+        .filter(|(k, _)| k.as_str() != "class")
+        .map(|(k, v)| if k == "replication_factor" { format!("rf={v}") } else { format!("{k}={v}") })
+        .collect();
+    if factors.is_empty() {
+        class
+    } else {
+        format!("{class} {}", factors.join(", "))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CqlColumn {
+    name: String,
+    kind: String,
+    position: i64,
+    data_type: String,
+    clustering_order: String,
+}
+
+fn kind_rank(kind: &str) -> u8 {
+    match kind {
+        "partition_key" => 0,
+        "clustering" => 1,
+        "static" => 2,
+        _ => 3,
+    }
+}
+
+/// system_schema.columns rows → key columns first, in key order, then static, then regular by name.
+fn cql_columns(set: &ResultSet) -> Vec<CqlColumn> {
+    let mut cols: Vec<CqlColumn> = set
+        .rows
+        .iter()
+        .map(|row| CqlColumn {
+            name: named_text(set, row, "column_name"),
+            kind: named_text(set, row, "kind"),
+            position: named_i64(set, row, "position").unwrap_or(-1),
+            data_type: named_text(set, row, "type"),
+            clustering_order: named_text(set, row, "clustering_order"),
+        })
+        .collect();
+    cols.sort_by(|a, b| kind_rank(&a.kind).cmp(&kind_rank(&b.kind)).then(a.position.cmp(&b.position)).then(a.name.cmp(&b.name)));
+    cols
+}
+
+fn column_infos(columns: &[CqlColumn]) -> Vec<ColumnInfo> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let pk = matches!(c.kind.as_str(), "partition_key" | "clustering");
+            ColumnInfo { name: c.name.clone(), data_type: c.data_type.clone(), nullable: !pk, primary_key: pk, ordinal: i as u32 + 1 }
+        })
+        .collect()
+}
+
+fn primary_key_clause(columns: &[CqlColumn]) -> String {
+    let names = |kind: &str| columns.iter().filter(|c| c.kind == kind).map(|c| quote_ident(&c.name)).collect::<Vec<_>>().join(", ");
+    let partition = names("partition_key");
+    let clustering = names("clustering");
+    if clustering.is_empty() {
+        format!("({partition})")
+    } else {
+        format!("(({partition}), {clustering})")
+    }
+}
+
+/// `WITH CLUSTERING ORDER BY (…) AND option = literal …` or empty.
+fn with_clause(columns: &[CqlColumn], options: &[(String, String)]) -> String {
+    let mut with: Vec<String> = Vec::new();
+    let order: Vec<String> = columns
+        .iter()
+        .filter(|c| c.kind == "clustering")
+        .map(|c| format!("{} {}", quote_ident(&c.name), if c.clustering_order.eq_ignore_ascii_case("desc") { "DESC" } else { "ASC" }))
+        .collect();
+    if !order.is_empty() {
+        with.push(format!("CLUSTERING ORDER BY ({})", order.join(", ")));
+    }
+    with.extend(options.iter().map(|(k, v)| format!("{k} = {v}")));
+    if with.is_empty() {
+        String::new()
+    } else {
+        format!("\nWITH {}", with.join("\n  AND "))
+    }
+}
+
+// WHAT:  Table / view options worth echoing in DDL, in the order cqlsh prints them.
+const TABLE_OPTIONS: &[&str] = &[
+    "comment",
+    "bloom_filter_fp_chance",
+    "caching",
+    "compaction",
+    "compression",
+    "crc_check_chance",
+    "default_time_to_live",
+    "gc_grace_seconds",
+    "max_index_interval",
+    "memtable_flush_period_in_ms",
+    "min_index_interval",
+    "speculative_retry",
+    "read_repair",
+    "cdc",
+];
+
+fn option_literal(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Int(i) => Some(i.to_string()),
+        Value::Float(f) => Some(f.to_string()),
+        Value::Decimal(s) => Some(s.clone()),
+        Value::Text(s) | Value::Bytes(s) | Value::DateTime(s) | Value::Unsupported(s) => Some(quote_literal(s)),
+        Value::Json(serde_json::Value::Object(obj)) => {
+            Some(cql_map_literal(&obj.iter().map(|(k, v)| (k.clone(), json_text(v))).collect()))
+        }
+        Value::Json(other) => Some(quote_literal(&other.to_string())),
+    }
+}
+
+fn table_options(set: &ResultSet, row: &[Value]) -> Vec<(String, String)> {
+    TABLE_OPTIONS
+        .iter()
+        .filter_map(|name| {
+            let value = named_value(set, row, name)?;
+            if *name == "comment" && matches!(value, Value::Text(s) if s.is_empty()) {
+                return None;
+            }
+            option_literal(value).map(|lit| ((*name).to_string(), lit))
+        })
+        .collect()
+}
+
+fn create_table_cql(keyspace: &str, table: &str, columns: &[CqlColumn], options: &[(String, String)]) -> String {
+    let mut lines: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            let suffix = if c.kind == "static" { " STATIC" } else { "" };
+            format!("  {} {}{suffix}", quote_ident(&c.name), c.data_type)
+        })
+        .collect();
+    lines.push(format!("  PRIMARY KEY {}", primary_key_clause(columns)));
+    format!(
+        "CREATE TABLE {}.{} (\n{}\n){};",
+        quote_ident(keyspace),
+        quote_ident(table),
+        lines.join(",\n"),
+        with_clause(columns, options)
+    )
+}
+
+fn create_view_cql(
+    keyspace: &str,
+    view: &str,
+    base_table: &str,
+    where_clause: &str,
+    include_all_columns: bool,
+    columns: &[CqlColumn],
+    options: &[(String, String)],
+) -> String {
+    let select = if include_all_columns || columns.is_empty() {
+        "*".to_string()
+    } else {
+        columns.iter().map(|c| quote_ident(&c.name)).collect::<Vec<_>>().join(", ")
+    };
+    let filter = if where_clause.trim().is_empty() { String::new() } else { format!("\n  WHERE {}", where_clause.trim()) };
+    format!(
+        "CREATE MATERIALIZED VIEW {}.{} AS\n  SELECT {select}\n  FROM {}.{}{filter}\n  PRIMARY KEY {}{};",
+        quote_ident(keyspace),
+        quote_ident(view),
+        quote_ident(keyspace),
+        quote_ident(base_table),
+        primary_key_clause(columns),
+        with_clause(columns, options)
+    )
+}
+
+fn create_index_cql(keyspace: &str, table: &str, index: &str, kind: &str, options: &BTreeMap<String, String>) -> String {
+    let target = options.get("target").cloned().unwrap_or_default();
+    let on = format!("{}.{}", quote_ident(keyspace), quote_ident(table));
+    match (kind.eq_ignore_ascii_case("CUSTOM"), options.get("class_name")) {
+        (true, Some(class)) => {
+            let extra: BTreeMap<String, String> =
+                options.iter().filter(|(k, _)| k.as_str() != "target" && k.as_str() != "class_name").map(|(k, v)| (k.clone(), v.clone())).collect();
+            let with = if extra.is_empty() { String::new() } else { format!(" WITH OPTIONS = {}", cql_map_literal(&extra)) };
+            format!("CREATE CUSTOM INDEX {} ON {on} ({target}) USING {}{with};", quote_ident(index), quote_literal(class))
+        }
+        _ => format!("CREATE INDEX {} ON {on} ({target});", quote_ident(index)),
+    }
+}
+
+fn create_type_cql(keyspace: &str, name: &str, fields: &[(String, String)]) -> String {
+    let lines: Vec<String> = fields.iter().map(|(f, t)| format!("  {} {t}", quote_ident(f))).collect();
+    format!("CREATE TYPE {}.{} (\n{}\n);", quote_ident(keyspace), quote_ident(name), lines.join(",\n"))
+}
+
+/// `"a" int, "b" text` — names are optional in system_schema (older servers).
+fn function_args(arg_names: &[String], arg_types: &[String]) -> Vec<String> {
+    arg_types
+        .iter()
+        .enumerate()
+        .map(|(i, t)| match arg_names.get(i) {
+            Some(n) => format!("{} {t}", quote_ident(n)),
+            None => t.clone(),
+        })
+        .collect()
+}
+
+fn create_function_cql(keyspace: &str, name: &str, args: &[String], called_on_null: bool, return_type: &str, language: &str, body: &str) -> String {
+    let null_clause = if called_on_null { "CALLED ON NULL INPUT" } else { "RETURNS NULL ON NULL INPUT" };
+    format!(
+        "CREATE FUNCTION {}.{}({})\n  {null_clause}\n  RETURNS {return_type}\n  LANGUAGE {language}\n  AS $${body}$$;",
+        quote_ident(keyspace),
+        quote_ident(name),
+        args.join(", ")
+    )
+}
+
+fn create_aggregate_cql(
+    keyspace: &str,
+    name: &str,
+    arg_types: &[String],
+    state_func: &str,
+    state_type: &str,
+    final_func: Option<&str>,
+    initcond: Option<&str>,
+) -> String {
+    let mut text = format!(
+        "CREATE AGGREGATE {}.{}({})\n  SFUNC {}\n  STYPE {state_type}",
+        quote_ident(keyspace),
+        quote_ident(name),
+        arg_types.join(", "),
+        quote_ident(state_func)
+    );
+    if let Some(f) = final_func.filter(|f| !f.is_empty()) {
+        text.push_str(&format!("\n  FINALFUNC {}", quote_ident(f)));
+    }
+    if let Some(init) = initcond.filter(|i| !i.is_empty()) {
+        text.push_str(&format!("\n  INITCOND {init}"));
+    }
+    text.push(';');
+    text
+}
+
+/// `name(int, text)` ↔ (name, [int, text]); overloads share a name, so the
+/// explorer reference carries the argument types.
+fn signature(name: &str, arg_types: &[String]) -> String {
+    format!("{name}({})", arg_types.join(", "))
+}
+
+fn parse_signature(text: &str) -> (String, Vec<String>) {
+    match text.split_once('(') {
+        Some((name, rest)) => {
+            let inner = rest.trim_end().trim_end_matches(')');
+            let mut args = Vec::new();
+            let mut depth = 0i32;
+            let mut current = String::new();
+            for c in inner.chars() {
+                match c {
+                    '<' => {
+                        depth += 1;
+                        current.push(c);
+                    }
+                    '>' => {
+                        depth -= 1;
+                        current.push(c);
+                    }
+                    ',' if depth == 0 => {
+                        args.push(current.trim().to_string());
+                        current.clear();
+                    }
+                    _ => current.push(c),
+                }
+            }
+            if !current.trim().is_empty() {
+                args.push(current.trim().to_string());
+            }
+            (name.trim().to_string(), args)
+        }
+        None => (text.trim().to_string(), Vec::new()),
+    }
+}
+
+/// system_auth resource (`data/ks/t`, `roles/x`, `functions/ks`) → CQL resource for GRANT / REVOKE.
+fn cql_resource(resource: &str) -> Option<String> {
+    let parts: Vec<&str> = resource.split('/').collect();
+    match parts.as_slice() {
+        ["data"] => Some("ALL KEYSPACES".to_string()),
+        ["data", ks] => Some(format!("KEYSPACE {}", quote_ident(ks))),
+        ["data", ks, table] => Some(format!("TABLE {}.{}", quote_ident(ks), quote_ident(table))),
+        ["roles"] => Some("ALL ROLES".to_string()),
+        ["roles", role] => Some(format!("ROLE {}", quote_ident(role))),
+        ["functions"] => Some("ALL FUNCTIONS".to_string()),
+        ["functions", ks] => Some(format!("ALL FUNCTIONS IN KEYSPACE {}", quote_ident(ks))),
+        _ => None,
+    }
+}
+
+fn dotted(keyspace: &str, name: &str) -> String {
+    format!("{}.{}", quote_ident(keyspace), quote_ident(name))
+}
+
+fn parent_keyspace(reference: &ObjectRef, fallback: Option<&str>) -> AppResult<String> {
+    reference
+        .parent
+        .as_deref()
+        .map(|p| p.split_once('.').map(|(ks, _)| ks).unwrap_or(p))
+        .or(fallback)
+        .map(str::to_string)
+        .ok_or_else(|| AppError::invalid_input("No keyspace selected. Set the keyspace on the connection."))
+}
+
+fn short_class(class: &str) -> String {
+    class.rsplit('.').next().unwrap_or(class).to_string()
+}
+
+impl CassandraIntegration {
+    // WHAT:  `SELECT * FROM system_schema.<table>` for one keyspace or every user keyspace.
+    async fn schema_rows(&self, table: &str, keyspace: Option<&str>) -> AppResult<ResultSet> {
+        let cql = match keyspace {
+            Some(ks) => format!("SELECT * FROM system_schema.{table} WHERE keyspace_name = {}", quote_literal(ks)),
+            None => format!("SELECT * FROM system_schema.{table}"),
+        };
+        let mut set = run(&self.session, &cql, usize::MAX).await?;
+        if keyspace.is_none() {
+            let idx = column_index(&set, "keyspace_name");
+            set.rows.retain(|row| idx.and_then(|i| row.get(i)).map(local_text).is_some_and(|ks| !is_system_keyspace(&ks)));
+        }
+        Ok(set)
+    }
+
+    async fn schema_row(&self, table: &str, keyspace: &str, name_column: &str, name: &str) -> AppResult<Option<(ResultSet, Vec<Value>)>> {
+        let set = self.schema_rows(table, Some(keyspace)).await?;
+        let row = set.rows.iter().find(|row| named_text(&set, row, name_column) == name).cloned();
+        Ok(row.map(|row| (set, row)))
+    }
+
+    async fn columns_of(&self, keyspace: &str, table: &str) -> AppResult<Vec<CqlColumn>> {
+        let cql = format!(
+            "SELECT column_name, kind, position, type, clustering_order FROM system_schema.columns WHERE keyspace_name = {} AND table_name = {}",
+            quote_literal(keyspace),
+            quote_literal(table)
+        );
+        let set = run(&self.session, &cql, usize::MAX).await?;
+        Ok(cql_columns(&set))
+    }
+
+    async fn list_keyspaces_objects(&self) -> AppResult<Vec<ObjectSummary>> {
+        let set = self.schema_rows("keyspaces", None).await?;
+        Ok(set
+            .rows
+            .iter()
+            .map(|row| {
+                let name = named_text(&set, row, "keyspace_name");
+                let replication = named_map(&set, row, "replication");
+                let mut summary = ObjectSummary::new(ObjectKind::Keyspace, name, None).with_detail(replication_summary(&replication));
+                if named_bool(&set, row, "durable_writes") == Some(false) {
+                    summary = summary.with_badge("no durable writes");
+                }
+                summary
+            })
+            .collect())
+    }
+
+    async fn list_tables_objects(&self, keyspace: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let set = self.schema_rows("tables", keyspace).await?;
+        Ok(set
+            .rows
+            .iter()
+            .map(|row| {
+                let ks = named_text(&set, row, "keyspace_name");
+                let name = named_text(&set, row, "table_name");
+                let mut summary = ObjectSummary::new(ObjectKind::Table, name, Some(ks));
+                let comment = named_text(&set, row, "comment");
+                if !comment.is_empty() {
+                    summary = summary.with_detail(comment);
+                }
+                let ttl = named_i64(&set, row, "default_time_to_live").unwrap_or(0);
+                if ttl > 0 {
+                    summary = summary.with_badge(format!("ttl {ttl}s"));
+                }
+                summary
+            })
+            .collect())
+    }
+
+    async fn list_views_objects(&self, keyspace: Option<&str>, base_table: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let set = self.schema_rows("views", keyspace).await?;
+        Ok(set
+            .rows
+            .iter()
+            .filter(|row| base_table.is_none_or(|t| named_text(&set, row, "base_table_name") == t))
+            .map(|row| {
+                let ks = named_text(&set, row, "keyspace_name");
+                let name = named_text(&set, row, "view_name");
+                let base = named_text(&set, row, "base_table_name");
+                ObjectSummary::new(ObjectKind::MaterializedView, name, Some(ks)).with_detail(format!("on {base}"))
+            })
+            .collect())
+    }
+
+    async fn list_indexes_objects(&self, keyspace: Option<&str>, table: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let set = self.schema_rows("indexes", keyspace).await?;
+        Ok(set
+            .rows
+            .iter()
+            .filter(|row| table.is_none_or(|t| named_text(&set, row, "table_name") == t))
+            .map(|row| {
+                let ks = named_text(&set, row, "keyspace_name");
+                let name = named_text(&set, row, "index_name");
+                let table = named_text(&set, row, "table_name");
+                let options = named_map(&set, row, "options");
+                let target = options.get("target").cloned().unwrap_or_default();
+                ObjectSummary::new(ObjectKind::Index, name, Some(ks))
+                    .with_detail(format!("{table} ({target})"))
+                    .with_badge(named_text(&set, row, "kind").to_ascii_lowercase())
+            })
+            .collect())
+    }
+
+    async fn list_types_objects(&self, keyspace: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let set = self.schema_rows("types", keyspace).await?;
+        Ok(set
+            .rows
+            .iter()
+            .map(|row| {
+                let ks = named_text(&set, row, "keyspace_name");
+                let name = named_text(&set, row, "type_name");
+                let fields = named_list(&set, row, "field_names");
+                ObjectSummary::new(ObjectKind::Type, name, Some(ks)).with_detail(format!("{} fields", fields.len())).with_badge("udt")
+            })
+            .collect())
+    }
+
+    async fn list_functions_objects(&self, keyspace: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let set = self.schema_rows("functions", keyspace).await?;
+        Ok(set
+            .rows
+            .iter()
+            .map(|row| {
+                let ks = named_text(&set, row, "keyspace_name");
+                let name = named_text(&set, row, "function_name");
+                let arg_types = named_list(&set, row, "argument_types");
+                let returns = named_text(&set, row, "return_type");
+                ObjectSummary::new(ObjectKind::Function, signature(&name, &arg_types), Some(ks))
+                    .with_detail(format!("→ {returns}"))
+                    .with_badge(named_text(&set, row, "language"))
+            })
+            .collect())
+    }
+
+    async fn list_aggregates_objects(&self, keyspace: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let set = self.schema_rows("aggregates", keyspace).await?;
+        Ok(set
+            .rows
+            .iter()
+            .map(|row| {
+                let ks = named_text(&set, row, "keyspace_name");
+                let name = named_text(&set, row, "aggregate_name");
+                let arg_types = named_list(&set, row, "argument_types");
+                let returns = named_text(&set, row, "return_type");
+                ObjectSummary::new(ObjectKind::Aggregate, signature(&name, &arg_types), Some(ks)).with_detail(format!("→ {returns}"))
+            })
+            .collect())
+    }
+
+    async fn auth_rows(&self, cql: &str) -> AppResult<ResultSet> {
+        run(&self.session, cql, MAX_OBJECTS).await.map_err(|e| {
+            AppError::driver(format!("{e} — reading system_auth needs a superuser or SELECT permission on system_auth (roles created with authentication enabled)."))
+        })
+    }
+
+    async fn list_roles_objects(&self) -> AppResult<Vec<ObjectSummary>> {
+        let set = self.auth_rows("SELECT role, can_login, is_superuser, member_of FROM system_auth.roles").await?;
+        Ok(set
+            .rows
+            .iter()
+            .map(|row| {
+                let name = named_text(&set, row, "role");
+                let members = named_list(&set, row, "member_of");
+                let mut summary = ObjectSummary::new(ObjectKind::Role, name, None);
+                if !members.is_empty() {
+                    summary = summary.with_detail(format!("member of {}", members.join(", ")));
+                }
+                if named_bool(&set, row, "is_superuser") == Some(true) {
+                    summary = summary.with_badge("superuser");
+                } else if named_bool(&set, row, "can_login") == Some(true) {
+                    summary = summary.with_badge("login");
+                }
+                summary
+            })
+            .collect())
+    }
+
+    async fn list_grants_objects(&self) -> AppResult<Vec<ObjectSummary>> {
+        let set = self.auth_rows("SELECT role, resource, permissions FROM system_auth.role_permissions").await?;
+        Ok(set
+            .rows
+            .iter()
+            .map(|row| {
+                let role = named_text(&set, row, "role");
+                let resource = named_text(&set, row, "resource");
+                let permissions = named_list(&set, row, "permissions");
+                ObjectSummary::new(ObjectKind::Grant, resource, Some(role)).with_detail(permissions.join(", "))
+            })
+            .collect())
+    }
+
+    async fn list_nodes_objects(&self) -> AppResult<Vec<ObjectSummary>> {
+        let local = run(&self.session, "SELECT * FROM system.local", 1).await?;
+        let mut out = Vec::new();
+        for row in &local.rows {
+            out.push(
+                ObjectSummary::new(ObjectKind::Node, node_address(&local, row), None).with_detail(node_caption(&local, row)).with_badge("local"),
+            );
+        }
+        let peers = run(&self.session, "SELECT * FROM system.peers", MAX_OBJECTS).await?;
+        for row in &peers.rows {
+            out.push(ObjectSummary::new(ObjectKind::Node, node_address(&peers, row), None).with_detail(node_caption(&peers, row)));
+        }
+        Ok(out)
+    }
+
+    // WHAT:  system_views.settings exists from Cassandra 4.0; older servers and
+    //        ScyllaDB simply have no settings to list.
+    async fn list_settings_objects(&self) -> AppResult<Vec<ObjectSummary>> {
+        let Ok(set) = run(&self.session, "SELECT name, value FROM system_views.settings", MAX_OBJECTS).await else {
+            return Ok(Vec::new());
+        };
+        Ok(set
+            .rows
+            .iter()
+            .map(|row| {
+                let name = named_text(&set, row, "name");
+                let value = named_text(&set, row, "value");
+                ObjectSummary::new(ObjectKind::Setting, name, None).with_detail(value)
+            })
+            .collect())
+    }
+
+    async fn keyspace_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let ks = &reference.name;
+        let Some((set, row)) = self.schema_row("keyspaces", ks, "keyspace_name", ks).await? else {
+            return Err(AppError::not_found(format!("Keyspace {ks} not found.")));
+        };
+        let replication = named_map(&set, &row, "replication");
+        let durable = named_bool(&set, &row, "durable_writes").unwrap_or(true);
+        let ddl = format!("CREATE KEYSPACE {} WITH replication = {} AND durable_writes = {durable};", quote_ident(ks), cql_map_literal(&replication));
+        let mut children = self.list_tables_objects(Some(ks)).await?;
+        children.extend(self.list_views_objects(Some(ks), None).await.unwrap_or_default());
+        children.extend(self.list_types_objects(Some(ks)).await.unwrap_or_default());
+        let mut detail = ObjectDetail::empty(reference)
+            .definition(ddl, CodeLanguage::Sql)
+            .property("replication", replication_summary(&replication))
+            .property("durable_writes", durable.to_string());
+        for (k, v) in &replication {
+            detail = detail.property(k, v.clone());
+        }
+        detail.children = children;
+        Ok(detail.action(ObjectAction::destructive("drop", "Drop keyspace", format!("DROP KEYSPACE {}", quote_ident(ks)))))
+    }
+
+    async fn table_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let ks = parent_keyspace(reference, self.keyspace.as_deref())?;
+        let table = &reference.name;
+        let Some((set, row)) = self.schema_row("tables", &ks, "table_name", table).await? else {
+            return Err(AppError::not_found(format!("Table {ks}.{table} not found.")));
+        };
+        let columns = self.columns_of(&ks, table).await?;
+        let options = table_options(&set, &row);
+        let ddl = create_table_cql(&ks, table, &columns, &options);
+        let mut detail = ObjectDetail::empty(reference).definition(ddl, CodeLanguage::Sql);
+        detail.columns = column_infos(&columns);
+        let id = named_text(&set, &row, "id");
+        if !id.is_empty() {
+            detail = detail.property("id", id);
+        }
+        let compaction = named_map(&set, &row, "compaction");
+        if let Some(class) = compaction.get("class") {
+            detail = detail.property("compaction", short_class(class));
+        }
+        let compression = named_map(&set, &row, "compression");
+        if let Some(class) = compression.get("class") {
+            detail = detail.property("compression", short_class(class));
+        }
+        for name in ["comment", "gc_grace_seconds", "default_time_to_live", "bloom_filter_fp_chance", "speculative_retry"] {
+            let value = named_text(&set, &row, name);
+            if !value.is_empty() {
+                detail = detail.property(name, value);
+            }
+        }
+        let flags = named_list(&set, &row, "flags");
+        if !flags.is_empty() {
+            detail = detail.property("flags", flags.join(", "));
+        }
+        let mut children = self.list_indexes_objects(Some(&ks), Some(table)).await.unwrap_or_default();
+        children.extend(self.list_views_objects(Some(&ks), Some(table)).await.unwrap_or_default());
+        detail.children = children;
+        let name = dotted(&ks, table);
+        Ok(detail
+            .action(ObjectAction::destructive("truncate", "Truncate table", format!("TRUNCATE TABLE {name}")))
+            .action(ObjectAction::destructive("drop", "Drop table", format!("DROP TABLE {name}"))))
+    }
+
+    async fn view_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let ks = parent_keyspace(reference, self.keyspace.as_deref())?;
+        let view = &reference.name;
+        let Some((set, row)) = self.schema_row("views", &ks, "view_name", view).await? else {
+            return Err(AppError::not_found(format!("Materialized view {ks}.{view} not found.")));
+        };
+        let columns = self.columns_of(&ks, view).await?;
+        let base = named_text(&set, &row, "base_table_name");
+        let where_clause = named_text(&set, &row, "where_clause");
+        let include_all = named_bool(&set, &row, "include_all_columns").unwrap_or(false);
+        let options = table_options(&set, &row);
+        let ddl = create_view_cql(&ks, view, &base, &where_clause, include_all, &columns, &options);
+        let mut detail = ObjectDetail::empty(reference)
+            .definition(ddl, CodeLanguage::Sql)
+            .property("base_table", base)
+            .property("where", where_clause)
+            .property("include_all_columns", include_all.to_string());
+        detail.columns = column_infos(&columns);
+        Ok(detail.action(ObjectAction::destructive("drop", "Drop materialized view", format!("DROP MATERIALIZED VIEW {}", dotted(&ks, view)))))
+    }
+
+    async fn index_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let ks = parent_keyspace(reference, self.keyspace.as_deref())?;
+        let index = &reference.name;
+        let Some((set, row)) = self.schema_row("indexes", &ks, "index_name", index).await? else {
+            return Err(AppError::not_found(format!("Index {ks}.{index} not found.")));
+        };
+        let table = named_text(&set, &row, "table_name");
+        let kind = named_text(&set, &row, "kind");
+        let options = named_map(&set, &row, "options");
+        let ddl = create_index_cql(&ks, &table, index, &kind, &options);
+        let mut detail = ObjectDetail::empty(reference).definition(ddl, CodeLanguage::Sql).property("table", table).property("kind", kind);
+        for (k, v) in &options {
+            detail = detail.property(k, v.clone());
+        }
+        Ok(detail.action(ObjectAction::destructive("drop", "Drop index", format!("DROP INDEX {}", dotted(&ks, index)))))
+    }
+
+    async fn type_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let ks = parent_keyspace(reference, self.keyspace.as_deref())?;
+        let name = &reference.name;
+        let Some((set, row)) = self.schema_row("types", &ks, "type_name", name).await? else {
+            return Err(AppError::not_found(format!("Type {ks}.{name} not found.")));
+        };
+        let names = named_list(&set, &row, "field_names");
+        let types = named_list(&set, &row, "field_types");
+        let fields: Vec<(String, String)> = names.iter().cloned().zip(types.iter().cloned()).collect();
+        let mut detail = ObjectDetail::empty(reference).definition(create_type_cql(&ks, name, &fields), CodeLanguage::Sql);
+        detail.columns = fields
+            .iter()
+            .enumerate()
+            .map(|(i, (f, t))| ColumnInfo { name: f.clone(), data_type: t.clone(), nullable: true, primary_key: false, ordinal: i as u32 + 1 })
+            .collect();
+        Ok(detail.action(ObjectAction::destructive("drop", "Drop type", format!("DROP TYPE {}", dotted(&ks, name)))))
+    }
+
+    async fn function_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let ks = parent_keyspace(reference, self.keyspace.as_deref())?;
+        let (name, args) = parse_signature(&reference.name);
+        let set = self.schema_rows("functions", Some(&ks)).await?;
+        let row = set
+            .rows
+            .iter()
+            .find(|row| named_text(&set, row, "function_name") == name && (args.is_empty() || named_list(&set, row, "argument_types") == args))
+            .cloned()
+            .ok_or_else(|| AppError::not_found(format!("Function {ks}.{} not found.", reference.name)))?;
+        let arg_types = named_list(&set, &row, "argument_types");
+        let arg_names = named_list(&set, &row, "argument_names");
+        let language = named_text(&set, &row, "language");
+        let returns = named_text(&set, &row, "return_type");
+        let body = named_text(&set, &row, "body");
+        let called_on_null = named_bool(&set, &row, "called_on_null_input").unwrap_or(false);
+        let ddl = create_function_cql(&ks, &name, &function_args(&arg_names, &arg_types), called_on_null, &returns, &language, &body);
+        let drop = format!("DROP FUNCTION {}({})", dotted(&ks, &name), arg_types.join(", "));
+        Ok(ObjectDetail::empty(reference)
+            .definition(ddl, CodeLanguage::Sql)
+            .property("language", language)
+            .property("returns", returns)
+            .property("called_on_null_input", called_on_null.to_string())
+            .action(ObjectAction::destructive("drop", "Drop function", drop)))
+    }
+
+    async fn aggregate_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let ks = parent_keyspace(reference, self.keyspace.as_deref())?;
+        let (name, args) = parse_signature(&reference.name);
+        let set = self.schema_rows("aggregates", Some(&ks)).await?;
+        let row = set
+            .rows
+            .iter()
+            .find(|row| named_text(&set, row, "aggregate_name") == name && (args.is_empty() || named_list(&set, row, "argument_types") == args))
+            .cloned()
+            .ok_or_else(|| AppError::not_found(format!("Aggregate {ks}.{} not found.", reference.name)))?;
+        let arg_types = named_list(&set, &row, "argument_types");
+        let state_func = named_text(&set, &row, "state_func");
+        let state_type = named_text(&set, &row, "state_type");
+        let final_func = named_text(&set, &row, "final_func");
+        let initcond = named_text(&set, &row, "initcond");
+        let returns = named_text(&set, &row, "return_type");
+        let ddl = create_aggregate_cql(&ks, &name, &arg_types, &state_func, &state_type, Some(&final_func), Some(&initcond));
+        let drop = format!("DROP AGGREGATE {}({})", dotted(&ks, &name), arg_types.join(", "));
+        Ok(ObjectDetail::empty(reference)
+            .definition(ddl, CodeLanguage::Sql)
+            .property("state_func", state_func)
+            .property("state_type", state_type)
+            .property("final_func", final_func)
+            .property("returns", returns)
+            .action(ObjectAction::destructive("drop", "Drop aggregate", drop)))
+    }
+
+    async fn role_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let role = &reference.name;
+        let set = self.auth_rows(&format!("SELECT role, can_login, is_superuser, member_of FROM system_auth.roles WHERE role = {}", quote_literal(role))).await?;
+        let row = set.rows.first().cloned().ok_or_else(|| AppError::not_found(format!("Role {role} not found.")))?;
+        let login = named_bool(&set, &row, "can_login").unwrap_or(false);
+        let superuser = named_bool(&set, &row, "is_superuser").unwrap_or(false);
+        let members = named_list(&set, &row, "member_of");
+        let ddl = format!("CREATE ROLE {} WITH LOGIN = {login} AND SUPERUSER = {superuser};", quote_ident(role));
+        let grants = self
+            .auth_rows(&format!("SELECT resource, permissions FROM system_auth.role_permissions WHERE role = {}", quote_literal(role)))
+            .await
+            .unwrap_or(ResultSet { columns: vec![], rows: vec![], truncated: false });
+        let mut detail = ObjectDetail::empty(reference)
+            .definition(ddl, CodeLanguage::Sql)
+            .property("can_login", login.to_string())
+            .property("is_superuser", superuser.to_string())
+            .property("member_of", members.join(", "));
+        detail.rows = Some(grants);
+        Ok(detail.action(ObjectAction::destructive("drop", "Drop role", format!("DROP ROLE {}", quote_ident(role)))))
+    }
+
+    async fn grant_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let role = reference.parent.clone().ok_or_else(|| AppError::invalid_input("A grant reference needs its role as parent."))?;
+        let resource = &reference.name;
+        let set = self
+            .auth_rows(&format!("SELECT resource, permissions FROM system_auth.role_permissions WHERE role = {}", quote_literal(&role)))
+            .await?;
+        let row = set
+            .rows
+            .iter()
+            .find(|row| named_text(&set, row, "resource") == *resource)
+            .cloned()
+            .ok_or_else(|| AppError::not_found(format!("No grant on {resource} for {role}.")))?;
+        let permissions = named_list(&set, &row, "permissions");
+        let mut detail = ObjectDetail::empty(reference).property("role", role.clone()).property("resource", resource.clone()).property("permissions", permissions.join(", "));
+        if let Some(target) = cql_resource(resource) {
+            let grant = format!("GRANT {} ON {target} TO {};", permissions.join(", "), quote_ident(&role));
+            detail = detail
+                .definition(grant, CodeLanguage::Sql)
+                .action(ObjectAction::destructive("revoke", "Revoke all permissions", format!("REVOKE ALL PERMISSIONS ON {target} FROM {}", quote_ident(&role))));
+        }
+        Ok(detail)
+    }
+
+    async fn node_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let local = run(&self.session, "SELECT * FROM system.local", 1).await?;
+        let found = local.rows.iter().find(|row| node_address(&local, row) == reference.name).map(|row| (local.clone(), row.clone(), true));
+        let found = match found {
+            Some(f) => Some(f),
+            None => {
+                let peers = run(&self.session, "SELECT * FROM system.peers", MAX_OBJECTS).await?;
+                peers.rows.iter().find(|row| node_address(&peers, row) == reference.name).map(|row| (peers.clone(), row.clone(), false))
+            }
+        };
+        let Some((set, row, is_local)) = found else {
+            return Err(AppError::not_found(format!("Node {} not found in system.local / system.peers.", reference.name)));
+        };
+        let mut detail = ObjectDetail::empty(reference).property("local", is_local.to_string());
+        for (i, column) in set.columns.iter().enumerate() {
+            let Some(value) = row.get(i).filter(|v| !matches!(v, Value::Null)) else { continue };
+            if column.name == "tokens" {
+                if let Value::Json(serde_json::Value::Array(tokens)) = value {
+                    detail = detail.property("tokens", format!("{} tokens", tokens.len()));
+                }
+                continue;
+            }
+            detail = detail.property(&column.name, local_text(value));
+        }
+        Ok(detail)
+    }
+
+    async fn setting_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let set = run(&self.session, &format!("SELECT name, value FROM system_views.settings WHERE name = {}", quote_literal(&reference.name)), 1).await?;
+        let row = set.rows.first().cloned().ok_or_else(|| AppError::not_found(format!("Setting {} not found.", reference.name)))?;
+        let value = named_text(&set, &row, "value");
+        Ok(ObjectDetail::empty(reference).definition(format!("{} = {value}", reference.name), CodeLanguage::Text).property("value", value))
+    }
+}
+
+fn node_address(set: &ResultSet, row: &[Value]) -> String {
+    ["broadcast_address", "rpc_address", "peer", "listen_address"]
+        .iter()
+        .map(|c| named_text(set, row, c))
+        .find(|v| !v.is_empty())
+        .unwrap_or_else(|| named_text(set, row, "host_id"))
+}
+
+fn node_caption(set: &ResultSet, row: &[Value]) -> String {
+    let dc = named_text(set, row, "data_center");
+    let rack = named_text(set, row, "rack");
+    let version = named_text(set, row, "release_version");
+    let mut parts = Vec::new();
+    if !dc.is_empty() || !rack.is_empty() {
+        parts.push(format!("{dc} / {rack}"));
+    }
+    if !version.is_empty() {
+        parts.push(version);
+    }
+    parts.join(" · ")
+}
+
 // WHAT:  What this family offers the object explorer and the tool tabs.
 // WHY:   Declared here, next to the adapter that must answer `objects()` for
 //        every kind listed; rendered by the capability matrix for every engine.
@@ -941,6 +1857,132 @@ impl Integration for CassandraIntegration {
             pk
         )))
     }
+
+    async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        // `ks.table` parents come from a table's children list; plain parents are keyspaces.
+        let (keyspace, table) = match parent.and_then(|p| p.split_once('.')) {
+            Some((ks, t)) => (Some(ks), Some(t)),
+            None => (parent, None),
+        };
+        let mut out = match kind {
+            ObjectKind::Keyspace => self.list_keyspaces_objects().await?,
+            ObjectKind::Table => self.list_tables_objects(keyspace).await?,
+            ObjectKind::MaterializedView => self.list_views_objects(keyspace, table).await?,
+            ObjectKind::Index => self.list_indexes_objects(keyspace, table).await?,
+            ObjectKind::Type => self.list_types_objects(keyspace).await?,
+            ObjectKind::Function => self.list_functions_objects(keyspace).await?,
+            ObjectKind::Aggregate => self.list_aggregates_objects(keyspace).await?,
+            ObjectKind::Role => self.list_roles_objects().await?,
+            ObjectKind::Grant => self.list_grants_objects().await?,
+            ObjectKind::Node => self.list_nodes_objects().await?,
+            ObjectKind::Setting => self.list_settings_objects().await?,
+            _ => Vec::new(),
+        };
+        if kind != ObjectKind::Node {
+            out.sort_by(|a, b| a.reference.parent.cmp(&b.reference.parent).then(a.reference.name.cmp(&b.reference.name)));
+        }
+        out.truncate(MAX_OBJECTS);
+        Ok(out)
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        match reference.kind {
+            ObjectKind::Keyspace => self.keyspace_detail(reference).await,
+            ObjectKind::Table => self.table_detail(reference).await,
+            ObjectKind::MaterializedView => self.view_detail(reference).await,
+            ObjectKind::Index => self.index_detail(reference).await,
+            ObjectKind::Type => self.type_detail(reference).await,
+            ObjectKind::Function => self.function_detail(reference).await,
+            ObjectKind::Aggregate => self.aggregate_detail(reference).await,
+            ObjectKind::Role => self.role_detail(reference).await,
+            ObjectKind::Grant => self.grant_detail(reference).await,
+            ObjectKind::Node => self.node_detail(reference).await,
+            ObjectKind::Setting => self.setting_detail(reference).await,
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    // WHAT:  Cluster identity from system.local, node count from system.peers,
+    //        schema counts from system_schema and a size estimate for the
+    //        current keyspace from system.size_estimates (partitions × mean size).
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        let local = run(
+            &self.session,
+            "SELECT cluster_name, release_version, partitioner, data_center, rack, cql_version, native_protocol_version FROM system.local",
+            1,
+        )
+        .await?;
+        let row = local.rows.first().cloned().unwrap_or_default();
+        let peers = run(&self.session, "SELECT peer FROM system.peers", usize::MAX).await.map(|s| s.rows.len()).unwrap_or(0);
+        let label = if matches!(self.engine, Engine::Scylladb) { "ScyllaDB" } else { "Cassandra" };
+        let mut server = vec![
+            Stat::text("Version", format!("{label} {}", named_text(&local, &row, "release_version"))),
+            Stat::text("Cluster", named_text(&local, &row, "cluster_name")),
+            Stat::text("Partitioner", short_class(&named_text(&local, &row, "partitioner"))),
+        ];
+        let cql = named_text(&local, &row, "cql_version");
+        if !cql.is_empty() {
+            server.push(Stat::text("CQL version", cql));
+        }
+        let cluster = vec![
+            Stat::number("Nodes", (peers + 1) as f64, None).with_hint("system.local + system.peers"),
+            Stat::number("Peers", peers as f64, None),
+            Stat::text("Local DC / rack", format!("{} / {}", named_text(&local, &row, "data_center"), named_text(&local, &row, "rack"))),
+        ];
+        let count = |set: AppResult<ResultSet>| -> f64 {
+            set.map(|s| {
+                let idx = column_index(&s, "keyspace_name");
+                s.rows.iter().filter(|r| idx.and_then(|i| r.get(i)).map(local_text).is_some_and(|ks| !is_system_keyspace(&ks))).count() as f64
+            })
+            .unwrap_or(0.0)
+        };
+        let keyspaces_all = run(&self.session, "SELECT keyspace_name FROM system_schema.keyspaces", usize::MAX).await;
+        let system_keyspaces = keyspaces_all.as_ref().map(|s| s.rows.len()).unwrap_or(0) as f64;
+        let user_keyspaces = count(keyspaces_all);
+        let schema = vec![
+            Stat::number("Keyspaces", user_keyspaces, None).with_hint(format!("{} including system", system_keyspaces)),
+            Stat::number("Tables", count(run(&self.session, "SELECT keyspace_name FROM system_schema.tables", usize::MAX).await), None),
+            Stat::number("Materialized views", count(run(&self.session, "SELECT keyspace_name FROM system_schema.views", usize::MAX).await), None),
+            Stat::number("Indexes", count(run(&self.session, "SELECT keyspace_name FROM system_schema.indexes", usize::MAX).await), None),
+            Stat::number("Types", count(run(&self.session, "SELECT keyspace_name FROM system_schema.types", usize::MAX).await), None),
+            Stat::number("Functions", count(run(&self.session, "SELECT keyspace_name FROM system_schema.functions", usize::MAX).await), None),
+        ];
+        let mut groups = vec![
+            StatGroup { title: "Server".into(), stats: server },
+            StatGroup { title: "Cluster".into(), stats: cluster },
+            StatGroup { title: "Schema".into(), stats: schema },
+        ];
+        if let Some(ks) = &self.keyspace {
+            let cql = format!(
+                "SELECT table_name, partitions_count, mean_partition_size FROM system.size_estimates WHERE keyspace_name = {}",
+                quote_literal(ks)
+            );
+            if let Ok(set) = run(&self.session, &cql, usize::MAX).await {
+                let mut partitions = 0f64;
+                let mut bytes = 0f64;
+                let mut tables: Vec<String> = Vec::new();
+                for r in &set.rows {
+                    let count = named_i64(&set, r, "partitions_count").unwrap_or(0) as f64;
+                    let mean = named_i64(&set, r, "mean_partition_size").unwrap_or(0) as f64;
+                    partitions += count;
+                    bytes += count * mean;
+                    let table = named_text(&set, r, "table_name");
+                    if !tables.contains(&table) {
+                        tables.push(table);
+                    }
+                }
+                groups.push(StatGroup {
+                    title: format!("Storage · {ks}"),
+                    stats: vec![
+                        Stat::number("Estimated partitions", partitions, None).with_hint("sum of system.size_estimates.partitions_count"),
+                        Stat::number("Estimated size", (bytes / 1_048_576.0 * 10.0).round() / 10.0, Some("MB")).with_hint(format_bytes(bytes)),
+                        Stat::number("Tables with estimates", tables.len() as f64, None),
+                    ],
+                });
+            }
+        }
+        Ok(ServerStats::now(groups))
+    }
 }
 
 #[cfg(test)]
@@ -1043,6 +2085,133 @@ mod tests {
         assert_eq!(cql_literal("42", "int"), "42");
         assert_eq!(cql_literal("42", "text"), "'42'");
         assert_eq!(cql_literal("TRUE", "boolean"), "true");
+    }
+
+    fn set(columns: &[&str], rows: Vec<Vec<Value>>) -> ResultSet {
+        ResultSet {
+            columns: columns.iter().map(|c| ColumnMeta { name: (*c).to_string(), type_name: "text".into() }).collect(),
+            rows,
+            truncated: false,
+        }
+    }
+
+    fn t(s: &str) -> Value {
+        Value::Text(s.into())
+    }
+
+    #[test]
+    fn create_table_ddl_reconstructs_keys_order_and_options() {
+        let columns = set(
+            &["column_name", "kind", "position", "type", "clustering_order"],
+            vec![
+                vec![t("body"), t("regular"), Value::Int(-1), t("text"), t("none")],
+                vec![t("ts"), t("clustering"), Value::Int(0), t("timestamp"), t("desc")],
+                vec![t("id"), t("partition_key"), Value::Int(0), t("uuid"), t("none")],
+                vec![t("bucket"), t("partition_key"), Value::Int(1), t("int"), t("none")],
+                vec![t("owner"), t("static"), Value::Int(-1), t("text"), t("none")],
+            ],
+        );
+        let cols = cql_columns(&columns);
+        assert_eq!(cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["id", "bucket", "ts", "owner", "body"]);
+        let infos = column_infos(&cols);
+        assert!(infos[0].primary_key && infos[2].primary_key && !infos[3].primary_key);
+        let table_row = set(
+            &["comment", "gc_grace_seconds", "compaction", "default_time_to_live", "bloom_filter_fp_chance"],
+            vec![vec![
+                t("it's events"),
+                Value::Int(864000),
+                Value::Json(serde_json::json!({"class": "org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy", "max_threshold": "32"})),
+                Value::Int(0),
+                Value::Float(0.01),
+            ]],
+        );
+        let options = table_options(&table_row, &table_row.rows[0]);
+        let ddl = create_table_cql("ks", "events", &cols, &options);
+        assert_eq!(
+            ddl,
+            "CREATE TABLE \"ks\".\"events\" (\n  \"id\" uuid,\n  \"bucket\" int,\n  \"ts\" timestamp,\n  \"owner\" text STATIC,\n  \"body\" text,\n  PRIMARY KEY ((\"id\", \"bucket\"), \"ts\")\n)\nWITH CLUSTERING ORDER BY (\"ts\" DESC)\n  AND comment = 'it''s events'\n  AND bloom_filter_fp_chance = 0.01\n  AND compaction = {'class': 'org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy', 'max_threshold': '32'}\n  AND default_time_to_live = 0\n  AND gc_grace_seconds = 864000;"
+        );
+        // Empty comment is skipped; no clustering column → no WITH clause at all.
+        let simple = set(&["column_name", "kind", "position", "type", "clustering_order"], vec![vec![t("k"), t("partition_key"), Value::Int(0), t("int"), t("none")]]);
+        let empty_comment = set(&["comment"], vec![vec![t("")]]);
+        let ddl = create_table_cql("ks", "kv", &cql_columns(&simple), &table_options(&empty_comment, &empty_comment.rows[0]));
+        assert_eq!(ddl, "CREATE TABLE \"ks\".\"kv\" (\n  \"k\" int,\n  PRIMARY KEY (\"k\")\n);");
+    }
+
+    #[test]
+    fn view_index_type_function_ddl() {
+        let columns = set(
+            &["column_name", "kind", "position", "type", "clustering_order"],
+            vec![
+                vec![t("id"), t("clustering"), Value::Int(0), t("uuid"), t("asc")],
+                vec![t("email"), t("partition_key"), Value::Int(0), t("text"), t("none")],
+            ],
+        );
+        let cols = cql_columns(&columns);
+        let view = create_view_cql("ks", "by_email", "users", "email IS NOT NULL AND id IS NOT NULL", false, &cols, &[]);
+        assert_eq!(
+            view,
+            "CREATE MATERIALIZED VIEW \"ks\".\"by_email\" AS\n  SELECT \"email\", \"id\"\n  FROM \"ks\".\"users\"\n  WHERE email IS NOT NULL AND id IS NOT NULL\n  PRIMARY KEY ((\"email\"), \"id\")\nWITH CLUSTERING ORDER BY (\"id\" ASC);"
+        );
+        let mut opts = BTreeMap::new();
+        opts.insert("target".to_string(), "email".to_string());
+        assert_eq!(create_index_cql("ks", "users", "users_email_idx", "COMPOSITES", &opts), "CREATE INDEX \"users_email_idx\" ON \"ks\".\"users\" (email);");
+        opts.insert("class_name".to_string(), "org.apache.cassandra.index.sasi.SASIIndex".to_string());
+        opts.insert("mode".to_string(), "CONTAINS".to_string());
+        assert_eq!(
+            create_index_cql("ks", "users", "sasi", "CUSTOM", &opts),
+            "CREATE CUSTOM INDEX \"sasi\" ON \"ks\".\"users\" (email) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = {'mode': 'CONTAINS'};"
+        );
+        assert_eq!(
+            create_type_cql("ks", "address", &[("street".into(), "text".into()), ("zip".into(), "int".into())]),
+            "CREATE TYPE \"ks\".\"address\" (\n  \"street\" text,\n  \"zip\" int\n);"
+        );
+        let f = create_function_cql("ks", "plus", &function_args(&["a".into(), "b".into()], &["int".into(), "int".into()]), true, "int", "java", "return a + b;");
+        assert_eq!(f, "CREATE FUNCTION \"ks\".\"plus\"(\"a\" int, \"b\" int)\n  CALLED ON NULL INPUT\n  RETURNS int\n  LANGUAGE java\n  AS $$return a + b;$$;");
+        let a = create_aggregate_cql("ks", "total", &["int".into()], "plus", "int", Some("fin"), Some("0"));
+        assert_eq!(a, "CREATE AGGREGATE \"ks\".\"total\"(int)\n  SFUNC \"plus\"\n  STYPE int\n  FINALFUNC \"fin\"\n  INITCOND 0;");
+        assert!(!create_aggregate_cql("ks", "total", &[], "plus", "int", Some(""), None).contains("FINALFUNC"));
+    }
+
+    #[test]
+    fn signatures_resources_and_replication() {
+        assert_eq!(signature("f", &["int".into(), "map<text, int>".into()]), "f(int, map<text, int>)");
+        assert_eq!(parse_signature("f(int, map<text, int>)"), ("f".to_string(), vec!["int".to_string(), "map<text, int>".to_string()]));
+        assert_eq!(parse_signature("f()"), ("f".to_string(), vec![]));
+        assert_eq!(parse_signature("plain"), ("plain".to_string(), vec![]));
+        assert_eq!(cql_resource("data").as_deref(), Some("ALL KEYSPACES"));
+        assert_eq!(cql_resource("data/ks").as_deref(), Some("KEYSPACE \"ks\""));
+        assert_eq!(cql_resource("data/ks/t").as_deref(), Some("TABLE \"ks\".\"t\""));
+        assert_eq!(cql_resource("roles/bob").as_deref(), Some("ROLE \"bob\""));
+        assert_eq!(cql_resource("functions/ks").as_deref(), Some("ALL FUNCTIONS IN KEYSPACE \"ks\""));
+        assert_eq!(cql_resource("functions/ks/f[int]"), None);
+        let mut nts = BTreeMap::new();
+        nts.insert("class".to_string(), "org.apache.cassandra.locator.NetworkTopologyStrategy".to_string());
+        nts.insert("dc1".to_string(), "3".to_string());
+        nts.insert("dc2".to_string(), "2".to_string());
+        assert_eq!(replication_summary(&nts), "NetworkTopologyStrategy dc1=3, dc2=2");
+        let mut simple = BTreeMap::new();
+        simple.insert("class".to_string(), "SimpleStrategy".to_string());
+        simple.insert("replication_factor".to_string(), "1".to_string());
+        assert_eq!(replication_summary(&simple), "SimpleStrategy rf=1");
+        assert_eq!(cql_map_literal(&simple), "{'class': 'SimpleStrategy', 'replication_factor': '1'}");
+        let r = ObjectRef { kind: ObjectKind::Index, name: "i".into(), parent: Some("ks.t".into()) };
+        assert_eq!(parent_keyspace(&r, None).unwrap(), "ks");
+        let bare = ObjectRef { kind: ObjectKind::Table, name: "t".into(), parent: None };
+        assert_eq!(parent_keyspace(&bare, Some("cur")).unwrap(), "cur");
+        assert!(parent_keyspace(&bare, None).is_err());
+        assert_eq!(format_bytes(512.0), "512 B");
+        assert_eq!(format_bytes(1_572_864.0), "1.5 MB");
+    }
+
+    #[test]
+    fn node_rows_name_and_describe() {
+        let local = set(&["broadcast_address", "data_center", "rack", "release_version", "tokens"], vec![vec![t("10.0.0.1"), t("dc1"), t("r1"), t("4.1.3"), Value::Json(serde_json::json!(["1", "2"]))]]);
+        assert_eq!(node_address(&local, &local.rows[0]), "10.0.0.1");
+        assert_eq!(node_caption(&local, &local.rows[0]), "dc1 / r1 · 4.1.3");
+        let peer = set(&["peer", "rpc_address", "data_center", "rack"], vec![vec![t("10.0.0.2"), Value::Null, t("dc1"), t("r2")]]);
+        assert_eq!(node_address(&peer, &peer.rows[0]), "10.0.0.2");
+        assert_eq!(node_caption(&peer, &peer.rows[0]), "dc1 / r2");
     }
 
     fn resolved(engine: Engine) -> ResolvedConnection {

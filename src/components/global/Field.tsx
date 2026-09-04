@@ -242,8 +242,9 @@ interface DateTimeFieldProps {
 }
 
 // WHAT:  HeroUI DatePicker / TimeField speaking DB text. Timestamps edit all
-//        segments (date + 24h time to the second) and pick the day from the
-//        calendar; times get clock segments only.
+//        segments (date + 24h time to the second); the popover holds the
+//        calendar and, for timestamps, a clock so date and time are picked in
+//        one place. Times get clock segments only.
 // WHERE: https://heroui.com/docs/react/components/{date-picker,time-field,calendar}
 export function DateTimeField({ kind, value, onChange, label, ariaLabel, compact = false, autoFocus = false, isDisabled = false, className }: DateTimeFieldProps) {
   const groupClass = cn("font-mono", compact ? "h-full min-h-0 rounded-sm border-accent bg-background px-1 text-[12px] shadow-none" : "");
@@ -286,36 +287,63 @@ export function DateTimeField({ kind, value, onChange, label, ariaLabel, compact
       autoFocus={autoFocus}
       className={cn(compact ? "h-full" : "w-full", className)}
     >
-      {label ? <Label>{label}</Label> : null}
-      <DateField.Group fullWidth className={groupClass}>
-        <DateField.Input>{(segment) => <DateField.Segment segment={segment} className={segmentClass} />}</DateField.Input>
-        <DateField.Suffix>
-          <DatePicker.Trigger className={compact ? "size-5 min-w-5" : ""}>
-            <DatePicker.TriggerIndicator>
-              <Icon name="calendar" size={compact ? 12 : 14} />
-            </DatePicker.TriggerIndicator>
-          </DatePicker.Trigger>
-        </DateField.Suffix>
-      </DateField.Group>
-      <DatePicker.Popover className="glass-modal rounded-xl">
-        <Calendar aria-label={`${a11y} calendar`}>
-          <Calendar.Header>
-            <Calendar.YearPickerTrigger>
-              <Calendar.YearPickerTriggerHeading />
-              <Calendar.YearPickerTriggerIndicator />
-            </Calendar.YearPickerTrigger>
-            <Calendar.NavButton slot="previous" />
-            <Calendar.NavButton slot="next" />
-          </Calendar.Header>
-          <Calendar.Grid>
-            <Calendar.GridHeader>{(day) => <Calendar.HeaderCell>{day}</Calendar.HeaderCell>}</Calendar.GridHeader>
-            <Calendar.GridBody>{(date) => <Calendar.Cell date={date} />}</Calendar.GridBody>
-          </Calendar.Grid>
-          <Calendar.YearPickerGrid>
-            <Calendar.YearPickerGridBody>{({ year }) => <Calendar.YearPickerCell year={year} />}</Calendar.YearPickerGridBody>
-          </Calendar.YearPickerGrid>
-        </Calendar>
-      </DatePicker.Popover>
+      {({ state }) => (
+        <>
+          {label ? <Label>{label}</Label> : null}
+          <DateField.Group fullWidth className={groupClass}>
+            <DateField.Input>{(segment) => <DateField.Segment segment={segment} className={segmentClass} />}</DateField.Input>
+            <DateField.Suffix>
+              <DatePicker.Trigger className={compact ? "size-5 min-w-5" : ""}>
+                <DatePicker.TriggerIndicator>
+                  <Icon name="calendar" size={compact ? 12 : 14} />
+                </DatePicker.TriggerIndicator>
+              </DatePicker.Trigger>
+            </DateField.Suffix>
+          </DateField.Group>
+          <DatePicker.Popover className="glass-modal flex flex-col gap-3 rounded-xl">
+            <Calendar aria-label={`${a11y} calendar`}>
+              <Calendar.Header>
+                <Calendar.YearPickerTrigger>
+                  <Calendar.YearPickerTriggerHeading />
+                  <Calendar.YearPickerTriggerIndicator />
+                </Calendar.YearPickerTrigger>
+                <Calendar.NavButton slot="previous" />
+                <Calendar.NavButton slot="next" />
+              </Calendar.Header>
+              <Calendar.Grid>
+                <Calendar.GridHeader>{(day) => <Calendar.HeaderCell>{day}</Calendar.HeaderCell>}</Calendar.GridHeader>
+                <Calendar.GridBody>{(date) => <Calendar.Cell date={date} />}</Calendar.GridBody>
+              </Calendar.Grid>
+              <Calendar.YearPickerGrid>
+                <Calendar.YearPickerGridBody>{({ year }) => <Calendar.YearPickerCell year={year} />}</Calendar.YearPickerGridBody>
+              </Calendar.YearPickerGrid>
+            </Calendar>
+            {kind === "datetime" ? (
+              <div className="flex items-center justify-between gap-3 border-t border-border/40 pt-3">
+                <span className="flex items-center gap-1.5 text-xs text-muted">
+                  <Icon name="clock" size={12} />
+                  Time
+                </span>
+                <TimeField
+                  aria-label={`${a11y} time`}
+                  granularity="second"
+                  hourCycle={24}
+                  shouldForceLeadingZeros
+                  hideTimeZone
+                  value={state.timeValue}
+                  onChange={(next) => {
+                    if (next) state.setTimeValue(next);
+                  }}
+                >
+                  <TimeField.Group variant="secondary" className="font-mono">
+                    <TimeField.Input>{(segment) => <TimeField.Segment segment={segment} />}</TimeField.Input>
+                  </TimeField.Group>
+                </TimeField>
+              </div>
+            ) : null}
+          </DatePicker.Popover>
+        </>
+      )}
     </DatePicker>
   );
 }

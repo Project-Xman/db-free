@@ -51,6 +51,55 @@ import {
   ToggleOnIcon,
   ViewIcon,
   ViewOffSlashIcon,
+  Activity01Icon,
+  AiBrain01Icon,
+  Alert01Icon,
+  Archive01Icon,
+  ArrowDataTransferHorizontalIcon,
+  Book02Icon,
+  Camera01Icon,
+  ChartBarLineIcon,
+  ChartLineData01Icon,
+  ChartRelationshipIcon,
+  CodeIcon,
+  CodeXmlIcon,
+  Compass01Icon,
+  CpuIcon,
+  CubeIcon,
+  DatabaseSync01Icon,
+  Exchange01Icon,
+  FlashIcon,
+  FlowConnectionIcon,
+  FunctionIcon,
+  GaugeIcon,
+  GitBranchIcon,
+  Globe02Icon,
+  GridIcon,
+  HierarchyIcon,
+  Layers01Icon,
+  ListViewIcon,
+  LockKeyIcon,
+  MapsIcon,
+  Message01Icon,
+  Notification01Icon,
+  PackageIcon,
+  Radar01Icon,
+  RepeatIcon,
+  Route01Icon,
+  RssIcon,
+  SearchListIcon,
+  SendIcon,
+  ServerIcon,
+  Shield01Icon,
+  SparklesIcon,
+  SwatchIcon,
+  Tag01Icon,
+  Target01Icon,
+  Task01Icon,
+  Timer01Icon,
+  UserGroupIcon,
+  UserIcon,
+  Wrench01Icon,
 } from "@hugeicons/core-free-icons";
 
 export type IconName =
@@ -99,7 +148,56 @@ export type IconName =
   | "clock"
   | "copy"
   | "expand"
-  | "collapse";
+  | "collapse"
+  | "function"
+  | "user"
+  | "users"
+  | "shield"
+  | "server"
+  | "activity"
+  | "layers"
+  | "cpu"
+  | "globe"
+  | "flash"
+  | "alert"
+  | "package"
+  | "code"
+  | "chart"
+  | "chart-bar"
+  | "chart-relationship"
+  | "gauge"
+  | "hierarchy"
+  | "tag"
+  | "archive"
+  | "flow"
+  | "radar"
+  | "sparkles"
+  | "cube"
+  | "route"
+  | "send"
+  | "bell"
+  | "repeat"
+  | "list"
+  | "target"
+  | "book"
+  | "swatch"
+  | "task"
+  | "camera"
+  | "database-sync"
+  | "lock-key"
+  | "wrench"
+  | "grid"
+  | "search-list"
+  | "xml"
+  | "message"
+  | "timer"
+  | "map"
+  | "compass"
+  | "git-branch"
+  | "brain"
+  | "exchange"
+  | "transfer"
+  | "rss";
 
 // WHAT:  App icon vocabulary → Hugeicons (stroke-rounded, free set). Call sites
 //        stay `<Icon name="table" />`; swap a glyph here, not in features.
@@ -150,6 +248,55 @@ const GLYPHS: Record<IconName, IconSvgElement> = {
   copy: Copy01Icon,
   expand: ArrowExpand01Icon,
   collapse: ArrowShrink01Icon,
+  function: FunctionIcon,
+  user: UserIcon,
+  users: UserGroupIcon,
+  shield: Shield01Icon,
+  server: ServerIcon,
+  activity: Activity01Icon,
+  layers: Layers01Icon,
+  cpu: CpuIcon,
+  globe: Globe02Icon,
+  flash: FlashIcon,
+  alert: Alert01Icon,
+  package: PackageIcon,
+  code: CodeIcon,
+  chart: ChartLineData01Icon,
+  "chart-bar": ChartBarLineIcon,
+  "chart-relationship": ChartRelationshipIcon,
+  gauge: GaugeIcon,
+  hierarchy: HierarchyIcon,
+  tag: Tag01Icon,
+  archive: Archive01Icon,
+  flow: FlowConnectionIcon,
+  radar: Radar01Icon,
+  sparkles: SparklesIcon,
+  cube: CubeIcon,
+  route: Route01Icon,
+  send: SendIcon,
+  bell: Notification01Icon,
+  repeat: RepeatIcon,
+  list: ListViewIcon,
+  target: Target01Icon,
+  book: Book02Icon,
+  swatch: SwatchIcon,
+  task: Task01Icon,
+  camera: Camera01Icon,
+  "database-sync": DatabaseSync01Icon,
+  "lock-key": LockKeyIcon,
+  wrench: Wrench01Icon,
+  grid: GridIcon,
+  "search-list": SearchListIcon,
+  xml: CodeXmlIcon,
+  message: Message01Icon,
+  timer: Timer01Icon,
+  map: MapsIcon,
+  compass: Compass01Icon,
+  "git-branch": GitBranchIcon,
+  brain: AiBrain01Icon,
+  exchange: Exchange01Icon,
+  transfer: ArrowDataTransferHorizontalIcon,
+  rss: RssIcon,
 };
 
 interface IconProps extends Omit<SVGProps<SVGSVGElement>, "name" | "strokeWidth"> {

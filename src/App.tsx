@@ -9,6 +9,7 @@ import { ConnectionsPage } from "@/features/connections/ConnectionsPage";
 import { ConnectionPicker } from "@/features/connections/ConnectionPicker";
 import { ConnectionForm } from "@/features/connections/ConnectionForm";
 import { SettingsPage } from "@/features/settings/SettingsPage";
+import { CapabilityMatrixPage } from "@/features/engines/CapabilityMatrixPage";
 import { QueryPane } from "@/features/editor/QueryPane";
 import { TableTab } from "@/features/grid/TableTab";
 import { KeyTab } from "@/features/keys/KeyTab";
@@ -17,6 +18,9 @@ import { TransferTab } from "@/features/transfer/TransferTab";
 import { ErdTab } from "@/features/diagrams/ErdTab";
 import { DocumentTab } from "@/features/documents/DocumentTab";
 import { ChatTab } from "@/features/chat/ChatTab";
+import { ObjectTab } from "@/features/objects/ObjectTab";
+import { AdminTab } from "@/features/admin/AdminTab";
+import { ToolTab } from "@/features/tools/ToolTab";
 import { PendingChangesPanel } from "@/features/changes/PendingChangesPanel";
 import { CommandPalette } from "@/features/palette/CommandPalette";
 import { Toaster } from "@/components/global/Toaster";
@@ -62,6 +66,10 @@ export function App() {
         <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
           <SettingsPage />
         </div>
+      ) : page.kind === "capabilities" ? (
+        <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
+          <CapabilityMatrixPage />
+        </div>
       ) : page.kind === "connection-picker" ? (
         <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
           <ConnectionPicker />
@@ -95,6 +103,12 @@ export function App() {
                   <ErdTab key={tab.id} connectionId={tab.connectionId} schema={tab.schema} />
                 ) : tab.kind === "chat" ? (
                   <ChatTab key={tab.id} connectionId={tab.connectionId} />
+                ) : tab.kind === "object" ? (
+                  <ObjectTab key={tab.id} connectionId={tab.connectionId} reference={tab.reference} />
+                ) : tab.kind === "admin" ? (
+                  <AdminTab key={tab.id} connectionId={tab.connectionId} />
+                ) : tab.kind === "tool" ? (
+                  <ToolTab key={tab.id} connectionId={tab.connectionId} tool={tab.tool} />
                 ) : (
                   <DocumentTab key={tab.id} kind={tab.documentKind} documentId={tab.documentId} connectionId={tab.connectionId} />
                 )}

@@ -1,4 +1,4 @@
-// SOT: qldb-integration, aws-sigv4, partiql, ion, ion-binary-reader, qldb-hash, qldb-session-api
+// SOT: qldb-integration, aws-sigv4, partiql, ion, ion-binary-reader, qldb-hash, qldb-session-api, qldb-control-plane, qldb-object-explorer, qldb-server-stats, qldb-ledger-history
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::aws_sigv4::{sign_post, AwsCredentials, SignRequest};
@@ -6,8 +6,9 @@ use crate::integrations::http::{local, Auth, HttpClient};
 use crate::integrations::sql::quote_literal;
 use crate::integrations::{quote_ident, Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog,
-    SchemaInfo, StatementResult, TableInfo, TableKind, TableRef, Value,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, ObjectAction, ObjectDetail, ObjectKind,
+    ObjectRef, ObjectSummary, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, ServerStats, Stat,
+    StatGroup, StatementResult, TableInfo, TableKind, TableRef, Value,
 };
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -47,6 +48,10 @@ pub struct QldbIntegration {
     ledger: String,
     session: Mutex<Option<String>>,
     read_only: bool,
+    /// Control plane (`qldb.<region>.amazonaws.com`): ListLedgers / DescribeLedger
+    /// / GetDigest. Separate host and verb set from the session API above.
+    control: HttpClient,
+    control_host: String,
 }
 
 pub async fn connect(conn: &ResolvedConnection) -> AppResult<Arc<dyn Integration>> {
@@ -61,7 +66,10 @@ pub async fn connect(conn: &ResolvedConnection) -> AppResult<Arc<dyn Integration
         .to_string();
     let host = format!("session.qldb.{}.amazonaws.com", creds.region);
     let http = HttpClient::new(format!("https://{host}"), Auth::None, false)?;
-    let integration = QldbIntegration { engine: conn.summary.engine, http, creds, host, ledger, session: Mutex::new(None), read_only: conn.summary.read_only };
+    let control_host = format!("qldb.{}.amazonaws.com", creds.region);
+    let control = HttpClient::new(format!("https://{control_host}"), Auth::None, false)?;
+    let integration =
+        QldbIntegration { engine: conn.summary.engine, http, creds, host, ledger, session: Mutex::new(None), read_only: conn.summary.read_only, control, control_host };
     integration.ping().await?;
     Ok(Arc::new(integration))
 }
@@ -122,6 +130,86 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
         out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// SigV4 for the control plane (GET)
+//
+// WHAT:  `aws_sigv4::sign_post` covers the session API, which is POST-only.
+//        The QLDB *control plane* (ListLedgers, DescribeLedger) is REST-JSON
+//        over GET, so the canonical request differs and is built here.
+// WHY:   Same reason the SHA-256 above is a local copy: the HMAC crate is
+//        confined to aws_sigv4.rs, and this file may not widen that boundary.
+// HOW:   HMAC-SHA256 per RFC 2104 on top of the `sha256` above (block size 64).
+// ---------------------------------------------------------------------------
+
+const SHA_BLOCK: usize = 64;
+
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut padded = [0u8; SHA_BLOCK];
+    if key.len() > SHA_BLOCK {
+        padded[..32].copy_from_slice(&sha256(key));
+    } else {
+        padded[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Vec::with_capacity(SHA_BLOCK + data.len());
+    let mut outer = Vec::with_capacity(SHA_BLOCK + 32);
+    for b in padded {
+        inner.push(b ^ 0x36);
+        outer.push(b ^ 0x5c);
+    }
+    inner.extend_from_slice(data);
+    let inner_hash = sha256(&inner);
+    outer.extend_from_slice(&inner_hash);
+    sha256(&outer)
+}
+
+// WHAT:  Percent-encoding for a canonical URI path segment (AWS leaves `/`).
+fn uri_encode(raw: &str, keep_slash: bool) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') || (keep_slash && b == b'/') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+// WHAT:  Signs a GET for `service` and returns the headers it must carry.
+pub fn sign_get(creds: &AwsCredentials, host: &str, path: &str, query: &[(String, String)], service: &str, now: chrono::DateTime<chrono::Utc>) -> Vec<(String, String)> {
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date_stamp = now.format("%Y%m%d").to_string();
+    let payload_hash = hex::encode(sha256(b""));
+
+    let mut headers: Vec<(String, String)> = vec![("host".into(), host.to_string()), ("x-amz-date".into(), amz_date.clone())];
+    if let Some(tok) = &creds.session_token {
+        headers.push(("x-amz-security-token".into(), tok.clone()));
+    }
+    headers.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut pairs: Vec<(String, String)> = query.iter().map(|(k, v)| (uri_encode(k, false), uri_encode(v, false))).collect();
+    pairs.sort();
+    let canonical_query: String = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
+    let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{}\n", v.trim())).collect();
+    let signed_headers: String = headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+    let canonical_request = format!("GET\n{}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}", uri_encode(path, true));
+
+    let scope = format!("{date_stamp}/{}/{service}/aws4_request", creds.region);
+    let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", hex::encode(sha256(canonical_request.as_bytes())));
+
+    let k_date = hmac_sha256(format!("AWS4{}", creds.secret_key).as_bytes(), date_stamp.as_bytes());
+    let k_region = hmac_sha256(&k_date, creds.region.as_bytes());
+    let k_service = hmac_sha256(&k_region, service.as_bytes());
+    let k_signing = hmac_sha256(&k_service, b"aws4_request");
+    let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
+
+    headers.push((
+        "authorization".into(),
+        format!("AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}", creds.access_key),
+    ));
+    headers
 }
 
 // ---------------------------------------------------------------------------
@@ -688,10 +776,12 @@ impl QldbIntegration {
             &self.creds,
             &SignRequest {
                 service: "qldb",
+                method: "POST",
                 host: &self.host,
                 path: "/",
+                query: "",
                 amz_target: Some(TARGET),
-                content_type: CONTENT_TYPE,
+                content_type: Some(CONTENT_TYPE),
                 body: &bytes,
                 now: chrono::Utc::now(),
             },
@@ -806,6 +896,349 @@ impl QldbIntegration {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Object explorer / stats / ledger history
+// ---------------------------------------------------------------------------
+
+const HISTORY_CAP: usize = 100;
+const TABLE_CAP: usize = 1_000;
+
+fn ion_field<'a>(v: &'a Ion, name: &str) -> Option<&'a Ion> {
+    match v {
+        Ion::Struct(fields) => fields.iter().find(|(k, _)| k == name).map(|(_, v)| v),
+        _ => None,
+    }
+}
+
+fn ion_text(v: &Ion, name: &str) -> String {
+    match ion_field(v, name) {
+        Some(Ion::String(s)) | Some(Ion::Symbol(s)) | Some(Ion::Timestamp(s)) | Some(Ion::Decimal(s)) => s.clone(),
+        Some(Ion::Int(i)) => i.to_string(),
+        Some(Ion::Bool(b)) => b.to_string(),
+        Some(Ion::Float(f)) => f.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn ion_list<'a>(v: &'a Ion, name: &str) -> &'a [Ion] {
+    match ion_field(v, name) {
+        Some(Ion::List(items)) | Some(Ion::Sexp(items)) => items,
+        _ => &[],
+    }
+}
+
+fn jstr(v: &serde_json::Value, key: &str) -> String {
+    match v.get(key) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    }
+}
+
+// WHAT:  The control plane sends timestamps as epoch seconds (REST-JSON).
+fn epoch_text(v: &serde_json::Value, key: &str) -> String {
+    v.get(key)
+        .and_then(serde_json::Value::as_f64)
+        .and_then(|s| chrono::DateTime::from_timestamp(s as i64, 0))
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| jstr(v, key))
+}
+
+// WHAT:  One index entry of `information_schema.user_tables` → a summary.
+pub(crate) fn index_summary(table: &str, entry: &Ion) -> ObjectSummary {
+    let expr = ion_text(entry, "expr");
+    let id = ion_text(entry, "indexId");
+    let name = if expr.is_empty() { id.clone() } else { expr };
+    let mut s = ObjectSummary::new(ObjectKind::Index, name, Some(table.to_string()));
+    if !id.is_empty() {
+        s = s.with_detail(id);
+    }
+    let status = ion_text(entry, "status");
+    if !status.is_empty() {
+        s = s.with_badge(status);
+    }
+    s
+}
+
+pub(crate) fn history_sql(table: &str, document_id: &str) -> String {
+    format!(
+        "SELECT h.metadata.id, h.metadata.version, h.metadata.txId, h.metadata.txTime, h.hash, h.data FROM history({}) AS h WHERE h.metadata.id = {}",
+        quote_ident(table),
+        quote_literal(document_id)
+    )
+}
+
+impl QldbIntegration {
+    async fn control_get(&self, path: &str, query: &[(String, String)]) -> AppResult<serde_json::Value> {
+        let headers = sign_get(&self.creds, &self.control_host, path, query, "qldb", chrono::Utc::now());
+        let mut req = self.control.request(Method::GET, path);
+        if !query.is_empty() {
+            req = req.query(query);
+        }
+        for (k, v) in &headers {
+            if k != "host" {
+                req = req.header(k.as_str(), v.as_str());
+            }
+        }
+        let resp = self.control.send(req).await?;
+        resp.json().await.map_err(|e| AppError::driver(format!("Malformed QLDB control-plane response: {e}")))
+    }
+
+    async fn control_post(&self, path: &str) -> AppResult<serde_json::Value> {
+        let signed = sign_post(
+            &self.creds,
+            &SignRequest {
+                service: "qldb",
+                method: "POST",
+                host: &self.control_host,
+                path,
+                query: "",
+                amz_target: None,
+                content_type: Some("application/json"),
+                body: b"",
+                now: chrono::Utc::now(),
+            },
+        )?;
+        let mut req = self.control.request(Method::POST, path);
+        for (k, v) in &signed.headers {
+            if k != "host" {
+                req = req.header(k.as_str(), v.as_str());
+            }
+        }
+        let resp = self.control.send(req).await?;
+        resp.json().await.map_err(|e| AppError::driver(format!("Malformed QLDB control-plane response: {e}")))
+    }
+
+    async fn list_ledgers(&self) -> Vec<serde_json::Value> {
+        self.control_get("/ledgers", &[]).await.ok().and_then(|v| v.get("Ledgers").and_then(|l| l.as_array()).cloned()).unwrap_or_default()
+    }
+
+    async fn describe_ledger(&self, name: &str) -> Option<serde_json::Value> {
+        self.control_get(&format!("/ledgers/{}", uri_encode(name, false)), &[]).await.ok()
+    }
+
+    async fn digest(&self) -> Option<serde_json::Value> {
+        self.control_post(&format!("/ledgers/{}/digest", uri_encode(&self.ledger, false))).await.ok()
+    }
+
+    /// `information_schema.user_tables`, the only catalog QLDB exposes.
+    async fn user_tables(&self) -> AppResult<Vec<Ion>> {
+        self.select("SELECT name, tableId, status, indexes FROM information_schema.user_tables", TABLE_CAP).await
+    }
+
+    async fn find_table(&self, name: &str) -> AppResult<Ion> {
+        self.user_tables()
+            .await?
+            .into_iter()
+            .find(|t| ion_text(t, "name") == name)
+            .ok_or_else(|| AppError::not_found(format!("Table `{name}` is not in this ledger.")))
+    }
+
+    async fn list_objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let mut out = match kind {
+            ObjectKind::Database => {
+                let ledgers = self.list_ledgers().await;
+                if ledgers.is_empty() {
+                    // No qldb:ListLedgers permission: still show the one in use.
+                    vec![ObjectSummary::new(ObjectKind::Database, self.ledger.clone(), None).with_badge("current")]
+                } else {
+                    ledgers
+                        .iter()
+                        .map(|l| {
+                            let name = jstr(l, "Name");
+                            let current = name == self.ledger;
+                            let mut s = ObjectSummary::new(ObjectKind::Database, name, None).with_detail(epoch_text(l, "CreationDateTime"));
+                            let state = jstr(l, "State");
+                            s = s.with_badge(if state.is_empty() { "ledger".to_string() } else { state });
+                            if current {
+                                s = s.with_detail(format!("{} · current session", epoch_text(l, "CreationDateTime")));
+                            }
+                            s
+                        })
+                        .collect()
+                }
+            }
+            ObjectKind::Table => self
+                .user_tables()
+                .await?
+                .iter()
+                .map(|t| {
+                    let mut s = ObjectSummary::new(ObjectKind::Table, ion_text(t, "name"), Some(self.ledger.clone()));
+                    let id = ion_text(t, "tableId");
+                    let indexes = ion_list(t, "indexes").len();
+                    s = s.with_detail(if id.is_empty() { format!("{indexes} indexes") } else { format!("{id} · {indexes} indexes") });
+                    let status = ion_text(t, "status");
+                    if !status.is_empty() {
+                        s = s.with_badge(status);
+                    }
+                    s
+                })
+                .collect(),
+            ObjectKind::Index => self
+                .user_tables()
+                .await?
+                .iter()
+                .filter(|t| parent.is_none_or(|p| ion_text(t, "name") == p))
+                .flat_map(|t| {
+                    let table = ion_text(t, "name");
+                    ion_list(t, "indexes").iter().map(move |i| index_summary(&table, i)).collect::<Vec<_>>()
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        out.sort_by(|a, b| a.reference.parent.cmp(&b.reference.parent).then_with(|| a.reference.name.cmp(&b.reference.name)));
+        Ok(out)
+    }
+
+    async fn ledger_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let mut detail = ObjectDetail::empty(reference).definition(format!("-- ledger {}\nSELECT name, status FROM information_schema.user_tables", reference.name), CodeLanguage::Sql);
+        if let Some(described) = self.describe_ledger(&reference.name).await {
+            for (label, key) in [("state", "State"), ("arn", "Arn"), ("permissions mode", "PermissionsMode")] {
+                let v = jstr(&described, key);
+                if !v.is_empty() {
+                    detail = detail.property(label, v);
+                }
+            }
+            detail = detail.property("created", epoch_text(&described, "CreationDateTime"));
+            if let Some(p) = described.get("DeletionProtection").and_then(serde_json::Value::as_bool) {
+                detail = detail.property("deletion protection", p.to_string());
+            }
+        }
+        if reference.name == self.ledger {
+            detail = detail.property("session", "attached");
+            detail.children = self
+                .user_tables()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|t| ObjectSummary::new(ObjectKind::Table, ion_text(t, "name"), Some(self.ledger.clone())))
+                .collect();
+        }
+        Ok(detail)
+    }
+
+    async fn table_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let table = self.find_table(&reference.name).await?;
+        let ident = quote_ident(&reference.name);
+        let mut detail = ObjectDetail::empty(reference)
+            .definition(format!("SELECT * FROM {ident}"), CodeLanguage::Sql)
+            .property("ledger", self.ledger.clone())
+            .property("table id", ion_text(&table, "tableId"))
+            .property("status", ion_text(&table, "status"));
+        detail.columns = self.columns(&TableRef { schema: Some(self.ledger.clone()), name: reference.name.clone() }).await.unwrap_or_default();
+        detail.children = ion_list(&table, "indexes").iter().map(|i| index_summary(&reference.name, i)).collect();
+        detail.rows = Some(values_to_result(std::slice::from_ref(&table), &["name", "tableId", "status"]));
+        detail = detail
+            .action(ObjectAction::new("preview", "Preview documents", format!("SELECT * FROM {ident}")))
+            .action(ObjectAction::new("history", "Table history", format!("SELECT * FROM history({ident})")))
+            .action(ObjectAction::destructive("drop", "Drop table", format!("DROP TABLE {ident}")));
+        Ok(detail)
+    }
+
+    async fn index_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let table_name = reference.parent.clone().ok_or_else(|| AppError::invalid_input("An index needs its table."))?;
+        let table = self.find_table(&table_name).await?;
+        let entry = ion_list(&table, "indexes")
+            .iter()
+            .find(|i| ion_text(i, "expr") == reference.name || ion_text(i, "indexId") == reference.name)
+            .cloned()
+            .ok_or_else(|| AppError::not_found(format!("Index `{}` not found on `{table_name}`.", reference.name)))?;
+        let expr = ion_text(&entry, "expr");
+        let field = expr.trim_start_matches('[').trim_end_matches(']').to_string();
+        let mut detail = ObjectDetail::empty(reference)
+            .definition(format!("CREATE INDEX ON {} ({field})", quote_ident(&table_name)), CodeLanguage::Sql)
+            .property("table", table_name.clone())
+            .property("expression", expr)
+            .property("index id", ion_text(&entry, "indexId"))
+            .property("status", ion_text(&entry, "status"));
+        detail.rows = Some(values_to_result(std::slice::from_ref(&entry), &["expr", "indexId", "status"]));
+        detail = detail.action(ObjectAction::destructive("drop_index", "Drop index", format!("DROP INDEX \"{}\" ON {}", ion_text(&entry, "indexId"), quote_ident(&table_name))));
+        Ok(detail)
+    }
+
+    async fn detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        match reference.kind {
+            ObjectKind::Database => self.ledger_detail(reference).await,
+            ObjectKind::Table => self.table_detail(reference).await,
+            ObjectKind::Index => self.index_detail(reference).await,
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    async fn stats(&self) -> AppResult<ServerStats> {
+        let described = self.describe_ledger(&self.ledger).await;
+        let tables = self.user_tables().await.unwrap_or_default();
+        let digest = self.digest().await;
+
+        let mut ledger = vec![Stat::text("Ledger", self.ledger.clone()), Stat::text("Region", self.creds.region.clone())];
+        if let Some(d) = &described {
+            for (label, key) in [("State", "State"), ("Permissions mode", "PermissionsMode")] {
+                let v = jstr(d, key);
+                if !v.is_empty() {
+                    ledger.push(Stat::text(label, v));
+                }
+            }
+            ledger.push(Stat::text("Created", epoch_text(d, "CreationDateTime")));
+            if let Some(p) = d.get("DeletionProtection").and_then(serde_json::Value::as_bool) {
+                ledger.push(Stat::text("Deletion protection", if p { "on" } else { "off" }));
+            }
+            let kms = d.get("EncryptionDescription").map(|e| jstr(e, "EncryptionStatus")).unwrap_or_default();
+            if !kms.is_empty() {
+                ledger.push(Stat::text("Encryption", kms));
+            }
+        } else {
+            ledger.push(Stat::text("Describe", "not permitted for these credentials"));
+        }
+
+        let active = tables.iter().filter(|t| ion_text(t, "status") == "ACTIVE").count();
+        let indexes: usize = tables.iter().map(|t| ion_list(t, "indexes").len()).sum();
+        let schema = vec![
+            Stat::number("Tables", tables.len() as f64, None),
+            Stat::number("Tables active", active as f64, None),
+            Stat::number("Indexes", indexes as f64, None),
+        ];
+
+        let mut journal = Vec::new();
+        if let Some(d) = &digest {
+            let tip = d.get("DigestTipAddress").map(|t| jstr(t, "IonText")).unwrap_or_default();
+            if !tip.is_empty() {
+                journal.push(Stat::text("Digest tip address", tip.clone()));
+                // The tip address carries the journal sequence number.
+                if let Some(seq) = tip.split("sequenceNo:").nth(1).and_then(|s| s.trim().trim_end_matches('}').trim().parse::<f64>().ok()) {
+                    journal.push(Stat::number("Journal blocks", seq, None));
+                }
+                if let Some(strand) = tip.split("strandId:").nth(1).and_then(|s| s.split(',').next()) {
+                    journal.push(Stat::text("Strand", strand.trim().trim_matches('"').to_string()));
+                }
+            }
+            let hash = jstr(d, "Digest");
+            if !hash.is_empty() {
+                journal.push(Stat::text("Digest", crate::integrations::prometheus::truncate(&hash, 24)));
+            }
+        }
+
+        let groups = [("Ledger", ledger), ("Schema", schema), ("Journal", journal)]
+            .into_iter()
+            .filter(|(_, stats)| !stats.is_empty())
+            .map(|(title, stats)| StatGroup { title: title.to_string(), stats })
+            .collect();
+        Ok(ServerStats::now(groups))
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities { sql: true, namespaces: false, fixed_columns: false, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: true },
+        object_kinds: vec![K::Database, K::Table, K::Index],
+        tools: vec![T::LedgerHistory],
+    }
+}
+
 #[async_trait]
 impl Integration for QldbIntegration {
     fn engine(&self) -> Engine {
@@ -813,7 +1246,7 @@ impl Integration for QldbIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { sql: true, namespaces: false, fixed_columns: false, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: true }
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -908,6 +1341,40 @@ impl Integration for QldbIntegration {
         if let Some(t) = token {
             let _ = self.send(serde_json::json!({"SessionToken": t, "EndSession": {}})).await;
         }
+    }
+
+    async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        self.list_objects(kind, parent).await
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        self.detail(reference).await
+    }
+
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        self.stats().await
+    }
+
+    // WHAT:  Every revision of one document, from the ledger's own `history()`
+    //        view: transaction id, commit time, the revision hash and the data.
+    async fn history(&self, reference: &ObjectRef) -> AppResult<ResultSet> {
+        let table = reference
+            .parent
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| AppError::invalid_input("QLDB history is per table: pick the document's table."))?;
+        let id = reference.name.trim();
+        if id.is_empty() {
+            return Err(AppError::invalid_input("Enter the document id (`metadata.id`) whose history you want."));
+        }
+        if reference.kind != ObjectKind::Document {
+            return Err(AppError::invalid_input("QLDB keeps history per document; select a document id."));
+        }
+        let vals = self.select(&history_sql(table, id), HISTORY_CAP).await?;
+        let mut rs = values_to_result(&vals, &["txId", "txTime", "hash", "data"]);
+        rs.truncated = vals.len() >= HISTORY_CAP;
+        Ok(rs)
     }
 }
 
@@ -1052,6 +1519,75 @@ mod tests {
         // Ion-hash serialization of the string "a" is 0B 80 61 0E; escape bytes get prefixed.
         assert_eq!(ion_hash_string("a"), sha256(&[0x0B, 0x80, 0x61, 0x0E]));
         assert_eq!(ion_hash_string("\u{0B}"), sha256(&[0x0B, 0x80, 0x0C, 0x0B, 0x0E]));
+    }
+
+    #[test]
+    fn hmac_matches_known_answers() {
+        // RFC 4231 test case 1.
+        assert_eq!(hex::encode(hmac_sha256(&[0x0b; 20], b"Hi There")), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+        // RFC 4231 test case 2 (key shorter than the block).
+        assert_eq!(hex::encode(hmac_sha256(b"Jefe", b"what do ya want for nothing?")), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+        // A key longer than the 64-byte block is hashed first (RFC 4231 case 6).
+        assert_eq!(hex::encode(hmac_sha256(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First")), "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+        // The AWS-documented derived signing key, as in aws_sigv4.rs.
+        let k_date = hmac_sha256(b"AWS4wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", b"20150830");
+        let k_region = hmac_sha256(&k_date, b"us-east-1");
+        let k_service = hmac_sha256(&k_region, b"iam");
+        assert_eq!(hex::encode(hmac_sha256(&k_service, b"aws4_request")), "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9");
+    }
+
+    #[test]
+    fn get_signing_builds_an_authorization_header() {
+        let creds = AwsCredentials { region: "us-east-1".into(), access_key: "AKIDEXAMPLE".into(), secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(), session_token: None };
+        let now = chrono::DateTime::parse_from_rfc3339("2015-08-30T12:36:00Z").map(|d| d.with_timezone(&chrono::Utc)).unwrap_or_default();
+        let headers = sign_get(&creds, "qldb.us-east-1.amazonaws.com", "/ledgers", &[], "qldb", now);
+        let auth = headers.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.clone()).unwrap_or_default();
+        assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/qldb/aws4_request, SignedHeaders=host;x-amz-date, Signature="));
+        assert_eq!(auth.len(), auth.find("Signature=").unwrap_or(0) + "Signature=".len() + 64);
+        assert!(headers.iter().any(|(k, v)| k == "x-amz-date" && v == "20150830T123600Z"));
+        // A session token joins the signed header list.
+        let temp = AwsCredentials { session_token: Some("TOKEN".into()), ..creds };
+        let signed = sign_get(&temp, "qldb.us-east-1.amazonaws.com", "/ledgers", &[("MaxResults".into(), "10".into())], "qldb", now);
+        let auth = signed.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.clone()).unwrap_or_default();
+        assert!(auth.contains("SignedHeaders=host;x-amz-date;x-amz-security-token"));
+        assert_eq!(uri_encode("/ledgers/my ledger", true), "/ledgers/my%20ledger");
+        assert_eq!(uri_encode("a/b", false), "a%2Fb");
+    }
+
+    #[test]
+    fn history_and_catalog_shapes() {
+        assert_eq!(
+            history_sql("Vehicle", "3Qv67yjXEwB9SjmvkuG6Cp"),
+            "SELECT h.metadata.id, h.metadata.version, h.metadata.txId, h.metadata.txTime, h.hash, h.data FROM history(\"Vehicle\") AS h WHERE h.metadata.id = '3Qv67yjXEwB9SjmvkuG6Cp'"
+        );
+        // A quote in the id is escaped, not injected.
+        assert!(history_sql("T", "a'b").ends_with("'a''b'"));
+
+        let table = Ion::Struct(vec![
+            ("name".into(), Ion::String("Vehicle".into())),
+            ("tableId".into(), Ion::String("Kk2n".into())),
+            ("status".into(), Ion::String("ACTIVE".into())),
+            (
+                "indexes".into(),
+                Ion::List(vec![Ion::Struct(vec![
+                    ("expr".into(), Ion::String("[VIN]".into())),
+                    ("indexId".into(), Ion::String("9Ndzn".into())),
+                    ("status".into(), Ion::String("ONLINE".into())),
+                ])]),
+            ),
+        ]);
+        assert_eq!(ion_text(&table, "name"), "Vehicle");
+        assert_eq!(ion_text(&table, "missing"), "");
+        assert_eq!(ion_list(&table, "indexes").len(), 1);
+        let idx = index_summary("Vehicle", &ion_list(&table, "indexes")[0]);
+        assert_eq!(idx.reference.name, "[VIN]");
+        assert_eq!(idx.reference.parent.as_deref(), Some("Vehicle"));
+        assert_eq!(idx.badge.as_deref(), Some("ONLINE"));
+        assert_eq!(idx.detail.as_deref(), Some("9Ndzn"));
+
+        let described = serde_json::json!({"Name": "test", "State": "ACTIVE", "CreationDateTime": 1704067200.0, "DeletionProtection": true});
+        assert_eq!(jstr(&described, "State"), "ACTIVE");
+        assert_eq!(epoch_text(&described, "CreationDateTime"), "2024-01-01T00:00:00Z");
     }
 
     #[test]

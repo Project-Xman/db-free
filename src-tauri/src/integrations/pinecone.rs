@@ -1,11 +1,12 @@
-// SOT: pinecone-integration, pinecone-rest-api, vector-indexes, pinecone-control-plane, pinecone-data-plane, pinecone-command-console
+// SOT: pinecone-integration, pinecone-rest-api, vector-indexes, pinecone-control-plane, pinecone-data-plane, pinecone-command-console, object-explorer, server-stats, vector-search-playground, pinecone-admin-actions
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::http::{self, json_result, objects_to_result_set, Auth, HttpClient};
 use crate::integrations::{Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog,
-    SchemaInfo, SslMode, StatementResult, TableInfo, TableKind, TableRef, Value,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, ObjectAction, ObjectDetail, ObjectKind,
+    ObjectRef, ObjectSummary, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, ServerStats,
+    SslMode, Stat, StatGroup, StatementResult, TableInfo, TableKind, TableRef, Value, VectorSearchRequest,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value as Json};
@@ -458,14 +459,425 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-#[async_trait]
-impl Integration for PineconeIntegration {
-    fn engine(&self) -> Engine {
-        self.engine
+// ---------------------------------------------------------------------------
+// Object explorer / server stats / vector search
+//
+// WHAT:  `objects()` lists indexes (control plane), Pinecone "collections"
+//        (static snapshots of an index) and the namespaces of each index;
+//        `object_detail()` adds the JSON description, a property sheet and
+//        actions written as this adapter's own `{"path"/"index", …}`
+//        envelopes; `server_stats()` folds `describe_index_stats` over the
+//        indexes; `vector_search()` posts `/query` on the data plane.
+// ---------------------------------------------------------------------------
+
+const OBJECT_CAP: usize = 2_000;
+const SCORE_COLUMN: &str = "score";
+
+fn text_of(v: &Json) -> String {
+    match v {
+        Json::Null => String::new(),
+        Json::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn str_at<'a>(v: &'a Json, key: &str) -> &'a str {
+    v.get(key).and_then(Json::as_str).unwrap_or("")
+}
+
+fn pretty(v: &Json) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_default()
+}
+
+fn finish(mut list: Vec<ObjectSummary>) -> Vec<ObjectSummary> {
+    list.sort_by(|a, b| a.reference.name.cmp(&b.reference.name).then_with(|| a.reference.parent.cmp(&b.reference.parent)));
+    list.truncate(OBJECT_CAP);
+    list
+}
+
+fn summary(kind: ObjectKind, name: &str, parent: Option<&str>, detail: String, badge: Option<String>) -> ObjectSummary {
+    let mut s = ObjectSummary::new(kind, name, parent.map(str::to_string));
+    if !detail.is_empty() {
+        s = s.with_detail(detail);
+    }
+    if let Some(b) = badge.filter(|b| !b.is_empty()) {
+        s = s.with_badge(b);
+    }
+    s
+}
+
+fn rows_table(columns: &[(&str, &str)], rows: Vec<Vec<Value>>) -> ResultSet {
+    ResultSet {
+        columns: columns.iter().map(|(name, ty)| ColumnMeta { name: (*name).to_string(), type_name: (*ty).to_string() }).collect(),
+        rows,
+        truncated: false,
+    }
+}
+
+// WHAT:  Serverless (`spec.serverless.{cloud,region}`) and pod (`spec.pod`)
+//        indexes describe their placement differently.
+fn placement(index: &Json) -> String {
+    if let Some(sl) = index.pointer("/spec/serverless") {
+        return format!("serverless {} {}", str_at(sl, "cloud"), str_at(sl, "region")).trim().to_string();
+    }
+    if let Some(pod) = index.pointer("/spec/pod") {
+        let kind = str_at(pod, "pod_type");
+        let env = str_at(pod, "environment");
+        return format!("pods {kind} {env}").trim().to_string();
+    }
+    String::new()
+}
+
+fn index_summaries(indexes: &Json) -> Vec<ObjectSummary> {
+    let list = indexes
+        .get("indexes")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|i| {
+            let name = i.get("name").and_then(Json::as_str)?;
+            let mut parts = Vec::new();
+            if let Some(d) = i.get("dimension").and_then(Json::as_f64) {
+                parts.push(format!("{d}d"));
+            }
+            let metric = str_at(i, "metric");
+            if !metric.is_empty() {
+                parts.push(metric.to_string());
+            }
+            let place = placement(i);
+            if !place.is_empty() {
+                parts.push(place);
+            }
+            let host = str_at(i, "host");
+            if !host.is_empty() {
+                parts.push(host.to_string());
+            }
+            let badge = i.pointer("/status/state").map(text_of).filter(|s| !s.is_empty()).map(|s| s.to_ascii_lowercase());
+            Some(summary(ObjectKind::Collection, name, None, parts.join(" · "), badge))
+        })
+        .collect();
+    finish(list)
+}
+
+// WHAT:  A Pinecone "collection" is a frozen copy of an index — a snapshot.
+fn snapshot_summaries(body: &Json) -> Vec<ObjectSummary> {
+    let list = body
+        .get("collections")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let name = c.get("name").and_then(Json::as_str)?;
+            let mut parts = Vec::new();
+            if let Some(n) = c.get("vector_count").and_then(Json::as_f64) {
+                parts.push(format!("{} vectors", crate::model::objects::format_number(n)));
+            }
+            if let Some(d) = c.get("dimension").and_then(Json::as_f64) {
+                parts.push(format!("{d}d"));
+            }
+            if let Some(size) = c.get("size").and_then(Json::as_f64) {
+                parts.push(human_bytes(size));
+            }
+            let source = str_at(c, "source_collection");
+            let parent = if source.is_empty() { None } else { Some(source) };
+            let badge = c.get("status").map(text_of).filter(|s| !s.is_empty()).map(|s| s.to_ascii_lowercase());
+            Some(summary(ObjectKind::Snapshot, name, parent, parts.join(" · "), badge))
+        })
+        .collect();
+    finish(list)
+}
+
+fn human_bytes(bytes: f64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut value = bytes;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} B", value as u64)
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+// WHAT:  `describe_index_stats.namespaces` → one summary per namespace; the
+//        unnamed default namespace is shown as `(default)`.
+fn namespace_summaries(index: &str, stats: &Json) -> Vec<ObjectSummary> {
+    let list = stats
+        .get("namespaces")
+        .and_then(Json::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(name, spec)| {
+            let count = spec.get("vectorCount").or_else(|| spec.get("vector_count")).and_then(Json::as_f64).unwrap_or(0.0);
+            let shown = if name.is_empty() { "(default)" } else { name.as_str() };
+            let badge = name.is_empty().then(|| "default".to_string());
+            summary(ObjectKind::Namespace, shown, Some(index), format!("{} vectors", crate::model::objects::format_number(count)), badge)
+        })
+        .collect();
+    finish(list)
+}
+
+fn namespace_arg(name: &str) -> String {
+    if name == "(default)" {
+        String::new()
+    } else {
+        name.to_string()
+    }
+}
+
+// ---- vector search ----------------------------------------------------------
+
+// WHAT:  Playground request → the data plane's `/query` body. `vector_name`
+//        carries the namespace (Pinecone has one vector per record, but
+//        namespaces partition the index).
+fn query_body(req: &VectorSearchRequest) -> Json {
+    let mut body = json!({
+        "vector": req.vector,
+        "topK": req.top_k.max(1),
+        "includeMetadata": true,
+        "includeValues": req.include_vectors,
+    });
+    if let Some(filter) = req.filter.clone().filter(|f| f.is_object()) {
+        body["filter"] = filter;
+    }
+    if let Some(ns) = req.vector_name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        body["namespace"] = Json::String(namespace_arg(ns));
+    }
+    body
+}
+
+// WHAT:  Matches → grid: `id`, `score`, metadata keys, `values` when asked for.
+fn query_hits(resp: &Json, include_vectors: bool) -> ResultSet {
+    let matches = resp.get("matches").and_then(Json::as_array).cloned().unwrap_or_default();
+    let mut names: Vec<String> = vec![ID_COLUMN.to_string(), SCORE_COLUMN.to_string()];
+    let mut types: Vec<Option<&'static str>> = vec![Some("string"), Some("number")];
+    for hit in &matches {
+        for (k, v) in hit.get("metadata").and_then(Json::as_object).into_iter().flatten() {
+            match names.iter().position(|n| n == k) {
+                Some(i) => {
+                    if types[i].is_none() && !v.is_null() {
+                        types[i] = Some(http::json_type_name(v));
+                    }
+                }
+                None => {
+                    names.push(k.clone());
+                    types.push((!v.is_null()).then(|| http::json_type_name(v)));
+                }
+            }
+        }
+    }
+    if include_vectors {
+        names.push("values".to_string());
+        types.push(Some("json"));
+    }
+    let rows = matches
+        .iter()
+        .map(|hit| {
+            names
+                .iter()
+                .map(|n| match n.as_str() {
+                    ID_COLUMN => hit.get("id").map(http::json_to_value).unwrap_or(Value::Null),
+                    SCORE_COLUMN => hit.get("score").map(http::json_to_value).unwrap_or(Value::Null),
+                    "values" => hit.get("values").filter(|v| !v.is_null()).map(|v| Value::Json(v.clone())).unwrap_or(Value::Null),
+                    other => hit.get("metadata").and_then(|m| m.get(other)).map(http::json_to_value).unwrap_or(Value::Null),
+                })
+                .collect()
+        })
+        .collect();
+    ResultSet {
+        columns: names.into_iter().zip(types).map(|(name, ty)| ColumnMeta { name, type_name: ty.unwrap_or("json").to_string() }).collect(),
+        rows,
+        truncated: false,
+    }
+}
+
+// ---- server stats -----------------------------------------------------------
+
+fn stats_groups(api_version: &str, indexes: &[(String, Json, Json)]) -> Vec<StatGroup> {
+    let server = vec![Stat::text("API version", api_version), Stat::number("Indexes", indexes.len() as f64, None)];
+    let vectors: f64 = indexes.iter().filter_map(|(_, _, s)| s.get("totalVectorCount").and_then(Json::as_f64)).sum();
+    let namespaces: usize = indexes.iter().map(|(_, _, s)| s.get("namespaces").and_then(Json::as_object).map(|n| n.len()).unwrap_or(0)).sum();
+    let ready = indexes.iter().filter(|(_, d, _)| d.pointer("/status/ready").and_then(Json::as_bool) == Some(true)).count();
+    let mut storage = vec![
+        Stat::number("Vectors", vectors, None),
+        Stat::number("Namespaces", namespaces as f64, None),
+        Stat::number("Ready indexes", ready as f64, None),
+    ];
+    let fullness: Vec<f64> = indexes.iter().filter_map(|(_, _, s)| s.get("indexFullness").and_then(Json::as_f64)).collect();
+    if !fullness.is_empty() {
+        let max = fullness.iter().copied().fold(0.0_f64, f64::max);
+        storage.push(Stat::number("Index fullness", (max * 100.0).round(), Some("%")));
+    }
+    let dims: Vec<String> = indexes
+        .iter()
+        .filter_map(|(name, d, s)| {
+            let dim = d.get("dimension").and_then(Json::as_f64).or_else(|| s.get("dimension").and_then(Json::as_f64))?;
+            Some(format!("{name} {dim}d"))
+        })
+        .collect();
+    let mut groups = vec![StatGroup { title: "Server".into(), stats: server }, StatGroup { title: "Storage".into(), stats: storage }];
+    if !dims.is_empty() {
+        groups.push(StatGroup { title: "Indexes".into(), stats: vec![Stat::text("Dimensions", dims.join(", "))] });
+    }
+    groups
+}
+
+impl PineconeIntegration {
+    async fn control_get(&self, path: &str) -> AppResult<Json> {
+        self.call(&self.control, reqwest::Method::GET, path, None).await
     }
 
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
+    async fn list_indexes(&self) -> AppResult<Vec<ObjectSummary>> {
+        if let Some((name, _)) = &self.fixed {
+            let desc = self.describe_index(name).await.unwrap_or(Json::Null);
+            return Ok(index_summaries(&json!({"indexes": [desc]})));
+        }
+        Ok(index_summaries(&self.control_get("/indexes").await?))
+    }
+
+    async fn list_snapshots(&self) -> AppResult<Vec<ObjectSummary>> {
+        match self.control_get("/collections").await {
+            Ok(body) => Ok(snapshot_summaries(&body)),
+            Err(AppError::NotFound { .. }) | Err(AppError::NotConnected { .. }) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn list_namespaces(&self, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let names = match parent {
+            Some(p) => vec![p.to_string()],
+            None => self.index_names().await?,
+        };
+        let mut list = Vec::new();
+        for index in names {
+            if let Ok(stats) = self.stats(&index).await {
+                list.extend(namespace_summaries(&index, &stats));
+            }
+            if list.len() >= OBJECT_CAP {
+                break;
+            }
+        }
+        Ok(finish(list))
+    }
+
+    async fn index_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = reference.name.as_str();
+        let desc = self.describe_index(name).await.unwrap_or(Json::Null);
+        let stats = self.stats(name).await.unwrap_or(Json::Null);
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&json!({"index": desc, "stats": stats})), CodeLanguage::Json);
+        for (label, key) in [("Dimension", "dimension"), ("Metric", "metric"), ("Host", "host"), ("Vector type", "vector_type")] {
+            let v = desc.get(key).map(text_of).unwrap_or_default();
+            if !v.is_empty() {
+                detail = detail.property(label, v);
+            }
+        }
+        let place = placement(&desc);
+        if !place.is_empty() {
+            detail = detail.property("Placement", place);
+        }
+        for (label, key) in [("State", "/status/state"), ("Ready", "/status/ready")] {
+            if let Some(v) = desc.pointer(key) {
+                detail = detail.property(label, text_of(v));
+            }
+        }
+        if let Some(total) = stats.get("totalVectorCount").and_then(Json::as_f64) {
+            detail = detail.property("Vectors", crate::model::objects::format_number(total));
+        }
+        if let Some(f) = stats.get("indexFullness").and_then(Json::as_f64) {
+            detail = detail.property("Fullness", format!("{}%", (f * 100.0).round()));
+        }
+        detail.columns = fixed_columns();
+        let namespaces = namespace_summaries(name, &stats);
+        detail.rows = Some(rows_table(
+            &[("namespace", "string"), ("vectors", "integer")],
+            stats
+                .get("namespaces")
+                .and_then(Json::as_object)
+                .into_iter()
+                .flatten()
+                .map(|(ns, spec)| {
+                    vec![
+                        Value::Text(if ns.is_empty() { "(default)".into() } else { ns.clone() }),
+                        Value::Int(spec.get("vectorCount").or_else(|| spec.get("vector_count")).and_then(Json::as_i64).unwrap_or(0)),
+                    ]
+                })
+                .collect(),
+        ));
+        detail.children = namespaces;
+        Ok(detail
+            .action(ObjectAction::destructive("clear", "Delete all vectors", json!({"index": name, "delete": {"deleteAll": true}}).to_string()))
+            .action(ObjectAction::destructive("delete", "Delete index", json!({"method": "DELETE", "path": format!("/indexes/{name}")}).to_string())))
+    }
+
+    async fn snapshot_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = reference.name.as_str();
+        let body = self.control_get(&format!("/collections/{name}")).await?;
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&body), CodeLanguage::Json);
+        for (label, key) in [("Status", "status"), ("Environment", "environment"), ("Source index", "source_collection")] {
+            let v = str_at(&body, key);
+            if !v.is_empty() {
+                detail = detail.property(label, v);
+            }
+        }
+        for (label, key) in [("Dimension", "dimension"), ("Vectors", "vector_count")] {
+            if let Some(v) = body.get(key) {
+                detail = detail.property(label, text_of(v));
+            }
+        }
+        if let Some(size) = body.get("size").and_then(Json::as_f64) {
+            detail = detail.property("Size", human_bytes(size));
+        }
+        Ok(detail.action(ObjectAction::destructive("delete", "Delete collection", json!({"method": "DELETE", "path": format!("/collections/{name}")}).to_string())))
+    }
+
+    async fn namespace_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let index = reference.parent.as_deref().ok_or_else(|| AppError::invalid_input("A namespace needs its index as parent."))?;
+        let ns = namespace_arg(&reference.name);
+        let stats = self.stats(index).await?;
+        let spec = stats.pointer(&format!("/namespaces/{ns}")).cloned().unwrap_or(Json::Null);
+        let count = spec.get("vectorCount").or_else(|| spec.get("vector_count")).and_then(Json::as_f64).unwrap_or(0.0);
+        let detail = ObjectDetail::empty(reference)
+            .definition(pretty(&spec), CodeLanguage::Json)
+            .property("Index", index)
+            .property("Namespace", if ns.is_empty() { "(default)".to_string() } else { ns.clone() })
+            .property("Vectors", crate::model::objects::format_number(count));
+        let mut body = json!({"deleteAll": true});
+        if !ns.is_empty() {
+            body["namespace"] = Json::String(ns);
+        }
+        Ok(detail.action(ObjectAction::destructive("clear", "Delete all vectors", json!({"index": index, "delete": body}).to_string())))
+    }
+
+    async fn similarity(&self, req: &VectorSearchRequest) -> AppResult<ResultSet> {
+        if req.vector.is_empty() {
+            return Err(AppError::invalid_input("A query vector is required."));
+        }
+        let resp = self.data_call(&req.collection, reqwest::Method::POST, "/query", Some(&query_body(req))).await?;
+        Ok(query_hits(&resp, req.include_vectors))
+    }
+
+    async fn overview(&self) -> AppResult<ServerStats> {
+        let mut indexes = Vec::new();
+        for name in self.index_names().await? {
+            let desc = self.describe_index(&name).await.unwrap_or(Json::Null);
+            let stats = self.stats(&name).await.unwrap_or(Json::Null);
+            indexes.push((name, desc, stats));
+        }
+        Ok(ServerStats::now(stats_groups(API_VERSION, &indexes)))
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities {
             sql: false,
             namespaces: false,
             fixed_columns: true,
@@ -474,7 +886,20 @@ impl Integration for PineconeIntegration {
             views: false,
             transactions: false,
             exact_estimate: true,
-        }
+        },
+        object_kinds: vec![K::Collection, K::Namespace, K::Snapshot],
+        tools: vec![T::Stats, T::VectorSearch],
+    }
+}
+
+#[async_trait]
+impl Integration for PineconeIntegration {
+    fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -551,6 +976,32 @@ impl Integration for PineconeIntegration {
         Ok(vec![self.run(cmd, max_rows).await?])
     }
 
+    async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        match kind {
+            ObjectKind::Collection => self.list_indexes().await,
+            ObjectKind::Snapshot => self.list_snapshots().await,
+            ObjectKind::Namespace => self.list_namespaces(parent).await,
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        match reference.kind {
+            ObjectKind::Collection => self.index_detail(reference).await,
+            ObjectKind::Snapshot => self.snapshot_detail(reference).await,
+            ObjectKind::Namespace => self.namespace_detail(reference).await,
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        self.overview().await
+    }
+
+    async fn vector_search(&self, req: &VectorSearchRequest) -> AppResult<ResultSet> {
+        self.similarity(req).await
+    }
+
     async fn close(&self) {}
 }
 
@@ -602,6 +1053,109 @@ mod tests {
         assert_eq!(raw, Some(Command::Raw { method: "POST".into(), path: "/query".into(), body: Some(json!({})), host: Some("h.pinecone.io".into()) }));
         assert!(parse_command(r#"{"index":"docs","delete":{"deleteAll":true}}"#).map(|c| c.is_mutation()).unwrap_or(false));
         assert!(parse_command("SELECT 1").is_err());
+    }
+
+    #[test]
+    fn explorer_lists_indexes_snapshots_namespaces() {
+        let indexes = json!({"indexes": [
+            {"name": "docs", "dimension": 1536, "metric": "cosine", "host": "docs-abc.svc.pinecone.io", "status": {"ready": true, "state": "Ready"}, "spec": {"serverless": {"cloud": "aws", "region": "us-east-1"}}},
+            {"name": "legacy", "dimension": 768, "metric": "dotproduct", "host": "", "status": {"state": "Initializing"}, "spec": {"pod": {"pod_type": "p1.x1", "environment": "us-west1-gcp"}}}
+        ]});
+        let list = index_summaries(&indexes);
+        assert_eq!(list[0].reference.name, "docs");
+        assert_eq!(list[0].badge.as_deref(), Some("ready"));
+        assert_eq!(list[0].detail.as_deref(), Some("1536d · cosine · serverless aws us-east-1 · docs-abc.svc.pinecone.io"));
+        assert_eq!(list[1].badge.as_deref(), Some("initializing"));
+        assert_eq!(list[1].detail.as_deref(), Some("768d · dotproduct · pods p1.x1 us-west1-gcp"));
+        assert_eq!(placement(&json!({})), "");
+
+        let snaps = snapshot_summaries(&json!({"collections": [{"name": "docs-backup", "status": "Ready", "dimension": 1536, "vector_count": 1200, "size": 4096, "source_collection": "docs"}]}));
+        assert_eq!(snaps[0].reference.parent.as_deref(), Some("docs"));
+        assert_eq!(snaps[0].badge.as_deref(), Some("ready"));
+        assert_eq!(snaps[0].detail.as_deref(), Some("1,200 vectors · 1536d · 4.0 KB"));
+
+        let ns = namespace_summaries("docs", &json!({"namespaces": {"": {"vectorCount": 10}, "tenant-a": {"vectorCount": 5}}}));
+        assert_eq!(ns[0].reference.name, "(default)");
+        assert_eq!(ns[0].badge.as_deref(), Some("default"));
+        assert_eq!(ns[0].detail.as_deref(), Some("10 vectors"));
+        assert_eq!(ns[1].reference.name, "tenant-a");
+        assert_eq!(ns[1].reference.parent.as_deref(), Some("docs"));
+        assert!(ns[1].badge.is_none());
+        assert_eq!(namespace_arg("(default)"), "");
+        assert_eq!(namespace_arg("tenant-a"), "tenant-a");
+    }
+
+    #[test]
+    fn vector_search_body_and_hits() {
+        let req = VectorSearchRequest {
+            collection: "docs".into(),
+            vector: vec![0.1, 0.9],
+            vector_name: None,
+            top_k: 4,
+            filter: Some(json!({"genre": {"$eq": "scifi"}})),
+            include_vectors: false,
+        };
+        let body = query_body(&req);
+        assert_eq!(body["vector"], json!([0.1, 0.9]));
+        assert_eq!(body["topK"], 4);
+        assert_eq!(body["includeMetadata"], json!(true));
+        assert_eq!(body["includeValues"], json!(false));
+        assert_eq!(body["filter"], json!({"genre": {"$eq": "scifi"}}));
+        assert!(body.get("namespace").is_none());
+        let ns = query_body(&VectorSearchRequest { vector_name: Some("tenant-a".into()), include_vectors: true, filter: None, top_k: 0, ..req.clone() });
+        assert_eq!(ns["namespace"], "tenant-a");
+        assert_eq!(ns["topK"], 1);
+        assert_eq!(ns["includeValues"], json!(true));
+        assert!(ns.get("filter").is_none());
+        assert_eq!(query_body(&VectorSearchRequest { vector_name: Some("(default)".into()), ..req.clone() })["namespace"], "");
+
+        let resp = json!({"namespace": "", "matches": [
+            {"id": "v1", "score": 0.94, "metadata": {"genre": "scifi", "year": 1965}, "values": [0.1, 0.9]},
+            {"id": "v2", "score": 0.31, "metadata": {"genre": "drama"}}
+        ]});
+        let rs = query_hits(&resp, false);
+        let names: Vec<&str> = rs.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "score", "genre", "year"]);
+        assert_eq!(rs.rows[0][0], Value::Text("v1".into()));
+        assert_eq!(rs.rows[0][1], Value::Float(0.94));
+        assert_eq!(rs.rows[0][3], Value::Int(1965));
+        assert_eq!(rs.rows[1][3], Value::Null);
+        let with_vals = query_hits(&resp, true);
+        assert_eq!(with_vals.columns.last().map(|c| c.name.as_str()), Some("values"));
+        assert_eq!(with_vals.rows[0][4], Value::Json(json!([0.1, 0.9])));
+        assert!(query_hits(&json!({}), false).rows.is_empty());
+    }
+
+    #[test]
+    fn stats_groups_aggregate_indexes() {
+        let indexes = vec![
+            ("docs".to_string(), json!({"dimension": 1536, "status": {"ready": true}}), json!({"totalVectorCount": 1200, "indexFullness": 0.25, "namespaces": {"": {"vectorCount": 1000}, "a": {"vectorCount": 200}}})),
+            ("other".to_string(), json!({"dimension": 768, "status": {"ready": false}}), json!({"totalVectorCount": 30, "indexFullness": 0.5, "namespaces": {}})),
+        ];
+        let groups = stats_groups("2025-01", &indexes);
+        let find = |group: &str, label: &str| groups.iter().find(|g| g.title == group).and_then(|g| g.stats.iter().find(|s| s.label == label).cloned());
+        assert_eq!(find("Server", "API version").map(|s| s.value), Some("2025-01".into()));
+        assert_eq!(find("Server", "Indexes").and_then(|s| s.numeric), Some(2.0));
+        assert_eq!(find("Storage", "Vectors").and_then(|s| s.numeric), Some(1230.0));
+        assert_eq!(find("Storage", "Namespaces").and_then(|s| s.numeric), Some(2.0));
+        assert_eq!(find("Storage", "Ready indexes").and_then(|s| s.numeric), Some(1.0));
+        assert_eq!(find("Storage", "Index fullness").and_then(|s| s.numeric), Some(50.0));
+        assert_eq!(find("Indexes", "Dimensions").map(|s| s.value), Some("docs 1536d, other 768d".into()));
+        assert_eq!(human_bytes(2048.0), "2.0 KB");
+    }
+
+    #[test]
+    fn explorer_actions_parse_as_console_commands() {
+        let delete = json!({"method": "DELETE", "path": "/indexes/docs"}).to_string();
+        match parse_command(&delete) {
+            Ok(cmd @ Command::Raw { .. }) => assert!(cmd.is_mutation()),
+            other => panic!("unexpected {other:?}"),
+        }
+        let clear = json!({"index": "docs", "delete": {"deleteAll": true, "namespace": "a"}}).to_string();
+        assert!(matches!(parse_command(&clear), Ok(Command::Delete { .. })));
+        assert!(parse_command(&clear).map(|c| c.is_mutation()).unwrap_or(false));
+        let snapshot = json!({"method": "DELETE", "path": "/collections/docs-backup"}).to_string();
+        assert!(parse_command(&snapshot).is_ok());
     }
 
     #[tokio::test]

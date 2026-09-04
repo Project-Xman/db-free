@@ -3,6 +3,7 @@ import { useCallback, useState } from "react";
 import { useWorkspace, type SidebarMode } from "@/stores/workspace";
 import { Resizer } from "@/components/global/Resizer";
 import { TablesPanel } from "./TablesPanel";
+import { ObjectsPanel } from "@/features/objects/ObjectsPanel";
 import { QueriesPanel } from "@/features/queries/QueriesPanel";
 import { DocumentsPanel } from "@/features/documents/DocumentsPanel";
 
@@ -10,6 +11,8 @@ function renderPanel(mode: SidebarMode) {
   switch (mode) {
     case "tables":
       return <TablesPanel />;
+    case "objects":
+      return <ObjectsPanel />;
     case "queries":
       return <QueriesPanel />;
     case "dashboards":

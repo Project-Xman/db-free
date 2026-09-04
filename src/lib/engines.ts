@@ -160,12 +160,16 @@ export const ENGINES = {
   cockroachdb: server({ label: "CockroachDB", kind: "new_sql", defaultPort: 26257, defaultDatabase: "defaultdb", defaultUser: "root", hint: "Distributed SQL · PG wire", schemes: ["cockroachdb", "cockroach", "crdb"] }),
   tidb: server({ label: "TiDB", kind: "new_sql", defaultPort: 4000, defaultDatabase: "test", defaultUser: "root", hint: "Distributed SQL · MySQL wire", schemes: ["tidb"] }),
   yugabytedb: server({ label: "YugabyteDB", kind: "new_sql", defaultPort: 5433, defaultDatabase: "yugabyte", defaultUser: "yugabyte", hint: "Distributed SQL · PG wire", schemes: ["yugabyte", "yugabytedb"] }),
+  spacetimedb: http({ label: "SpacetimeDB", kind: "new_sql", hint: "Module database · HTTP SQL", commandLanguage: SQL, schemes: ["spacetimedb", "spacetime"], fields: { host: "Host URL", database: "Module name or identity", password: "Identity token (optional)" }, hostPlaceholder: "http://localhost:3000" }),
 
   // ---- Embedded
   sqlite: file({ label: "SQLite", kind: "embedded", hint: "Embedded file · SQL", schemes: ["sqlite", "file"] }),
   rocksdb: file({ label: "RocksDB", kind: "embedded", icon: "hash", hint: "Embedded key-value · directory", commandLanguage: "Command", schemes: ["rocksdb"], fields: { filePath: "Database directory" } }),
   libsql: http({ label: "LibSQL / Turso", kind: "embedded", hint: "Serverless SQLite · HTTP", commandLanguage: SQL, schemes: ["libsql", "turso"], fields: { host: "Database URL", password: "Auth token" }, hostPlaceholder: "libsql://your-db.turso.io" }),
   val_town: http({ label: "Val Town", kind: "embedded", defaultDatabase: "main", hint: "Serverless SQLite · HTTP", commandLanguage: SQL, schemes: ["valtown", "val_town"], fields: { host: "API base (optional)", password: "API token", database: "Database name" }, hostPlaceholder: "https://api.val.town" }),
+  s3: meta({ label: "Amazon S3", kind: "object", form: "aws", defaultPort: null, defaultDatabase: "", defaultUser: "", icon: "database", hint: "Object storage · buckets and keys", commandLanguage: "Command", schemes: ["s3"], fields: { host: "Region", username: "Access key ID", password: "Secret access key", database: "Endpoint override" }, hostPlaceholder: "us-east-1" }),
+  minio: meta({ label: "MinIO", kind: "object", form: "aws", defaultPort: null, defaultDatabase: "", defaultUser: "", icon: "database", hint: "S3-compatible storage · self-hosted", commandLanguage: "Command", schemes: ["minio"], fields: { host: "Region", username: "Access key", password: "Secret key", database: "Endpoint URL" }, hostPlaceholder: "us-east-1" }),
+  cloudflare_r2: meta({ label: "Cloudflare R2", kind: "object", form: "aws", defaultPort: null, defaultDatabase: "", defaultUser: "", icon: "database", hint: "S3-compatible storage · zero egress", commandLanguage: "Command", schemes: ["r2", "cloudflare_r2"], fields: { host: "Region", username: "Access key ID", password: "Secret access key", database: "Endpoint URL" }, hostPlaceholder: "auto" }),
   cloudflare_d1: http({ label: "Cloudflare D1", kind: "embedded", hint: "Serverless SQLite · REST", commandLanguage: SQL, schemes: ["cloudflare", "d1"], fields: { host: "Account ID", database: "Database ID", password: "API token" }, hostPlaceholder: "Account ID (32 hex characters)" }),
 
   // ---- Ledger

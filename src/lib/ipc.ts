@@ -29,8 +29,15 @@ import type {
   ImportReport,
   ImportRequest,
   ListDocumentsRequest,
+  ObjectDetail,
+  ObjectRequest,
+  ObjectSummary,
+  ObjectsRequest,
   PlanReport,
   QueryOutcome,
+  RangeQueryCommand,
+  RangeResult,
+  ResultSet,
   RunWorkflowRequest,
   SaveBufferRequest,
   SaveConnectionRequest,
@@ -39,10 +46,14 @@ import type {
   SaveSettingsRequest,
   SavedQuery,
   SchemaCatalog,
+  SearchCommand,
+  SearchResult,
+  ServerStats,
   SessionInfo,
   SessionRequest,
   TablePage,
   TablePageRequest,
+  VectorSearchCommand,
   WorkflowRunReport,
 } from "./bindings";
 
@@ -88,6 +99,13 @@ interface CommandMap {
   ai_generate: { req: AiGenerateRequest; res: AiReply };
   explain_query: { req: ExplainRequest; res: PlanReport };
   run_workflow: { req: RunWorkflowRequest; res: WorkflowRunReport };
+  list_objects: { req: ObjectsRequest; res: ObjectSummary[] };
+  load_object: { req: ObjectRequest; res: ObjectDetail };
+  server_stats: { req: SessionRequest; res: ServerStats };
+  vector_search: { req: VectorSearchCommand; res: ResultSet };
+  search_documents: { req: SearchCommand; res: SearchResult };
+  query_range: { req: RangeQueryCommand; res: RangeResult };
+  load_history: { req: ObjectRequest; res: ResultSet };
 }
 
 type MissingFromMap = Exclude<CommandName, keyof CommandMap>;

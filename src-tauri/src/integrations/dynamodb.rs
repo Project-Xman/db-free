@@ -1,12 +1,13 @@
-// SOT: dynamodb-integration, aws-sigv4, partiql, dynamodb-attribute-value
+// SOT: dynamodb-integration, aws-sigv4, partiql, dynamodb-attribute-value, dynamodb-object-explorer, dynamodb-server-stats
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::aws_sigv4::{sign_post, AwsCredentials, SignRequest};
-use crate::integrations::http::{json_result, HttpClient};
+use crate::integrations::http::{json_result, objects_to_result_set, HttpClient};
 use crate::integrations::{Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog,
-    SchemaInfo, StatementResult, TableInfo, TableKind, TableRef, Value,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, ObjectAction, ObjectDetail, ObjectKind, ObjectRef,
+    ObjectSummary, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, ServerStats, Stat, StatGroup,
+    StatementResult, TableInfo, TableKind, TableRef, Value,
 };
 use async_trait::async_trait;
 use reqwest::Method;
@@ -292,10 +293,12 @@ impl DynamoIntegration {
             &self.creds,
             &SignRequest {
                 service: "dynamodb",
+                method: "POST",
                 host: &self.host,
                 path: "/",
+                query: "",
                 amz_target: Some(&target),
-                content_type: CONTENT_TYPE,
+                content_type: Some(CONTENT_TYPE),
                 body: &bytes,
                 now: chrono::Utc::now(),
             },
@@ -376,6 +379,495 @@ impl DynamoIntegration {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Object explorer / administration
+// ---------------------------------------------------------------------------
+//
+// WHAT:  Tables (`ListTables` + `DescribeTable`), their secondary indexes
+//        (GSI / LSI), the tables whose stream is enabled, and backups
+//        (`ListBackups`). Stats are the totals over every table plus the
+//        account limits from `DescribeLimits`.
+// WHY:   DynamoDB has one flat namespace per region: no schemas, users or
+//        sessions to list, so the four kinds above are the whole catalog.
+// HOW:   `DescribeTable` is the only source for indexes and streams, so the
+//        listings describe each table once and map the reply with pure
+//        functions. Index and backup references carry their table as parent.
+//        `ListBackups` and `DescribeLimits` need extra IAM permissions; both
+//        degrade to empty rather than failing the listing.
+
+type Json = serde_json::Value;
+
+const OBJECT_CAP: usize = 2_000;
+const TABLE_PAGE: usize = 100;
+
+fn jstr<'a>(v: &'a Json, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(Json::as_str)
+}
+
+fn jnum(v: &Json, key: &str) -> Option<f64> {
+    v.get(key).and_then(Json::as_f64)
+}
+
+fn pnum(v: &Json, pointer: &str) -> Option<f64> {
+    v.pointer(pointer).and_then(Json::as_f64)
+}
+
+fn items<'a>(v: &'a Json, key: &str) -> impl Iterator<Item = &'a Json> {
+    v.get(key).and_then(Json::as_array).into_iter().flatten()
+}
+
+fn pretty(v: &Json) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_default()
+}
+
+fn sorted(mut list: Vec<ObjectSummary>) -> Vec<ObjectSummary> {
+    list.sort_by(|a, b| a.reference.name.cmp(&b.reference.name));
+    list.truncate(OBJECT_CAP);
+    list
+}
+
+fn bytes_text(bytes: f64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes.max(0.0);
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} B", value as u64)
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn epoch_text(secs: f64) -> String {
+    chrono::DateTime::from_timestamp(secs as i64, 0).map(|t| t.to_rfc3339()).unwrap_or_else(|| format!("{secs}"))
+}
+
+// WHAT:  Permission-denied and unsupported-operation replies mean "nothing to
+//        list here", not a failure (DynamoDB Local serves no backups or limits).
+fn tolerated<T: Default>(result: AppResult<T>) -> AppResult<T> {
+    match &result {
+        Err(e) => {
+            let m = e.message();
+            let denied = ["AccessDenied", "UnrecognizedClient", "not authorized", "UnknownOperation", "InvalidAction"].iter().any(|n| m.contains(n));
+            if denied || matches!(e, AppError::NotConnected { .. } | AppError::NotFound { .. }) {
+                Ok(T::default())
+            } else {
+                result
+            }
+        }
+        _ => result,
+    }
+}
+
+// WHAT:  PROVISIONED shows its configured capacity; on-demand says so.
+fn billing_text(desc: &Json) -> String {
+    match desc.pointer("/BillingModeSummary/BillingMode").and_then(Json::as_str) {
+        Some("PAY_PER_REQUEST") => "on-demand".to_string(),
+        _ => {
+            let read = pnum(desc, "/ProvisionedThroughput/ReadCapacityUnits").unwrap_or(0.0);
+            let write = pnum(desc, "/ProvisionedThroughput/WriteCapacityUnits").unwrap_or(0.0);
+            format!("{read} RCU / {write} WCU")
+        }
+    }
+}
+
+fn key_schema_text(container: &Json) -> String {
+    items(container, "KeySchema")
+        .filter_map(|k| {
+            let name = jstr(k, "AttributeName")?;
+            Some(match jstr(k, "KeyType") {
+                Some("HASH") => format!("{name} (partition)"),
+                Some("RANGE") => format!("{name} (sort)"),
+                _ => name.to_string(),
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn projection_text(index: &Json) -> String {
+    match index.pointer("/Projection/ProjectionType").and_then(Json::as_str) {
+        Some("INCLUDE") => {
+            let cols: Vec<&str> = index.pointer("/Projection/NonKeyAttributes").and_then(Json::as_array).into_iter().flatten().filter_map(Json::as_str).collect();
+            format!("INCLUDE ({})", cols.join(", "))
+        }
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
+// ---- listings ---------------------------------------------------------------
+
+// WHAT:  `DescribeTable` payloads → table rows.
+fn table_summaries(descriptions: &[Json]) -> Vec<ObjectSummary> {
+    let list = descriptions
+        .iter()
+        .filter_map(|desc| {
+            let name = jstr(desc, "TableName")?;
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(n) = jnum(desc, "ItemCount") {
+                parts.push(format!("{} items", crate::model::objects::format_number(n)));
+            }
+            if let Some(size) = jnum(desc, "TableSizeBytes") {
+                parts.push(bytes_text(size));
+            }
+            parts.push(billing_text(desc));
+            let mut s = ObjectSummary::new(ObjectKind::Table, name, None).with_detail(parts.join(" · "));
+            if let Some(status) = jstr(desc, "TableStatus") {
+                s = s.with_badge(status.to_lowercase());
+            }
+            Some(s)
+        })
+        .collect();
+    sorted(list)
+}
+
+// WHAT:  GSIs and LSIs of one described table; parent = the table.
+fn index_summaries(desc: &Json) -> Vec<ObjectSummary> {
+    let Some(table) = jstr(desc, "TableName") else { return Vec::new() };
+    let mut list = Vec::new();
+    // Global and local indexes are different objects in DynamoDB, so they stay
+    // grouped (GSI first) and are sorted by name inside each group rather than
+    // interleaved by one flat sort.
+    for (key, badge) in [("GlobalSecondaryIndexes", "gsi"), ("LocalSecondaryIndexes", "lsi")] {
+        let mut group = Vec::new();
+        for index in items(desc, key) {
+            let Some(name) = jstr(index, "IndexName") else { continue };
+            let mut parts = vec![key_schema_text(index)];
+            let projection = projection_text(index);
+            if !projection.is_empty() {
+                parts.push(projection);
+            }
+            if let Some(n) = jnum(index, "ItemCount") {
+                parts.push(format!("{} items", crate::model::objects::format_number(n)));
+            }
+            let status = jstr(index, "IndexStatus").filter(|s| *s != "ACTIVE");
+            let mut s = ObjectSummary::new(ObjectKind::Index, name, Some(table.to_string())).with_detail(parts.join(" · "));
+            s = match status {
+                Some(state) => s.with_badge(state.to_lowercase()),
+                None => s.with_badge(badge),
+            };
+            group.push(s);
+        }
+        group.sort_by(|a, b| a.reference.name.cmp(&b.reference.name));
+        list.extend(group);
+    }
+    list.truncate(OBJECT_CAP);
+    list
+}
+
+// WHAT:  Tables whose `StreamSpecification` is enabled; name = the table.
+fn stream_summaries(descriptions: &[Json]) -> Vec<ObjectSummary> {
+    let list = descriptions
+        .iter()
+        .filter(|d| d.pointer("/StreamSpecification/StreamEnabled").and_then(Json::as_bool) == Some(true))
+        .filter_map(|desc| {
+            let name = jstr(desc, "TableName")?;
+            let mut s = ObjectSummary::new(ObjectKind::Stream, name, None);
+            if let Some(arn) = jstr(desc, "LatestStreamArn") {
+                s = s.with_detail(arn);
+            }
+            if let Some(view) = desc.pointer("/StreamSpecification/StreamViewType").and_then(Json::as_str) {
+                s = s.with_badge(view.to_lowercase().replace('_', " "));
+            }
+            Some(s)
+        })
+        .collect();
+    sorted(list)
+}
+
+// WHAT:  `ListBackups` → backups; parent = the table they belong to.
+fn backup_summaries(reply: &Json, table: Option<&str>) -> Vec<ObjectSummary> {
+    let list = items(reply, "BackupSummaries")
+        .filter_map(|b| {
+            let name = jstr(b, "BackupName")?;
+            let owner = jstr(b, "TableName")?;
+            if table.is_some_and(|t| t != owner) {
+                return None;
+            }
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(t) = jstr(b, "BackupCreationDateTime").map(str::to_string).or_else(|| jnum(b, "BackupCreationDateTime").map(epoch_text)) {
+                parts.push(t);
+            }
+            if let Some(size) = jnum(b, "BackupSizeBytes") {
+                parts.push(bytes_text(size));
+            }
+            if let Some(kind) = jstr(b, "BackupType") {
+                parts.push(kind.to_lowercase());
+            }
+            let mut s = ObjectSummary::new(ObjectKind::Backup, name, Some(owner.to_string())).with_detail(parts.join(" · "));
+            if let Some(status) = jstr(b, "BackupStatus") {
+                s = s.with_badge(status.to_lowercase());
+            }
+            Some(s)
+        })
+        .collect();
+    sorted(list)
+}
+
+// ---- details ----------------------------------------------------------------
+
+// WHAT:  Table sheet: DescribeTable as the definition, attribute definitions as
+//        columns, key schema as rows, indexes (and backups) as children.
+fn table_detail(reference: &ObjectRef, desc: &Json, backups: Vec<ObjectSummary>) -> ObjectDetail {
+    let mut d = ObjectDetail::empty(reference).definition(pretty(desc), CodeLanguage::Json);
+    for (label, key) in [("Status", "TableStatus"), ("ARN", "TableArn"), ("Id", "TableId")] {
+        if let Some(v) = jstr(desc, key) {
+            d = d.property(label, v);
+        }
+    }
+    if let Some(n) = jnum(desc, "ItemCount") {
+        d = d.property("Items", crate::model::objects::format_number(n));
+    }
+    if let Some(size) = jnum(desc, "TableSizeBytes") {
+        d = d.property("Size", bytes_text(size));
+    }
+    d = d.property("Billing", billing_text(desc)).property("Key schema", key_schema_text(desc));
+    if let Some(created) = jnum(desc, "CreationDateTime") {
+        d = d.property("Created", epoch_text(created));
+    }
+    if let Some(class) = desc.pointer("/TableClassSummary/TableClass").and_then(Json::as_str) {
+        d = d.property("Table class", class);
+    }
+    if desc.pointer("/StreamSpecification/StreamEnabled").and_then(Json::as_bool) == Some(true) {
+        d = d.property("Stream", desc.pointer("/StreamSpecification/StreamViewType").and_then(Json::as_str).unwrap_or("enabled"));
+    }
+    if let Some(sse) = desc.pointer("/SSEDescription/Status").and_then(Json::as_str) {
+        d = d.property("Encryption", sse);
+    }
+    d.columns = items(desc, "AttributeDefinitions")
+        .enumerate()
+        .filter_map(|(i, a)| {
+            let name = jstr(a, "AttributeName")?.to_string();
+            let key = items(desc, "KeySchema").any(|k| jstr(k, "AttributeName") == Some(name.as_str()));
+            Some(ColumnInfo {
+                data_type: key_type_name(jstr(a, "AttributeType").unwrap_or_default()).to_string(),
+                nullable: !key,
+                primary_key: key,
+                name,
+                ordinal: i as u32 + 1,
+            })
+        })
+        .collect();
+    let key_rows: Vec<Json> = items(desc, "KeySchema")
+        .map(|k| {
+            let name = jstr(k, "AttributeName").unwrap_or_default();
+            let attr_type = items(desc, "AttributeDefinitions").find(|a| jstr(a, "AttributeName") == Some(name)).and_then(|a| jstr(a, "AttributeType")).unwrap_or_default();
+            serde_json::json!({"attribute": name, "keyType": jstr(k, "KeyType").unwrap_or_default(), "type": key_type_name(attr_type)})
+        })
+        .collect();
+    if !key_rows.is_empty() {
+        d.rows = Some(objects_to_result_set(&key_rows, Some("attribute"), OBJECT_CAP));
+    }
+    d.children = index_summaries(desc).into_iter().chain(backups).collect();
+    d
+}
+
+fn index_detail(reference: &ObjectRef, desc: &Json, index: &Json, kind: &str) -> ObjectDetail {
+    let mut d = ObjectDetail::empty(reference)
+        .definition(pretty(index), CodeLanguage::Json)
+        .property("Type", kind)
+        .property("Table", jstr(desc, "TableName").unwrap_or_default())
+        .property("Key schema", key_schema_text(index))
+        .property("Projection", projection_text(index));
+    for (label, key) in [("Status", "IndexStatus"), ("ARN", "IndexArn")] {
+        if let Some(v) = jstr(index, key) {
+            d = d.property(label, v);
+        }
+    }
+    if let Some(n) = jnum(index, "ItemCount") {
+        d = d.property("Items", crate::model::objects::format_number(n));
+    }
+    if let Some(size) = jnum(index, "IndexSizeBytes") {
+        d = d.property("Size", bytes_text(size));
+    }
+    if index.get("ProvisionedThroughput").is_some() {
+        let read = pnum(index, "/ProvisionedThroughput/ReadCapacityUnits").unwrap_or(0.0);
+        let write = pnum(index, "/ProvisionedThroughput/WriteCapacityUnits").unwrap_or(0.0);
+        d = d.property("Throughput", format!("{read} RCU / {write} WCU"));
+    }
+    let key_rows: Vec<Json> = items(index, "KeySchema")
+        .map(|k| serde_json::json!({"attribute": jstr(k, "AttributeName").unwrap_or_default(), "keyType": jstr(k, "KeyType").unwrap_or_default()}))
+        .collect();
+    if !key_rows.is_empty() {
+        d.rows = Some(objects_to_result_set(&key_rows, Some("attribute"), OBJECT_CAP));
+    }
+    // Only a GSI can be dropped on its own; an LSI lives and dies with its table.
+    if kind == "gsi" {
+        let statement = serde_json::json!({
+            "Operation": "UpdateTable",
+            "Params": {"TableName": jstr(desc, "TableName").unwrap_or_default(), "GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": reference.name}}]}
+        });
+        d = d.action(ObjectAction::destructive("delete", "Delete index", statement.to_string()));
+    }
+    d
+}
+
+fn stream_detail(reference: &ObjectRef, desc: &Json) -> ObjectDetail {
+    let definition = serde_json::json!({
+        "StreamSpecification": desc.get("StreamSpecification").cloned().unwrap_or(Json::Null),
+        "LatestStreamArn": desc.get("LatestStreamArn").cloned().unwrap_or(Json::Null),
+        "LatestStreamLabel": desc.get("LatestStreamLabel").cloned().unwrap_or(Json::Null)
+    });
+    let mut d = ObjectDetail::empty(reference).definition(pretty(&definition), CodeLanguage::Json).property("Table", jstr(desc, "TableName").unwrap_or_default());
+    if let Some(view) = desc.pointer("/StreamSpecification/StreamViewType").and_then(Json::as_str) {
+        d = d.property("View type", view);
+    }
+    for (label, key) in [("Stream ARN", "LatestStreamArn"), ("Stream label", "LatestStreamLabel")] {
+        if let Some(v) = jstr(desc, key) {
+            d = d.property(label, v);
+        }
+    }
+    let statement = serde_json::json!({"Operation": "UpdateTable", "Params": {"TableName": jstr(desc, "TableName").unwrap_or_default(), "StreamSpecification": {"StreamEnabled": false}}});
+    d.action(ObjectAction::destructive("disable", "Disable stream", statement.to_string()))
+}
+
+fn backup_detail(reference: &ObjectRef, backup: &Json) -> ObjectDetail {
+    let mut d = ObjectDetail::empty(reference).definition(pretty(backup), CodeLanguage::Json);
+    let details = backup.get("BackupDetails").unwrap_or(backup);
+    let table = backup.pointer("/SourceTableDetails/TableName").and_then(Json::as_str).or_else(|| jstr(backup, "TableName")).unwrap_or_default();
+    d = d.property("Table", table);
+    for (label, key) in [("Status", "BackupStatus"), ("Type", "BackupType"), ("ARN", "BackupArn")] {
+        if let Some(v) = jstr(details, key) {
+            d = d.property(label, v);
+        }
+    }
+    if let Some(size) = jnum(details, "BackupSizeBytes") {
+        d = d.property("Size", bytes_text(size));
+    }
+    if let Some(created) = jstr(details, "BackupCreationDateTime").map(str::to_string).or_else(|| jnum(details, "BackupCreationDateTime").map(epoch_text)) {
+        d = d.property("Created", created);
+    }
+    if let Some(arn) = jstr(details, "BackupArn") {
+        let statement = serde_json::json!({"Operation": "DeleteBackup", "Params": {"BackupArn": arn}});
+        d = d.action(ObjectAction::destructive("delete", "Delete backup", statement.to_string()));
+    }
+    d
+}
+
+// ---- server stats -------------------------------------------------------------
+
+fn push_group(groups: &mut Vec<StatGroup>, title: &str, stats: Vec<Stat>) {
+    if !stats.is_empty() {
+        groups.push(StatGroup { title: title.to_string(), stats });
+    }
+}
+
+// WHAT:  Totals over the described tables plus the account limits.
+fn server_stat_groups(region: &str, endpoint: &str, descriptions: &[Json], limits: &Json) -> Vec<StatGroup> {
+    let mut groups = Vec::new();
+    let mut server = vec![Stat::text("Region", region), Stat::text("Endpoint", endpoint), Stat::number("Tables", descriptions.len() as f64, None)];
+    if !descriptions.is_empty() {
+        let active = descriptions.iter().filter(|d| jstr(d, "TableStatus") == Some("ACTIVE")).count();
+        server.push(Stat::number("Active tables", active as f64, None));
+    }
+    push_group(&mut groups, "Server", server);
+
+    let mut storage = Vec::new();
+    if !descriptions.is_empty() {
+        let items_total: f64 = descriptions.iter().filter_map(|d| jnum(d, "ItemCount")).sum();
+        let bytes_total: f64 = descriptions.iter().filter_map(|d| jnum(d, "TableSizeBytes")).sum();
+        let indexes: usize = descriptions.iter().map(|d| items(d, "GlobalSecondaryIndexes").count() + items(d, "LocalSecondaryIndexes").count()).sum();
+        let streams = descriptions.iter().filter(|d| d.pointer("/StreamSpecification/StreamEnabled").and_then(Json::as_bool) == Some(true)).count();
+        storage.push(Stat::number("Items", items_total, None));
+        storage.push(Stat::number("Size", (bytes_total / 1_048_576.0 * 100.0).round() / 100.0, Some("MB")).with_hint(bytes_text(bytes_total)));
+        storage.push(Stat::number("Secondary indexes", indexes as f64, None));
+        storage.push(Stat::number("Streams enabled", streams as f64, None));
+    }
+    push_group(&mut groups, "Storage", storage);
+
+    let mut capacity = Vec::new();
+    if !descriptions.is_empty() {
+        let on_demand = descriptions.iter().filter(|d| d.pointer("/BillingModeSummary/BillingMode").and_then(Json::as_str) == Some("PAY_PER_REQUEST")).count();
+        let read: f64 = descriptions.iter().filter_map(|d| pnum(d, "/ProvisionedThroughput/ReadCapacityUnits")).sum();
+        let write: f64 = descriptions.iter().filter_map(|d| pnum(d, "/ProvisionedThroughput/WriteCapacityUnits")).sum();
+        capacity.push(Stat::number("On-demand tables", on_demand as f64, None));
+        capacity.push(Stat::number("Provisioned read", read, Some("RCU")));
+        capacity.push(Stat::number("Provisioned write", write, Some("WCU")));
+    }
+    for (label, key, unit) in [
+        ("Account read limit", "AccountMaxReadCapacityUnits", "RCU"),
+        ("Account write limit", "AccountMaxWriteCapacityUnits", "WCU"),
+        ("Table read limit", "TableMaxReadCapacityUnits", "RCU"),
+        ("Table write limit", "TableMaxWriteCapacityUnits", "WCU"),
+    ] {
+        if let Some(n) = jnum(limits, key) {
+            capacity.push(Stat::number(label, n, Some(unit)));
+        }
+    }
+    push_group(&mut groups, "Capacity", capacity);
+    groups
+}
+
+impl DynamoIntegration {
+    // WHAT:  Every table name in the region (paged); shared by catalog + explorer.
+    async fn table_names(&self) -> AppResult<Vec<String>> {
+        let mut names = Vec::new();
+        let mut start: Option<String> = None;
+        loop {
+            let mut body = serde_json::json!({"Limit": TABLE_PAGE});
+            if let Some(s) = &start {
+                body["ExclusiveStartTableName"] = Json::String(s.clone());
+            }
+            let resp = self.call("ListTables", &body).await?;
+            for t in items(&resp, "TableNames") {
+                if let Some(n) = t.as_str() {
+                    names.push(n.to_string());
+                }
+            }
+            match jstr(&resp, "LastEvaluatedTableName") {
+                Some(s) if names.len() < 5_000 => start = Some(s.to_string()),
+                _ => break,
+            }
+        }
+        Ok(names)
+    }
+
+    // WHAT:  `DescribeTable` for every table, capped at the listing cap.
+    async fn describe_all(&self) -> AppResult<Vec<Json>> {
+        let names = self.table_names().await?;
+        let mut out = Vec::with_capacity(names.len().min(OBJECT_CAP));
+        for name in names.into_iter().take(OBJECT_CAP) {
+            out.push(self.describe(&name).await?);
+        }
+        Ok(out)
+    }
+
+    async fn backups(&self, table: Option<&str>) -> AppResult<Json> {
+        let mut body = serde_json::json!({"Limit": TABLE_PAGE});
+        if let Some(t) = table {
+            body["TableName"] = Json::String(t.to_string());
+        }
+        tolerated(self.call("ListBackups", &body).await)
+    }
+
+    // WHAT:  One index of a described table, with the family it belongs to.
+    fn find_index<'a>(desc: &'a Json, name: &str) -> Option<(&'a Json, &'static str)> {
+        for (key, kind) in [("GlobalSecondaryIndexes", "gsi"), ("LocalSecondaryIndexes", "lsi")] {
+            if let Some(index) = items(desc, key).find(|i| jstr(i, "IndexName") == Some(name)) {
+                return Some((index, kind));
+            }
+        }
+        None
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities { namespaces: false, ..Capabilities::DOCUMENT },
+        object_kinds: vec![K::Table, K::Index, K::Stream, K::Backup],
+        tools: vec![T::Stats],
+    }
+}
+
 #[async_trait]
 impl Integration for DynamoIntegration {
     fn engine(&self) -> Engine {
@@ -383,7 +875,7 @@ impl Integration for DynamoIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { namespaces: false, ..Capabilities::DOCUMENT }
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -404,24 +896,7 @@ impl Integration for DynamoIntegration {
     }
 
     async fn catalog(&self) -> AppResult<SchemaCatalog> {
-        let mut names = Vec::new();
-        let mut start: Option<String> = None;
-        loop {
-            let mut body = serde_json::json!({"Limit": 100});
-            if let Some(s) = &start {
-                body["ExclusiveStartTableName"] = serde_json::Value::String(s.clone());
-            }
-            let resp = self.call("ListTables", &body).await?;
-            for t in resp.get("TableNames").and_then(|t| t.as_array()).into_iter().flatten() {
-                if let Some(n) = t.as_str() {
-                    names.push(n.to_string());
-                }
-            }
-            match resp.get("LastEvaluatedTableName").and_then(|s| s.as_str()) {
-                Some(s) if names.len() < 5_000 => start = Some(s.to_string()),
-                _ => break,
-            }
-        }
+        let names = self.table_names().await?;
         let tables = names.into_iter().map(|name| TableInfo { schema: Some("tables".into()), name, kind: TableKind::Table, row_estimate: None }).collect();
         Ok(SchemaCatalog { schemas: vec![SchemaInfo { name: "tables".into(), tables }] })
     }
@@ -542,6 +1017,73 @@ impl Integration for DynamoIntegration {
     }
 
     async fn close(&self) {}
+
+    async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let owner = parent.map(str::trim).filter(|p| !p.is_empty() && *p != "tables");
+        match kind {
+            ObjectKind::Table => Ok(table_summaries(&self.describe_all().await?)),
+            ObjectKind::Index => match owner {
+                Some(table) => Ok(index_summaries(&self.describe(table).await?)),
+                None => {
+                    let mut all = Vec::new();
+                    for desc in self.describe_all().await? {
+                        all.extend(index_summaries(&desc));
+                        if all.len() >= OBJECT_CAP {
+                            break;
+                        }
+                    }
+                    Ok(sorted(all))
+                }
+            },
+            ObjectKind::Stream => match owner {
+                Some(table) => Ok(stream_summaries(std::slice::from_ref(&self.describe(table).await?))),
+                None => Ok(stream_summaries(&self.describe_all().await?)),
+            },
+            ObjectKind::Backup => Ok(backup_summaries(&self.backups(owner).await?, owner)),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = reference.name.as_str();
+        let owner = reference.parent.as_deref().map(str::trim).filter(|p| !p.is_empty() && *p != "tables");
+        match reference.kind {
+            ObjectKind::Table => {
+                let desc = self.describe(name).await?;
+                let backups = backup_summaries(&self.backups(Some(name)).await?, Some(name));
+                Ok(table_detail(reference, &desc, backups))
+            }
+            ObjectKind::Index => {
+                let table = owner.ok_or_else(|| AppError::invalid_input("An index reference needs its table as parent."))?;
+                let desc = self.describe(table).await?;
+                let (index, kind) = Self::find_index(&desc, name).ok_or_else(|| AppError::not_found(format!("Index {name} not found on {table}.")))?;
+                Ok(index_detail(reference, &desc, index, kind))
+            }
+            ObjectKind::Stream => {
+                let desc = self.describe(owner.unwrap_or(name)).await?;
+                Ok(stream_detail(reference, &desc))
+            }
+            ObjectKind::Backup => {
+                let listing = self.backups(owner).await?;
+                let summary = items(&listing, "BackupSummaries")
+                    .find(|b| jstr(b, "BackupName") == Some(name))
+                    .ok_or_else(|| AppError::not_found(format!("Backup {name} not found.")))?;
+                // The summary carries the ARN; DescribeBackup adds the source table details.
+                let described = match jstr(summary, "BackupArn") {
+                    Some(arn) => tolerated(self.call("DescribeBackup", &serde_json::json!({"BackupArn": arn})).await)?.get("BackupDescription").cloned(),
+                    None => None,
+                };
+                Ok(backup_detail(reference, described.as_ref().unwrap_or(summary)))
+            }
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        let descriptions = self.describe_all().await?;
+        let limits = tolerated(self.call("DescribeLimits", &serde_json::json!({})).await)?;
+        Ok(ServerStats::now(server_stat_groups(&self.creds.region, &self.endpoint, &descriptions, &limits)))
+    }
 }
 
 #[cfg(test)]
@@ -595,6 +1137,158 @@ mod tests {
         assert!(!is_write_partiql("SELECT 1"));
         assert!(is_write_op("PutItem"));
         assert!(!is_write_op("Query"));
+    }
+
+    // WHAT:  A DescribeTable payload with both index families and a stream.
+    fn described() -> serde_json::Value {
+        serde_json::json!({
+            "TableName": "Orders",
+            "TableStatus": "ACTIVE",
+            "TableArn": "arn:aws:dynamodb:us-east-1:1:table/Orders",
+            "ItemCount": 1500,
+            "TableSizeBytes": 2_097_152,
+            "CreationDateTime": 1_700_000_000.0,
+            "BillingModeSummary": {"BillingMode": "PAY_PER_REQUEST"},
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}, {"AttributeName": "sk", "AttributeType": "N"}, {"AttributeName": "userId", "AttributeType": "S"}],
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "byUser", "IndexStatus": "ACTIVE", "ItemCount": 1500, "IndexSizeBytes": 1024,
+                "KeySchema": [{"AttributeName": "userId", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["total", "status"]}
+            }],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "bySk", "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}],
+                "Projection": {"ProjectionType": "ALL"}
+            }],
+            "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+            "LatestStreamArn": "arn:aws:dynamodb:us-east-1:1:table/Orders/stream/2024"
+        })
+    }
+
+    #[test]
+    fn tables_map_with_status_and_billing() {
+        let provisioned = serde_json::json!({
+            "TableName": "Legacy", "TableStatus": "CREATING", "ItemCount": 3, "TableSizeBytes": 512,
+            "ProvisionedThroughput": {"ReadCapacityUnits": 5.0, "WriteCapacityUnits": 1.0}
+        });
+        let tables = table_summaries(&[described(), provisioned.clone()]);
+        assert_eq!(tables[0].reference.name, "Legacy");
+        assert_eq!(tables[0].badge.as_deref(), Some("creating"));
+        assert_eq!(tables[0].detail.as_deref(), Some("3 items · 512 B · 5 RCU / 1 WCU"));
+        assert_eq!(tables[1].badge.as_deref(), Some("active"));
+        assert_eq!(tables[1].detail.as_deref(), Some("1,500 items · 2.0 MB · on-demand"));
+        assert!(tables[1].reference.parent.is_none(), "DynamoDB has one flat namespace");
+
+        let r = ObjectRef { kind: ObjectKind::Table, name: "Orders".into(), parent: None };
+        let d = table_detail(&r, &described(), vec![ObjectSummary::new(ObjectKind::Backup, "b1", Some("Orders".into()))]);
+        assert_eq!(d.language, CodeLanguage::Json);
+        assert!(d.properties.iter().any(|p| p.name == "Items" && p.value == "1,500"));
+        assert!(d.properties.iter().any(|p| p.name == "Size" && p.value == "2.0 MB"));
+        assert!(d.properties.iter().any(|p| p.name == "Key schema" && p.value == "pk (partition), sk (sort)"));
+        assert!(d.properties.iter().any(|p| p.name == "Stream" && p.value == "NEW_AND_OLD_IMAGES"));
+        assert!(d.properties.iter().any(|p| p.name == "Created" && p.value.starts_with("2023-11-14")));
+        // Attribute definitions become columns; only the key attributes are primary.
+        let cols: Vec<(&str, bool)> = d.columns.iter().map(|c| (c.name.as_str(), c.primary_key)).collect();
+        assert_eq!(cols, vec![("pk", true), ("sk", true), ("userId", false)]);
+        assert_eq!(d.columns[1].data_type, "number");
+        assert_eq!(d.rows.as_ref().map(|r| r.rows.len()), Some(2), "key schema is the tabular payload");
+        // Children are the two indexes plus the backup passed in.
+        assert_eq!(d.children.len(), 3);
+        assert!(d.actions.is_empty(), "dropping a table is not offered from the sheet");
+    }
+
+    #[test]
+    fn indexes_streams_and_backups_map() {
+        let desc = described();
+        let idx = index_summaries(&desc);
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx[0].reference.name, "byUser");
+        assert_eq!(idx[0].badge.as_deref(), Some("gsi"));
+        assert_eq!(idx[0].reference.parent.as_deref(), Some("Orders"));
+        assert_eq!(idx[0].detail.as_deref(), Some("userId (partition) · INCLUDE (total, status) · 1,500 items"));
+        assert_eq!(idx[1].badge.as_deref(), Some("lsi"));
+        assert_eq!(idx[1].detail.as_deref(), Some("pk (partition), sk (sort) · ALL"));
+
+        let (gsi, kind) = DynamoIntegration::find_index(&desc, "byUser").unwrap_or((&serde_json::Value::Null, "?"));
+        assert_eq!(kind, "gsi");
+        let r = ObjectRef { kind: ObjectKind::Index, name: "byUser".into(), parent: Some("Orders".into()) };
+        let d = index_detail(&r, &desc, gsi, kind);
+        assert!(d.properties.iter().any(|p| p.name == "Projection" && p.value == "INCLUDE (total, status)"));
+        assert_eq!(d.actions.len(), 1);
+        assert!(d.actions[0].destructive);
+        assert_eq!(
+            d.actions[0].statement,
+            r#"{"Operation":"UpdateTable","Params":{"TableName":"Orders","GlobalSecondaryIndexUpdates":[{"Delete":{"IndexName":"byUser"}}]}}"#
+        );
+        let (lsi, kind) = DynamoIntegration::find_index(&desc, "bySk").unwrap_or((&serde_json::Value::Null, "?"));
+        assert!(index_detail(&r, &desc, lsi, kind).actions.is_empty(), "an LSI cannot be dropped on its own");
+        assert!(DynamoIntegration::find_index(&desc, "nope").is_none());
+
+        let no_stream = serde_json::json!({"TableName": "Plain", "StreamSpecification": {"StreamEnabled": false}});
+        let streams = stream_summaries(&[desc.clone(), no_stream]);
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].reference.name, "Orders");
+        assert_eq!(streams[0].badge.as_deref(), Some("new and old images"));
+        let sr = ObjectRef { kind: ObjectKind::Stream, name: "Orders".into(), parent: None };
+        let sd = stream_detail(&sr, &desc);
+        assert!(sd.properties.iter().any(|p| p.name == "View type" && p.value == "NEW_AND_OLD_IMAGES"));
+        assert_eq!(sd.actions[0].statement, r#"{"Operation":"UpdateTable","Params":{"TableName":"Orders","StreamSpecification":{"StreamEnabled":false}}}"#);
+
+        let listing = serde_json::json!({"BackupSummaries": [
+            {"BackupName": "nightly", "TableName": "Orders", "BackupStatus": "AVAILABLE", "BackupType": "USER", "BackupSizeBytes": 4096, "BackupCreationDateTime": 1_700_000_000.0, "BackupArn": "arn:backup/1"},
+            {"BackupName": "other", "TableName": "Elsewhere", "BackupStatus": "AVAILABLE", "BackupArn": "arn:backup/2"}
+        ]});
+        let all = backup_summaries(&listing, None);
+        assert_eq!(all.len(), 2);
+        let scoped = backup_summaries(&listing, Some("Orders"));
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].reference.parent.as_deref(), Some("Orders"));
+        assert_eq!(scoped[0].badge.as_deref(), Some("available"));
+        assert!(scoped[0].detail.as_deref().unwrap_or_default().contains("4.0 KB"));
+        let br = ObjectRef { kind: ObjectKind::Backup, name: "nightly".into(), parent: Some("Orders".into()) };
+        let bd = backup_detail(&br, &listing["BackupSummaries"][0]);
+        assert!(bd.properties.iter().any(|p| p.name == "Table" && p.value == "Orders"));
+        assert_eq!(bd.actions[0].statement, r#"{"Operation":"DeleteBackup","Params":{"BackupArn":"arn:backup/1"}}"#);
+    }
+
+    #[test]
+    fn server_stats_total_over_tables() {
+        let provisioned = serde_json::json!({
+            "TableName": "Legacy", "TableStatus": "ACTIVE", "ItemCount": 500, "TableSizeBytes": 1_048_576,
+            "ProvisionedThroughput": {"ReadCapacityUnits": 5.0, "WriteCapacityUnits": 2.0}
+        });
+        let limits = serde_json::json!({"AccountMaxReadCapacityUnits": 40000.0, "AccountMaxWriteCapacityUnits": 40000.0, "TableMaxReadCapacityUnits": 10000.0});
+        let groups = server_stat_groups("us-east-1", "https://dynamodb.us-east-1.amazonaws.com", &[described(), provisioned], &limits);
+        let titles: Vec<&str> = groups.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(titles, vec!["Server", "Storage", "Capacity"]);
+        let find = |group: &str, label: &str| groups.iter().find(|g| g.title == group).and_then(|g| g.stats.iter().find(|s| s.label == label).cloned());
+        assert_eq!(find("Server", "Region").map(|s| s.value), Some("us-east-1".into()));
+        assert_eq!(find("Server", "Tables").and_then(|s| s.numeric), Some(2.0));
+        assert_eq!(find("Storage", "Items").and_then(|s| s.numeric), Some(2000.0));
+        assert_eq!(find("Storage", "Size").and_then(|s| s.numeric), Some(3.0));
+        assert_eq!(find("Storage", "Size").and_then(|s| s.hint), Some("3.0 MB".into()));
+        assert_eq!(find("Storage", "Secondary indexes").and_then(|s| s.numeric), Some(2.0));
+        assert_eq!(find("Storage", "Streams enabled").and_then(|s| s.numeric), Some(1.0));
+        assert_eq!(find("Capacity", "On-demand tables").and_then(|s| s.numeric), Some(1.0));
+        assert_eq!(find("Capacity", "Provisioned read").and_then(|s| s.numeric), Some(5.0));
+        assert_eq!(find("Capacity", "Account read limit").map(|s| s.unit), Some(Some("RCU".into())));
+        assert!(find("Capacity", "Table write limit").is_none(), "absent limits are skipped");
+        // An empty region still reports where it is pointed.
+        let empty = server_stat_groups("eu-west-1", "http://localhost:8000", &[], &serde_json::json!({}));
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].title, "Server");
+    }
+
+    #[test]
+    fn denied_optional_calls_degrade_to_empty() {
+        assert!(matches!(tolerated::<serde_json::Value>(Err(AppError::driver("AccessDeniedException: user is not authorized"))), Ok(v) if v.is_null()));
+        assert!(matches!(tolerated::<serde_json::Value>(Err(AppError::driver("UnknownOperationException"))), Ok(v) if v.is_null()));
+        assert!(matches!(tolerated::<serde_json::Value>(Err(AppError::not_connected("403"))), Ok(v) if v.is_null()));
+        assert!(tolerated::<serde_json::Value>(Err(AppError::driver("ProvisionedThroughputExceeded"))).is_err(), "real failures still surface");
+        assert!(tolerated::<serde_json::Value>(Err(AppError::timeout("slow"))).is_err());
+        assert_eq!(bytes_text(1536.0), "1.5 KB");
+        assert_eq!(bytes_text(42.0), "42 B");
+        assert!(epoch_text(0.0).starts_with("1970-01-01"));
     }
 
     #[test]

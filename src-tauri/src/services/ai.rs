@@ -171,6 +171,17 @@ fn engine_guidelines(engine: Engine) -> &'static str {
             "JPQL Rules:\n\
              - Output JPQL (SELECT e FROM Entity e WHERE e.field = :value). Never output relational DDL."
         }
+        Family::S3 => {
+            "S3 Command Rules:\n\
+             - S3 has no query language: output one of BUCKETS, LIST <bucket> [prefix], GET <bucket> <key>, HEAD <bucket> <key>, DELETE <bucket> <key>.\n\
+             - Never output SQL. A prefix is a key prefix such as logs/2026/, not a glob."
+        }
+        Family::Spacetimedb => {
+            "SpacetimeDB SQL Rules:\n\
+             - Output the SpacetimeDB SQL subset: SELECT with WHERE, JOIN and LIMIT over module tables.\n\
+             - There are no schemas: reference tables by bare name. The catalogue lives in st_table and st_column.\n\
+             - Schema changes come from module code, not DDL: never output CREATE TABLE or ALTER TABLE."
+        }
         Family::Sparql => {
             "SPARQL Rules:\n\
              - Output SPARQL 1.1 (SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 25) with PREFIX declarations. Never output SQL."

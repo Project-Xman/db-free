@@ -1,11 +1,12 @@
-// SOT: milvus-integration, milvus-rest-api-v2, vector-collections, milvus-filter-expr, milvus-command-console, zilliz-cloud
+// SOT: milvus-integration, milvus-rest-api-v2, vector-collections, milvus-filter-expr, milvus-command-console, zilliz-cloud, object-explorer, server-stats, vector-search-playground, milvus-admin-actions
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::http::{self, json_result, json_to_value, json_type_name, objects_to_result_set, Auth, HttpClient};
 use crate::integrations::{Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog,
-    SchemaInfo, StatementResult, TableInfo, TableKind, TableRef, Value,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, ObjectAction, ObjectDetail, ObjectKind,
+    ObjectRef, ObjectSummary, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, ServerStats, Stat,
+    StatGroup, StatementResult, TableInfo, TableKind, TableRef, Value, VectorSearchRequest,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value as Json};
@@ -365,14 +366,536 @@ impl MilvusIntegration {
     }
 }
 
-#[async_trait]
-impl Integration for MilvusIntegration {
-    fn engine(&self) -> Engine {
-        self.engine
+// ---------------------------------------------------------------------------
+// Object explorer / server stats / vector search
+//
+// WHAT:  `objects()` answers every kind in `profile()` from the v2 management
+//        endpoints (`databases/list`, `collections/list` + `describe`,
+//        `partitions/list`, `indexes/list`, `aliases/list`, `users/list`,
+//        `roles/list`); `object_detail()` adds the JSON description, a property
+//        sheet and actions written as this adapter's own `{"path", "body"}`
+//        envelopes; `vector_search()` drives `entities/search`.
+// ---------------------------------------------------------------------------
+
+const OBJECT_CAP: usize = 2_000;
+const ID_COLUMN: &str = "id";
+const DISTANCE_COLUMN: &str = "distance";
+
+fn text_of(v: &Json) -> String {
+    match v {
+        Json::Null => String::new(),
+        Json::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn str_at<'a>(v: &'a Json, key: &str) -> &'a str {
+    v.get(key).and_then(Json::as_str).unwrap_or("")
+}
+
+fn pretty(v: &Json) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_default()
+}
+
+fn name_list(data: &Json) -> Vec<String> {
+    data.as_array()
+        .map(|a| a.iter().map(text_of).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+fn finish(mut list: Vec<ObjectSummary>) -> Vec<ObjectSummary> {
+    list.sort_by(|a, b| a.reference.name.cmp(&b.reference.name).then_with(|| a.reference.parent.cmp(&b.reference.parent)));
+    list.truncate(OBJECT_CAP);
+    list
+}
+
+fn summary(kind: ObjectKind, name: &str, parent: Option<&str>, detail: String, badge: Option<String>) -> ObjectSummary {
+    let mut s = ObjectSummary::new(kind, name, parent.map(str::to_string));
+    if !detail.is_empty() {
+        s = s.with_detail(detail);
+    }
+    if let Some(b) = badge.filter(|b| !b.is_empty()) {
+        s = s.with_badge(b);
+    }
+    s
+}
+
+fn rows_table(columns: &[(&str, &str)], rows: Vec<Vec<Value>>) -> ResultSet {
+    ResultSet {
+        columns: columns.iter().map(|(name, ty)| ColumnMeta { name: (*name).to_string(), type_name: (*ty).to_string() }).collect(),
+        rows,
+        truncated: false,
+    }
+}
+
+// WHAT:  `params: [{key: "dim", value: "128"}]` → the dimension of a field.
+fn field_dim(field: &Json) -> Option<u64> {
+    let raw = field.get("params").and_then(Json::as_array).and_then(|ps| ps.iter().find(|p| p.get("key").and_then(Json::as_str) == Some("dim")).and_then(|p| p.get("value")))?;
+    raw.as_u64().or_else(|| raw.as_str().and_then(|s| s.parse::<u64>().ok()))
+}
+
+fn is_vector_field(field: &Json) -> bool {
+    str_at(field, "type").to_ascii_lowercase().contains("vector")
+}
+
+// WHAT:  (field name, dimension) for every vector field of a collection.
+fn vector_fields(desc: &Json) -> Vec<(String, Option<u64>)> {
+    desc.get("fields")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|f| is_vector_field(f))
+        .map(|f| (str_at(f, "name").to_string(), field_dim(f)))
+        .collect()
+}
+
+fn primary_field(desc: &Json) -> Option<String> {
+    desc.get("fields")
+        .and_then(Json::as_array)?
+        .iter()
+        .find(|f| f.get("primaryKey").and_then(Json::as_bool) == Some(true))
+        .map(|f| str_at(f, "name").to_string())
+}
+
+fn metric_of(desc: &Json) -> String {
+    desc.get("indexes")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|i| i.get("metricType").and_then(Json::as_str).map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn collection_summary(name: &str, desc: &Json, rows: Option<f64>) -> ObjectSummary {
+    let mut parts = Vec::new();
+    if let Some(n) = rows {
+        parts.push(format!("{} rows", crate::model::objects::format_number(n)));
+    }
+    let dims: Vec<String> = vector_fields(desc)
+        .into_iter()
+        .map(|(field, dim)| match dim {
+            Some(d) => format!("{field} {d}d"),
+            None => field,
+        })
+        .collect();
+    if !dims.is_empty() {
+        parts.push(dims.join(", "));
+    }
+    let metric = metric_of(desc);
+    if !metric.is_empty() {
+        parts.push(metric);
+    }
+    let load = str_at(desc, "load");
+    let badge = match load {
+        "" => None,
+        other => Some(other.trim_start_matches("LoadState").to_ascii_lowercase()),
+    };
+    summary(ObjectKind::Collection, name, None, parts.join(" · "), badge)
+}
+
+fn index_summary(collection: &str, name: &str, desc: &Json) -> ObjectSummary {
+    let mut parts = Vec::new();
+    let field = str_at(desc, "fieldName");
+    if !field.is_empty() {
+        parts.push(format!("on {field}"));
+    }
+    let metric = str_at(desc, "metricType");
+    if !metric.is_empty() {
+        parts.push(metric.to_string());
+    }
+    let state = str_at(desc, "indexState");
+    if !state.is_empty() {
+        parts.push(state.to_string());
+    }
+    let badge = desc.get("indexType").map(text_of).filter(|t| !t.is_empty());
+    summary(ObjectKind::Index, name, Some(collection), parts.join(" · "), badge)
+}
+
+// ---- vector search ----------------------------------------------------------
+
+// WHAT:  Playground request → `entities/search`. `annsField` is the named
+//        vector or the collection's first vector field; the filter is Milvus's
+//        boolean expression, taken from a JSON string (or a `{"filter": "…"}`
+//        envelope) since the language has no JSON form.
+fn search_body(req: &VectorSearchRequest, anns_field: &str) -> Json {
+    let mut body = json!({
+        "collectionName": req.collection,
+        "data": [req.vector],
+        "limit": req.top_k.max(1),
+        "outputFields": ["*"],
+    });
+    if !anns_field.is_empty() {
+        body["annsField"] = Json::String(anns_field.to_string());
+    }
+    if let Some(expr) = filter_string(req.filter.as_ref()) {
+        body["filter"] = Json::String(expr);
+    }
+    body
+}
+
+fn filter_string(filter: Option<&Json>) -> Option<String> {
+    match filter? {
+        Json::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Json::Object(o) => o.get("filter").and_then(Json::as_str).map(str::to_string).filter(|s| !s.trim().is_empty()),
+        _ => None,
+    }
+}
+
+// WHAT:  Search hits → grid: `id`, `distance`, then the returned fields.
+fn search_hits(data: &Json, include_vectors: bool, vector_names: &[String]) -> ResultSet {
+    let hits = data.as_array().cloned().unwrap_or_default();
+    let mut names: Vec<String> = vec![ID_COLUMN.to_string(), DISTANCE_COLUMN.to_string()];
+    let mut types: Vec<Option<&'static str>> = vec![None, Some("number")];
+    for hit in &hits {
+        for (k, v) in hit.as_object().into_iter().flatten() {
+            if k == ID_COLUMN || k == DISTANCE_COLUMN {
+                if k == ID_COLUMN && types[0].is_none() && !v.is_null() {
+                    types[0] = Some(json_type_name(v));
+                }
+                continue;
+            }
+            if !include_vectors && vector_names.iter().any(|n| n == k) {
+                continue;
+            }
+            match names.iter().position(|n| n == k) {
+                Some(i) => {
+                    if types[i].is_none() && !v.is_null() {
+                        types[i] = Some(json_type_name(v));
+                    }
+                }
+                None => {
+                    names.push(k.clone());
+                    types.push((!v.is_null()).then(|| json_type_name(v)));
+                }
+            }
+        }
+    }
+    let rows = hits
+        .iter()
+        .map(|hit| names.iter().map(|n| hit.get(n).map(json_to_value).unwrap_or(Value::Null)).collect())
+        .collect();
+    ResultSet {
+        columns: names.into_iter().zip(types).map(|(name, ty)| ColumnMeta { name, type_name: ty.unwrap_or("json").to_string() }).collect(),
+        rows,
+        truncated: false,
+    }
+}
+
+// ---- server stats -----------------------------------------------------------
+
+fn stats_groups(database: &str, version: &str, databases: &[String], collections: &[(String, Json, Option<f64>)]) -> Vec<StatGroup> {
+    let server = vec![Stat::text("Version", version), Stat::text("Database", database), Stat::number("Databases", databases.len() as f64, None)];
+    let rows: f64 = collections.iter().filter_map(|(_, _, r)| *r).sum();
+    let loaded = collections.iter().filter(|(_, d, _)| str_at(d, "load").contains("Loaded")).count();
+    let vectors: usize = collections.iter().map(|(_, d, _)| vector_fields(d).len()).sum();
+    let partitions: f64 = collections.iter().filter_map(|(_, d, _)| d.get("partitionsNum").and_then(Json::as_f64)).sum();
+    let indexes: usize = collections.iter().map(|(_, d, _)| d.get("indexes").and_then(Json::as_array).map(Vec::len).unwrap_or(0)).sum();
+    let mut storage = vec![
+        Stat::number("Collections", collections.len() as f64, None),
+        Stat::number("Rows", rows, None),
+        Stat::number("Loaded collections", loaded as f64, None),
+        Stat::number("Vector fields", vectors as f64, None),
+        Stat::number("Indexes", indexes as f64, None),
+    ];
+    if partitions > 0.0 {
+        storage.push(Stat::number("Partitions", partitions, None));
+    }
+    vec![StatGroup { title: "Server".into(), stats: server }, StatGroup { title: "Storage".into(), stats: storage }]
+}
+
+impl MilvusIntegration {
+    async fn list_names(&self, path: &str, body: Json) -> Vec<String> {
+        let mut names = self.call(path, body).await.map(|d| name_list(&d)).unwrap_or_default();
+        names.sort();
+        names
     }
 
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
+    async fn row_count(&self, collection: &str) -> Option<f64> {
+        self.call("collections/get_stats", json!({"collectionName": collection})).await.ok().and_then(|d| d.get("rowCount").and_then(|r| r.as_f64().or_else(|| r.as_str().and_then(|s| s.parse().ok()))))
+    }
+
+    async fn scoped_collections(&self, parent: Option<&str>) -> Vec<String> {
+        match parent {
+            Some(p) => vec![p.to_string()],
+            None => self.list_names("collections/list", json!({})).await,
+        }
+    }
+
+    async fn list_databases(&self) -> AppResult<Vec<ObjectSummary>> {
+        let mut names = self.list_names("databases/list", json!({})).await;
+        if names.is_empty() {
+            names.push(self.database.clone());
+        }
+        Ok(finish(
+            names
+                .into_iter()
+                .map(|n| {
+                    let current = n == self.database;
+                    summary(ObjectKind::Database, &n, None, if current { "current".into() } else { String::new() }, current.then(|| "current".to_string()))
+                })
+                .collect(),
+        ))
+    }
+
+    async fn list_collections(&self) -> AppResult<Vec<ObjectSummary>> {
+        let mut list = Vec::new();
+        for name in self.scoped_collections(None).await {
+            let desc = self.describe(&name).await.unwrap_or(Json::Null);
+            let rows = self.row_count(&name).await;
+            list.push(collection_summary(&name, &desc, rows));
+        }
+        Ok(finish(list))
+    }
+
+    async fn list_partitions(&self, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let mut list = Vec::new();
+        for collection in self.scoped_collections(parent).await {
+            for name in self.list_names("partitions/list", json!({"collectionName": collection})).await {
+                let rows = self
+                    .call("partitions/get_stats", json!({"collectionName": collection, "partitionName": name}))
+                    .await
+                    .ok()
+                    .and_then(|d| d.get("rowCount").and_then(|r| r.as_f64().or_else(|| r.as_str().and_then(|s| s.parse().ok()))));
+                let detail = rows.map(|r| format!("{} rows", crate::model::objects::format_number(r))).unwrap_or_default();
+                list.push(summary(ObjectKind::Partition, &name, Some(&collection), detail, None));
+            }
+            if list.len() >= OBJECT_CAP {
+                break;
+            }
+        }
+        Ok(finish(list))
+    }
+
+    async fn list_indexes(&self, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let mut list = Vec::new();
+        for collection in self.scoped_collections(parent).await {
+            for name in self.list_names("indexes/list", json!({"collectionName": collection})).await {
+                let desc = self.index_describe(&collection, &name).await.unwrap_or(Json::Null);
+                list.push(index_summary(&collection, &name, &desc));
+            }
+            if list.len() >= OBJECT_CAP {
+                break;
+            }
+        }
+        Ok(finish(list))
+    }
+
+    async fn list_aliases(&self) -> AppResult<Vec<ObjectSummary>> {
+        let mut list = Vec::new();
+        for name in self.list_names("aliases/list", json!({})).await {
+            let desc = self.call("aliases/describe", json!({"aliasName": name})).await.unwrap_or(Json::Null);
+            let target = str_at(&desc, "collectionName").to_string();
+            let parent = if target.is_empty() { None } else { Some(target.as_str()) };
+            let detail = if target.is_empty() { String::new() } else { format!("→ {target}") };
+            list.push(summary(ObjectKind::Alias, &name, parent, detail, None));
+        }
+        Ok(finish(list))
+    }
+
+    async fn list_users(&self) -> AppResult<Vec<ObjectSummary>> {
+        let mut list = Vec::new();
+        for name in self.list_names("users/list", json!({})).await {
+            let roles = self.call("users/describe", json!({"userName": name})).await.map(|d| name_list(&d)).unwrap_or_default();
+            list.push(summary(ObjectKind::User, &name, None, roles.join(", "), (name == "root").then(|| "built-in".to_string())));
+        }
+        Ok(finish(list))
+    }
+
+    async fn list_roles(&self) -> AppResult<Vec<ObjectSummary>> {
+        let mut list = Vec::new();
+        for name in self.list_names("roles/list", json!({})).await {
+            let grants = self.call("roles/describe", json!({"roleName": name})).await.ok().and_then(|d| d.as_array().map(Vec::len)).unwrap_or(0);
+            let badge = matches!(name.as_str(), "admin" | "public").then(|| "built-in".to_string());
+            list.push(summary(ObjectKind::Role, &name, None, format!("{grants} privileges"), badge));
+        }
+        Ok(finish(list))
+    }
+
+    async fn index_describe(&self, collection: &str, index: &str) -> AppResult<Json> {
+        let data = self.call("indexes/describe", json!({"collectionName": collection, "indexName": index})).await?;
+        Ok(match &data {
+            Json::Array(items) => items.first().cloned().unwrap_or(Json::Null),
+            other => other.clone(),
+        })
+    }
+
+    fn drop_action(id: &str, label: &str, path: &str, body: Json) -> ObjectAction {
+        ObjectAction::destructive(id, label, json!({"path": path, "body": body}).to_string())
+    }
+
+    async fn database_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = reference.name.as_str();
+        let desc = self.call("databases/describe", json!({"dbName": name})).await.unwrap_or(Json::Null);
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&desc), CodeLanguage::Json).property("Current", (name == self.database).to_string());
+        if let Some(id) = desc.get("dbID") {
+            detail = detail.property("Database id", text_of(id));
+        }
+        let rows = desc
+            .get("properties")
+            .and_then(Json::as_array)
+            .into_iter()
+            .flatten()
+            .map(|p| vec![Value::Text(str_at(p, "key").to_string()), Value::Text(text_of(p.get("value").unwrap_or(&Json::Null)))])
+            .collect();
+        detail.rows = Some(rows_table(&[("property", "string"), ("value", "string")], rows));
+        Ok(detail.action(Self::drop_action("drop", "Drop database", "databases/drop", json!({"dbName": name}))))
+    }
+
+    async fn collection_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = reference.name.as_str();
+        let desc = self.describe(name).await?;
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&desc), CodeLanguage::Json);
+        if let Some(rows) = self.row_count(name).await {
+            detail = detail.property("Rows", crate::model::objects::format_number(rows));
+        }
+        for (label, key) in [("Description", "description"), ("Load state", "load"), ("Consistency", "consistencyLevel")] {
+            let v = desc.get(key).map(text_of).unwrap_or_default();
+            if !v.is_empty() {
+                detail = detail.property(label, v);
+            }
+        }
+        for (label, key) in [("Shards", "shardsNum"), ("Partitions", "partitionsNum"), ("Auto id", "autoID"), ("Dynamic field", "enableDynamicField")] {
+            if let Some(v) = desc.get(key) {
+                detail = detail.property(label, text_of(v));
+            }
+        }
+        if let Some(pk) = primary_field(&desc) {
+            detail = detail.property("Primary key", pk);
+        }
+        let metric = metric_of(&desc);
+        if !metric.is_empty() {
+            detail = detail.property("Metric", metric);
+        }
+        let vectors = vector_fields(&desc);
+        if !vectors.is_empty() {
+            detail = detail.property("Vector fields", vectors.iter().map(|(f, d)| match d { Some(d) => format!("{f} ({d}d)"), None => f.clone() }).collect::<Vec<_>>().join(", "));
+        }
+        detail.columns = columns_from_describe(&desc);
+        let mut children = self.list_partitions(Some(name)).await.unwrap_or_default();
+        children.extend(self.list_indexes(Some(name)).await.unwrap_or_default());
+        detail.children = children;
+        let body = json!({"collectionName": name});
+        Ok(detail
+            .action(ObjectAction::new("load", "Load collection", json!({"path": "collections/load", "body": body}).to_string()))
+            .action(ObjectAction::destructive("release", "Release collection", json!({"path": "collections/release", "body": body}).to_string()))
+            .action(Self::drop_action("drop", "Drop collection", "collections/drop", body)))
+    }
+
+    async fn partition_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let collection = reference.parent.as_deref().ok_or_else(|| AppError::invalid_input("A partition needs its collection as parent."))?;
+        let name = reference.name.as_str();
+        let body = json!({"collectionName": collection, "partitionName": name});
+        let stats = self.call("partitions/get_stats", body.clone()).await.unwrap_or(Json::Null);
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&stats), CodeLanguage::Json).property("Collection", collection);
+        if let Some(rows) = stats.get("rowCount") {
+            detail = detail.property("Rows", text_of(rows));
+        }
+        let mut detail = detail
+            .action(ObjectAction::new("load", "Load partition", json!({"path": "partitions/load", "body": {"collectionName": collection, "partitionNames": [name]}}).to_string()))
+            .action(ObjectAction::destructive("release", "Release partition", json!({"path": "partitions/release", "body": {"collectionName": collection, "partitionNames": [name]}}).to_string()));
+        if name != "_default" {
+            detail = detail.action(Self::drop_action("drop", "Drop partition", "partitions/drop", body));
+        }
+        Ok(detail)
+    }
+
+    async fn index_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let collection = reference.parent.as_deref().ok_or_else(|| AppError::invalid_input("An index needs its collection as parent."))?;
+        let name = reference.name.as_str();
+        let desc = self.index_describe(collection, name).await?;
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&desc), CodeLanguage::Json).property("Collection", collection);
+        for (label, key) in [("Field", "fieldName"), ("Index type", "indexType"), ("Metric", "metricType"), ("State", "indexState"), ("Failed reason", "failReason")] {
+            let v = str_at(&desc, key);
+            if !v.is_empty() {
+                detail = detail.property(label, v);
+            }
+        }
+        if let Some(rows) = desc.get("indexedRows") {
+            detail = detail.property("Indexed rows", text_of(rows));
+        }
+        Ok(detail.action(Self::drop_action("drop", "Drop index", "indexes/drop", json!({"collectionName": collection, "indexName": name}))))
+    }
+
+    async fn alias_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = reference.name.as_str();
+        let desc = self.call("aliases/describe", json!({"aliasName": name})).await?;
+        let detail = ObjectDetail::empty(reference)
+            .definition(pretty(&desc), CodeLanguage::Json)
+            .property("Collection", str_at(&desc, "collectionName"))
+            .property("Database", str_at(&desc, "dbName"));
+        Ok(detail.action(Self::drop_action("drop", "Drop alias", "aliases/drop", json!({"aliasName": name}))))
+    }
+
+    async fn user_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = reference.name.as_str();
+        let data = self.call("users/describe", json!({"userName": name})).await?;
+        let roles = name_list(&data);
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&data), CodeLanguage::Json).property("Roles", roles.join(", "));
+        detail.rows = Some(rows_table(&[("role", "string")], roles.into_iter().map(|r| vec![Value::Text(r)]).collect()));
+        Ok(detail.action(Self::drop_action("drop", "Drop user", "users/drop", json!({"userName": name}))))
+    }
+
+    async fn role_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let name = reference.name.as_str();
+        let data = self.call("roles/describe", json!({"roleName": name})).await?;
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&data), CodeLanguage::Json);
+        let grants = data.as_array().cloned().unwrap_or_default();
+        detail = detail.property("Privileges", grants.len().to_string());
+        let rows = grants
+            .iter()
+            .map(|g| {
+                vec![
+                    Value::Text(str_at(g, "objectType").to_string()),
+                    Value::Text(str_at(g, "objectName").to_string()),
+                    Value::Text(str_at(g, "privilege").to_string()),
+                    Value::Text(str_at(g, "grantor").to_string()),
+                ]
+            })
+            .collect();
+        detail.rows = Some(rows_table(&[("object_type", "string"), ("object", "string"), ("privilege", "string"), ("grantor", "string")], rows));
+        Ok(detail.action(Self::drop_action("drop", "Drop role", "roles/drop", json!({"roleName": name}))))
+    }
+
+    async fn similarity(&self, req: &VectorSearchRequest) -> AppResult<ResultSet> {
+        if req.vector.is_empty() {
+            return Err(AppError::invalid_input("A query vector is required."));
+        }
+        let desc = self.describe(&req.collection).await.unwrap_or(Json::Null);
+        let vectors = vector_fields(&desc);
+        let anns = req
+            .vector_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .or_else(|| vectors.first().map(|(n, _)| n.clone()))
+            .unwrap_or_default();
+        let data = self.call("entities/search", search_body(req, &anns)).await?;
+        let names: Vec<String> = vectors.into_iter().map(|(n, _)| n).collect();
+        Ok(search_hits(&data, req.include_vectors, &names))
+    }
+
+    async fn stats(&self) -> AppResult<ServerStats> {
+        let databases = self.list_names("databases/list", json!({})).await;
+        let mut collections = Vec::new();
+        for name in self.list_names("collections/list", json!({})).await {
+            let desc = self.describe(&name).await.unwrap_or(Json::Null);
+            let rows = self.row_count(&name).await;
+            collections.push((name, desc, rows));
+        }
+        let version = self.server_version().await.unwrap_or(None).unwrap_or_else(|| "Milvus (REST v2)".to_string());
+        Ok(ServerStats::now(stats_groups(&self.database, &version, &databases, &collections)))
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities {
             sql: false,
             namespaces: true,
             fixed_columns: true,
@@ -381,7 +904,20 @@ impl Integration for MilvusIntegration {
             views: false,
             transactions: false,
             exact_estimate: true,
-        }
+        },
+        object_kinds: vec![K::Database, K::Collection, K::Partition, K::Index, K::Alias, K::User, K::Role],
+        tools: vec![T::Stats, T::VectorSearch],
+    }
+}
+
+#[async_trait]
+impl Integration for MilvusIntegration {
+    fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -467,6 +1003,40 @@ impl Integration for MilvusIntegration {
         Ok(vec![self.run(cmd, max_rows).await?])
     }
 
+    async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        match kind {
+            ObjectKind::Database => self.list_databases().await,
+            ObjectKind::Collection => self.list_collections().await,
+            ObjectKind::Partition => self.list_partitions(parent).await,
+            ObjectKind::Index => self.list_indexes(parent).await,
+            ObjectKind::Alias => self.list_aliases().await,
+            ObjectKind::User => self.list_users().await,
+            ObjectKind::Role => self.list_roles().await,
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        match reference.kind {
+            ObjectKind::Database => self.database_detail(reference).await,
+            ObjectKind::Collection => self.collection_detail(reference).await,
+            ObjectKind::Partition => self.partition_detail(reference).await,
+            ObjectKind::Index => self.index_detail(reference).await,
+            ObjectKind::Alias => self.alias_detail(reference).await,
+            ObjectKind::User => self.user_detail(reference).await,
+            ObjectKind::Role => self.role_detail(reference).await,
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        self.stats().await
+    }
+
+    async fn vector_search(&self, req: &VectorSearchRequest) -> AppResult<ResultSet> {
+        self.similarity(req).await
+    }
+
     async fn close(&self) {}
 }
 
@@ -537,6 +1107,116 @@ mod tests {
         let names: Vec<&str> = rs.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["id", "t", "extra"]);
         assert_eq!(rs.rows[0][2], Value::Bool(true));
+    }
+
+    #[test]
+    fn describe_drives_collection_and_index_summaries() {
+        let desc = json!({
+            "collectionName": "books",
+            "load": "LoadStateLoaded",
+            "partitionsNum": 2,
+            "fields": [
+                {"name": "id", "type": "Int64", "primaryKey": true},
+                {"name": "vec", "type": "FloatVector", "params": [{"key": "dim", "value": "128"}]},
+                {"name": "title", "type": "VarChar"}
+            ],
+            "indexes": [{"fieldName": "vec", "indexName": "vec_idx", "metricType": "COSINE"}]
+        });
+        let s = collection_summary("books", &desc, Some(1500.0));
+        assert_eq!(s.badge.as_deref(), Some("loaded"));
+        assert_eq!(s.detail.as_deref(), Some("1,500 rows · vec 128d · COSINE"));
+        assert_eq!(vector_fields(&desc), vec![("vec".to_string(), Some(128))]);
+        assert_eq!(primary_field(&desc).as_deref(), Some("id"));
+        assert_eq!(metric_of(&desc), "COSINE");
+        assert_eq!(field_dim(&json!({"params": [{"key": "dim", "value": 64}]})), Some(64));
+        assert!(field_dim(&json!({"params": []})).is_none());
+        assert!(is_vector_field(&json!({"type": "BinaryVector"})));
+        assert!(!is_vector_field(&json!({"type": "VarChar"})));
+
+        let idx = index_summary("books", "vec_idx", &json!({"fieldName": "vec", "indexType": "HNSW", "metricType": "L2", "indexState": "Finished"}));
+        assert_eq!(idx.reference.parent.as_deref(), Some("books"));
+        assert_eq!(idx.badge.as_deref(), Some("HNSW"));
+        assert_eq!(idx.detail.as_deref(), Some("on vec · L2 · Finished"));
+        assert_eq!(name_list(&json!(["a", "b"])), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn vector_search_body_and_hits() {
+        let req = VectorSearchRequest {
+            collection: "books".into(),
+            vector: vec![0.1, 0.9],
+            vector_name: None,
+            top_k: 3,
+            filter: Some(json!("year > 1990")),
+            include_vectors: false,
+        };
+        let body = search_body(&req, "vec");
+        assert_eq!(body["collectionName"], "books");
+        assert_eq!(body["data"], json!([[0.1, 0.9]]));
+        assert_eq!(body["limit"], 3);
+        assert_eq!(body["annsField"], "vec");
+        assert_eq!(body["filter"], "year > 1990");
+        assert_eq!(body["outputFields"], json!(["*"]));
+        let named = search_body(&VectorSearchRequest { vector_name: Some("image".into()), filter: Some(json!({"filter": "n == 1"})), top_k: 0, ..req.clone() }, "image");
+        assert_eq!(named["annsField"], "image");
+        assert_eq!(named["filter"], "n == 1");
+        assert_eq!(named["limit"], 1);
+        let none = search_body(&VectorSearchRequest { filter: Some(json!({"must": []})), ..req.clone() }, "");
+        assert!(none.get("filter").is_none() && none.get("annsField").is_none());
+        assert_eq!(filter_string(Some(&json!("  a == 1 "))).as_deref(), Some("a == 1"));
+        assert!(filter_string(None).is_none());
+
+        let data = json!([
+            {"id": 1, "distance": 0.02, "title": "Dune", "vec": [0.1, 0.9]},
+            {"id": 2, "distance": 0.5, "title": "X", "year": 1984}
+        ]);
+        let rs = search_hits(&data, false, &["vec".to_string()]);
+        let names: Vec<&str> = rs.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "distance", "title", "year"]);
+        assert_eq!(rs.columns[0].type_name, "integer");
+        assert_eq!(rs.rows[0][1], Value::Float(0.02));
+        assert_eq!(rs.rows[0][3], Value::Null);
+        assert_eq!(rs.rows[1][3], Value::Int(1984));
+        let with_vec = search_hits(&data, true, &["vec".to_string()]);
+        assert!(with_vec.columns.iter().any(|c| c.name == "vec"));
+        assert!(search_hits(&Json::Null, false, &[]).rows.is_empty());
+    }
+
+    #[test]
+    fn stats_groups_aggregate_collections() {
+        let collections = vec![
+            ("a".to_string(), json!({"load": "LoadStateLoaded", "partitionsNum": 2, "fields": [{"name": "v", "type": "FloatVector", "params": [{"key": "dim", "value": "8"}]}], "indexes": [{"indexName": "i"}]}), Some(10.0)),
+            ("b".to_string(), json!({"load": "LoadStateNotLoad", "partitionsNum": 1, "fields": [], "indexes": []}), Some(5.0)),
+        ];
+        let groups = stats_groups("default", "Milvus 2.4", &["default".to_string(), "other".to_string()], &collections);
+        let find = |group: &str, label: &str| groups.iter().find(|g| g.title == group).and_then(|g| g.stats.iter().find(|s| s.label == label).cloned());
+        assert_eq!(find("Server", "Version").map(|s| s.value), Some("Milvus 2.4".into()));
+        assert_eq!(find("Server", "Databases").and_then(|s| s.numeric), Some(2.0));
+        assert_eq!(find("Storage", "Collections").and_then(|s| s.numeric), Some(2.0));
+        assert_eq!(find("Storage", "Rows").and_then(|s| s.numeric), Some(15.0));
+        assert_eq!(find("Storage", "Loaded collections").and_then(|s| s.numeric), Some(1.0));
+        assert_eq!(find("Storage", "Vector fields").and_then(|s| s.numeric), Some(1.0));
+        assert_eq!(find("Storage", "Indexes").and_then(|s| s.numeric), Some(1.0));
+        assert_eq!(find("Storage", "Partitions").and_then(|s| s.numeric), Some(3.0));
+    }
+
+    #[test]
+    fn explorer_actions_parse_as_console_commands() {
+        let drop = MilvusIntegration::drop_action("drop", "Drop collection", "collections/drop", json!({"collectionName": "books"}));
+        assert!(drop.destructive);
+        match parse_command(&drop.statement) {
+            Ok(cmd @ Command::Raw { .. }) => {
+                assert!(cmd.is_mutation());
+                assert_eq!(cmd, Command::Raw { path: "collections/drop".into(), body: json!({"collectionName": "books"}) });
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let load = json!({"path": "collections/load", "body": {"collectionName": "books"}}).to_string();
+        assert!(parse_command(&load).map(|c| c.is_mutation()).unwrap_or(false));
+        for path in ["partitions/drop", "indexes/drop", "aliases/drop", "users/drop", "roles/drop", "databases/drop"] {
+            let stmt = MilvusIntegration::drop_action("drop", "Drop", path, json!({})).statement;
+            assert!(parse_command(&stmt).map(|c| c.is_mutation()).unwrap_or(false), "{path}");
+        }
     }
 
     #[tokio::test]

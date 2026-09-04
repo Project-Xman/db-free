@@ -1,12 +1,13 @@
-// SOT: objectdb-integration, objectdb-rest, jpql, objectdb-gateway
+// SOT: objectdb-integration, objectdb-rest, jpql, objectdb-gateway, objectdb-object-explorer
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::http::{base_url, json_result, json_to_value, json_type_name, objects_to_result_set, HttpClient};
 use crate::integrations::sql::validate_columns;
 use crate::integrations::{Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog,
-    SchemaInfo, SortRule, SslMode, StatementResult, TableInfo, TableKind, TableRef, Value,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, ObjectAction, ObjectDetail, ObjectKind,
+    ObjectRef, ObjectSummary, PageQuery, ResolvedConnection, ResultSet, SchemaCatalog, SchemaInfo, SortRule, SslMode,
+    StatementResult, TableInfo, TableKind, TableRef, Value,
 };
 use async_trait::async_trait;
 use serde_json::{json, Map, Value as Json};
@@ -332,6 +333,93 @@ impl ObjectDbIntegration {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Object explorer
+//
+// WHAT:  ObjectDB's only first-class object is the persistent class, so the
+//        explorer lists entities and shows their fields. There is no catalog of
+//        indexes, users or settings behind the gateway contract, and nothing is
+//        invented here: only what `/entities` and JPQL can answer.
+// ---------------------------------------------------------------------------
+
+const OBJECT_CAP: usize = 2_000;
+
+// WHAT:  Field list → a grid (name, type, id, nullable) for the detail tab.
+pub(crate) fn field_rows(columns: &[ColumnInfo]) -> ResultSet {
+    ResultSet {
+        columns: [("name", "string"), ("type", "string"), ("id", "boolean"), ("nullable", "boolean")]
+            .iter()
+            .map(|(n, t)| ColumnMeta { name: (*n).to_string(), type_name: (*t).to_string() })
+            .collect(),
+        rows: columns
+            .iter()
+            .map(|c| vec![Value::Text(c.name.clone()), Value::Text(c.data_type.clone()), Value::Bool(c.primary_key), Value::Bool(c.nullable)])
+            .collect(),
+        truncated: false,
+    }
+}
+
+impl ObjectDbIntegration {
+    async fn instance_count(&self, entity: &str) -> Option<i64> {
+        self.count(&TableRef { schema: None, name: entity.to_string() }, &[]).await.ok()
+    }
+
+    async fn list_objects(&self, kind: ObjectKind) -> AppResult<Vec<ObjectSummary>> {
+        if kind != ObjectKind::Class {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for name in self.entities().await?.into_iter().take(OBJECT_CAP) {
+            let mut s = ObjectSummary::new(ObjectKind::Class, name.as_str(), None);
+            if let Some(n) = self.instance_count(&name).await {
+                s = s.with_detail(format!("{n} instances"));
+            }
+            // A dotted entity name is a fully-qualified class; the badge keeps
+            // the package visible once the tree shows only the simple name.
+            if let Some((package, _)) = name.rsplit_once('.') {
+                s = s.with_badge(package.to_string());
+            }
+            out.push(s);
+        }
+        out.sort_by(|a, b| a.reference.name.cmp(&b.reference.name));
+        Ok(out)
+    }
+
+    async fn class_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let entity = check_ident(&reference.name)?;
+        let cols = self.columns(&TableRef { schema: None, name: reference.name.clone() }).await?;
+        let mut detail = ObjectDetail::empty(reference)
+            .definition(format!("SELECT e FROM {entity} e"), CodeLanguage::Sql)
+            .property("fields", cols.len().to_string());
+        if let Some(id) = cols.iter().find(|c| c.primary_key) {
+            detail = detail.property("id field", format!("{} ({})", id.name, id.data_type));
+        }
+        if let Some(n) = self.instance_count(&reference.name).await {
+            detail = detail.property("instances", n.to_string());
+        }
+        detail.rows = Some(field_rows(&cols));
+        detail.columns = cols;
+        detail = detail
+            .action(ObjectAction::new("preview", "Preview instances", format!("SELECT e FROM {entity} e")))
+            .action(ObjectAction::new("count", "Count instances", format!("SELECT COUNT(e) FROM {entity} e")))
+            .action(ObjectAction::destructive("delete_all", "Delete all instances", format!("DELETE FROM {entity} e")));
+        Ok(detail)
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities { namespaces: false, fixed_columns: true, exact_estimate: true, views: false, ..Capabilities::DOCUMENT },
+        object_kinds: vec![K::Class],
+        tools: vec![],
+    }
+}
+
 #[async_trait]
 impl Integration for ObjectDbIntegration {
     fn engine(&self) -> Engine {
@@ -339,7 +427,7 @@ impl Integration for ObjectDbIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { namespaces: false, fixed_columns: true, exact_estimate: true, views: false, ..Capabilities::DOCUMENT }
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -433,6 +521,17 @@ impl Integration for ObjectDbIntegration {
     }
 
     async fn close(&self) {}
+
+    async fn objects(&self, kind: ObjectKind, _parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        self.list_objects(kind).await
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        match reference.kind {
+            ObjectKind::Class => self.class_detail(reference).await,
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -499,5 +598,15 @@ mod tests {
         let (q, p) = parse_execute_input(r#"{"jpql": "SELECT c FROM C c WHERE c.id = :i", "params": {"i": 1}}"#).unwrap();
         assert!(q.starts_with("SELECT"));
         assert_eq!(p["i"], json!(1));
+    }
+
+    #[test]
+    fn fields_become_a_detail_grid() {
+        let cols = parse_fields(&json!([{"name": "id", "type": "long", "id": true}, {"name": "name", "type": "String"}]));
+        let rs = field_rows(&cols);
+        assert_eq!(rs.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["name", "type", "id", "nullable"]);
+        assert_eq!(rs.rows[0], vec![Value::Text("id".into()), Value::Text("long".into()), Value::Bool(true), Value::Bool(false)]);
+        assert_eq!(rs.rows[1][2], Value::Bool(false));
+        assert!(field_rows(&[]).rows.is_empty());
     }
 }

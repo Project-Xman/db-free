@@ -58,13 +58,17 @@ fn predicate(engine: Engine, rule: &FilterRule) -> String {
         Family::Mysql => "CHAR",
         Family::Mssql => "NVARCHAR(MAX)",
         Family::Oracle => "VARCHAR2(4000)",
-        Family::Bigquery | Family::Snowflake | Family::Duckdb | Family::Clickhouse | Family::Druid => "STRING",
+        // ClickHouse type names are case-sensitive: STRING is not a known data
+        // type family there, only String.
+        Family::Clickhouse => "String",
+        Family::Bigquery | Family::Snowflake | Family::Duckdb | Family::Druid => "STRING",
         _ => "TEXT",
     };
     let text_col = format!("CAST({col} AS {text_type})");
-    // Postgres LIKE is case-sensitive; every other SQL engine here is case-insensitive by default.
+    // Postgres and ClickHouse have a case-sensitive LIKE and a separate ILIKE;
+    // the other engines here already match case-insensitively.
     let like = match engine.family() {
-        Family::Postgres | Family::Duckdb | Family::Snowflake | Family::Cassandra => "ILIKE",
+        Family::Postgres | Family::Duckdb | Family::Snowflake | Family::Cassandra | Family::Clickhouse => "ILIKE",
         _ => "LIKE",
     };
     let value = rule.value.trim();

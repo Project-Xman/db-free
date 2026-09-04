@@ -1,11 +1,14 @@
-// SOT: influxdb-integration, influxql, flux, influx-v2-api, influx-annotated-csv, influx-v1-fallback
+// SOT: influxdb-integration, influxql, flux, influx-v2-api, influx-annotated-csv, influx-v1-fallback, influx-object-explorer, influx-server-stats, influx-range-query
 
 use crate::error::{AppError, AppResult};
 use crate::integrations::http::{json_result, json_to_value, local, Auth, HttpClient};
+use crate::integrations::prometheus::{human_duration, jnum, jtext, mib, parse_exposition, pretty, truncate};
 use crate::integrations::{Capabilities, Integration};
 use crate::model::{
-    ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, PageQuery, ResolvedConnection, ResultSet,
-    SchemaCatalog, SchemaInfo, SortRule, StatementResult, TableInfo, TableKind, TableRef, Value,
+    CodeLanguage, ColumnInfo, ColumnMeta, Engine, FilterOp, FilterRule, ObjectAction, ObjectDetail, ObjectKind,
+    ObjectProperty, ObjectRef, ObjectSummary, PageQuery, RangeQueryRequest, RangeResult, ResolvedConnection, ResultSet,
+    SchemaCatalog, SchemaInfo, Series, ServerStats, SortRule, Stat, StatGroup, StatementResult, TableInfo, TableKind,
+    TableRef, Value,
 };
 use async_trait::async_trait;
 use reqwest::Method;
@@ -607,6 +610,718 @@ fn encode(raw: &str) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Object explorer / stats / range query
+// ---------------------------------------------------------------------------
+
+const OBJECT_CAP: usize = 2_000;
+// Listing measurements costs one Flux query per bucket, so an unscoped ask
+// walks only the first few buckets rather than every one on the server.
+const BUCKET_WALK: usize = 25;
+const CHILD_CAP: usize = 200;
+
+// WHAT:  Bookkeeping columns of a Flux table: never part of a series' label set.
+const FLUX_META: [&str; 6] = ["result", "table", "_start", "_stop", "_time", "_value"];
+
+fn value_text(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Decimal(s) | Value::Text(s) | Value::Bytes(s) | Value::DateTime(s) | Value::Unsupported(s) => s.clone(),
+        Value::Json(j) => j.to_string(),
+    }
+}
+
+fn value_number(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        Value::Decimal(s) | Value::Text(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+// WHAT:  A `_time` cell → epoch seconds. RFC3339 is what both APIs emit by
+//        default; a bare number is nanoseconds (v1 with `epoch=ns`), scaled by
+//        magnitude so ms / µs / s payloads land on the same axis.
+fn time_seconds(v: &Value) -> Option<f64> {
+    if let Some(n) = match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
+    } {
+        return Some(scale_epoch(n));
+    }
+    let text = value_text(v);
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&text) {
+        return Some(t.timestamp() as f64 + f64::from(t.timestamp_subsec_millis()) / 1000.0);
+    }
+    text.parse::<f64>().ok().map(scale_epoch)
+}
+
+fn scale_epoch(n: f64) -> f64 {
+    let a = n.abs();
+    if a >= 1e17 {
+        n / 1e9
+    } else if a >= 1e14 {
+        n / 1e6
+    } else if a >= 1e11 {
+        n / 1e3
+    } else {
+        n
+    }
+}
+
+// WHAT:  `cpu.usage_idle{host="h1"}` from a series' label set.
+fn series_name(labels: &[ObjectProperty]) -> String {
+    let get = |n: &str| labels.iter().find(|p| p.name == n).map(|p| p.value.clone()).filter(|v| !v.is_empty());
+    let base = match (get("_measurement"), get("_field")) {
+        (Some(m), Some(f)) => format!("{m}.{f}"),
+        (Some(m), None) => m,
+        (None, Some(f)) => f,
+        (None, None) => "value".to_string(),
+    };
+    let tags: Vec<String> = labels
+        .iter()
+        .filter(|p| p.name != "_measurement" && p.name != "_field" && !p.value.is_empty())
+        .map(|p| format!("{}=\"{}\"", p.name, p.value))
+        .collect();
+    if tags.is_empty() {
+        base
+    } else {
+        format!("{base}{{{}}}", tags.join(","))
+    }
+}
+
+// WHAT:  Annotated CSV → one Series per Flux table (i.e. per tag set).
+// HOW:   Rows carry their group in the `table` column; the label set is every
+//        non-bookkeeping column, so two tables that share tags still stay apart.
+pub(crate) fn csv_to_series(text: &str) -> Vec<Series> {
+    let mut out: Vec<Series> = Vec::new();
+    for (section, table) in parse_annotated_csv(text).into_iter().enumerate() {
+        let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+        let pos = |n: &str| names.iter().position(|x| *x == n);
+        let (Some(i_time), Some(i_value)) = (pos("_time"), pos("_value")) else { continue };
+        let i_table = pos("table");
+        let mut keys: Vec<String> = Vec::new();
+        for row in &table.rows {
+            let labels: Vec<ObjectProperty> = names
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| !FLUX_META.contains(*n))
+                .filter_map(|(i, n)| row.get(i).map(|v| ObjectProperty { name: (*n).to_string(), value: value_text(v) }))
+                .collect();
+            let group = i_table.and_then(|i| row.get(i)).map(value_text).unwrap_or_default();
+            let key = format!("{section}\u{1}{group}\u{1}{}", labels.iter().map(|p| format!("{}={}", p.name, p.value)).collect::<Vec<_>>().join("\u{2}"));
+            let idx = match keys.iter().position(|k| *k == key) {
+                Some(i) => i,
+                None => {
+                    keys.push(key);
+                    out.push(Series { name: series_name(&labels), labels, points: Vec::new() });
+                    out.len() - 1
+                }
+            };
+            if let (Some(ts), Some(v)) = (row.get(i_time).and_then(time_seconds), row.get(i_value).and_then(value_number)) {
+                if v.is_finite() {
+                    out[idx].points.push([ts, v]);
+                }
+            }
+        }
+    }
+    for s in &mut out {
+        s.points.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    out.retain(|s| !s.points.is_empty());
+    out
+}
+
+// WHAT:  InfluxQL JSON → Series, one per (series, numeric column) pair.
+pub(crate) fn influxql_series(body: &Json) -> AppResult<Vec<Series>> {
+    let mut out = Vec::new();
+    for result in body.get("results").and_then(Json::as_array).into_iter().flatten() {
+        if let Some(err) = result.get("error").and_then(Json::as_str) {
+            return Err(AppError::driver(err.to_string()));
+        }
+        for s in result.get("series").and_then(Json::as_array).into_iter().flatten() {
+            let measurement = jtext(s, "name");
+            let cols: Vec<String> = s.get("columns").and_then(Json::as_array).into_iter().flatten().filter_map(|c| c.as_str().map(str::to_string)).collect();
+            let tags: Vec<ObjectProperty> = s
+                .get("tags")
+                .and_then(Json::as_object)
+                .into_iter()
+                .flatten()
+                .map(|(k, v)| ObjectProperty { name: k.clone(), value: crate::integrations::prometheus::text_value(v) })
+                .collect();
+            let Some(i_time) = cols.iter().position(|c| c == "time") else { continue };
+            for (i, col) in cols.iter().enumerate() {
+                if i == i_time {
+                    continue;
+                }
+                let mut labels = tags.clone();
+                labels.insert(0, ObjectProperty { name: "_measurement".into(), value: measurement.clone() });
+                labels.insert(1, ObjectProperty { name: "_field".into(), value: col.clone() });
+                let mut points: Vec<[f64; 2]> = Vec::new();
+                for row in s.get("values").and_then(Json::as_array).into_iter().flatten() {
+                    let cells = row.as_array().cloned().unwrap_or_default();
+                    let ts = cells.get(i_time).map(json_to_value).and_then(|v| time_seconds(&v));
+                    let v = cells.get(i).map(json_to_value).and_then(|v| value_number(&v));
+                    if let (Some(ts), Some(v)) = (ts, v) {
+                        if v.is_finite() {
+                            points.push([ts, v]);
+                        }
+                    }
+                }
+                if points.is_empty() {
+                    continue;
+                }
+                points.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+                out.push(Series { name: series_name(&labels), labels, points });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn rfc3339(seconds: f64) -> String {
+    chrono::DateTime::from_timestamp(seconds as i64, 0).unwrap_or_default().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+// WHAT:  Prepends the `v` record every dashboard-style Flux script expects, so
+//        `v.timeRangeStart` / `v.timeRangeStop` / `v.windowPeriod` resolve to
+//        the window the explorer asked for.
+pub(crate) fn flux_with_window(script: &str, start: f64, end: f64, step: f64) -> String {
+    let step = step.max(1.0).round() as i64;
+    format!(
+        "v = {{timeRangeStart: time(v: \"{}\"), timeRangeStop: time(v: \"{}\"), windowPeriod: {step}s}}\n{script}",
+        rfc3339(start),
+        rfc3339(end)
+    )
+}
+
+// WHAT:  Adds the explorer's window to an InfluxQL statement that has no time
+//        bound of its own; a query that already filters on `time` is left alone.
+pub(crate) fn influxql_with_window(sql: &str, start: f64, end: f64) -> String {
+    let trimmed = sql.trim().trim_end_matches(';');
+    let lower = trimmed.to_ascii_lowercase();
+    let bound = format!("time >= '{}' AND time <= '{}'", rfc3339(start), rfc3339(end));
+    if lower.contains("time >") || lower.contains("time <") || lower.contains("time between") {
+        return trimmed.to_string();
+    }
+    // The bound goes before GROUP BY / ORDER BY / LIMIT, which must stay last.
+    let tail = ["group by", "order by", "limit", "slimit", "offset"].iter().filter_map(|kw| lower.find(kw)).min();
+    let (head, rest) = match tail {
+        Some(i) => (trimmed[..i].trim_end(), trimmed[i..].to_string()),
+        None => (trimmed, String::new()),
+    };
+    let head_lower = head.to_ascii_lowercase();
+    let joined = if head_lower.contains(" where ") || head_lower.ends_with(" where") {
+        format!("{head} AND {bound}")
+    } else {
+        format!("{head} WHERE {bound}")
+    };
+    if rest.is_empty() {
+        joined
+    } else {
+        format!("{joined} {rest}")
+    }
+}
+
+fn looks_like_flux(query: &str) -> bool {
+    let t = query.trim();
+    t.contains("|>") || t.contains("from(") || t.starts_with("import ")
+}
+
+fn seconds_label(secs: f64) -> String {
+    if secs <= 0.0 {
+        "infinite".to_string()
+    } else {
+        human_duration(secs)
+    }
+}
+
+// WHAT:  A bucket's retention, from the first non-zero rule (0 = keep forever).
+fn retention_of(bucket: &Json) -> String {
+    let secs = bucket
+        .get("retentionRules")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|r| jnum(r, "everySeconds"))
+        .find(|s| *s > 0.0);
+    seconds_label(secs.unwrap_or(0.0))
+}
+
+fn task_schedule(task: &Json) -> String {
+    let every = jtext(task, "every");
+    let cron = jtext(task, "cron");
+    match (every.is_empty(), cron.is_empty()) {
+        (false, _) => format!("every {every}"),
+        (_, false) => format!("cron {cron}"),
+        _ => String::new(),
+    }
+}
+
+fn props(detail: ObjectDetail, source: &Json, keys: &[&str]) -> ObjectDetail {
+    let mut detail = detail;
+    for key in keys {
+        let v = jtext(source, key);
+        if !v.is_empty() {
+            detail = detail.property(key, v);
+        }
+    }
+    detail
+}
+
+fn key_rows(fields: &[String], tags: &[String]) -> ResultSet {
+    let mut rows: Vec<Vec<Value>> = tags.iter().map(|t| vec![Value::Text("tag".into()), Value::Text(t.clone())]).collect();
+    rows.extend(fields.iter().map(|f| vec![Value::Text("field".into()), Value::Text(f.clone())]));
+    ResultSet {
+        columns: vec![ColumnMeta { name: "kind".into(), type_name: "string".into() }, ColumnMeta { name: "name".into(), type_name: "string".into() }],
+        rows,
+        truncated: false,
+    }
+}
+
+impl InfluxIntegration {
+    // WHAT:  A v2 collection endpoint → its array. v1 servers 404 every one of
+    //        them, which is reported as an empty list rather than an error.
+    async fn v2_list(&self, path: &str, key: &str) -> Vec<Json> {
+        if self.api != Api::V2 {
+            return Vec::new();
+        }
+        let body: Json = self.http.get_json(path).await.unwrap_or(Json::Null);
+        body.get(key).and_then(Json::as_array).cloned().unwrap_or_default()
+    }
+
+    async fn orgs(&self) -> Vec<Json> {
+        self.v2_list("/api/v2/orgs", "orgs").await
+    }
+
+    async fn bucket_objects(&self) -> Vec<Json> {
+        let path = match &self.org {
+            Some(o) => format!("/api/v2/buckets?limit=100&org={}", encode(o)),
+            None => "/api/v2/buckets?limit=100".to_string(),
+        };
+        self.v2_list(&path, "buckets").await
+    }
+
+    async fn tasks(&self) -> Vec<Json> {
+        self.v2_list("/api/v2/tasks?limit=100", "tasks").await
+    }
+
+    async fn users(&self) -> Vec<Json> {
+        self.v2_list("/api/v2/users", "users").await
+    }
+
+    /// `/api/v2/config` when the token may read it, else facts from /health + /ready.
+    async fn config(&self) -> Option<Json> {
+        if self.api != Api::V2 {
+            return None;
+        }
+        match self.http.get_json::<Json>("/api/v2/config").await {
+            Ok(v) if v.is_object() => Some(v),
+            _ => None,
+        }
+    }
+
+    async fn health_facts(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Ok(h) = self.http.get_json::<Json>("/health").await {
+            for key in ["status", "version", "commit", "name", "message"] {
+                let v = jtext(&h, key);
+                if !v.is_empty() {
+                    out.push((key.to_string(), v));
+                }
+            }
+        }
+        if let Ok(r) = self.http.get_json::<Json>("/ready").await {
+            for key in ["status", "started", "up"] {
+                let v = jtext(&r, key);
+                if !v.is_empty() {
+                    out.push((format!("ready.{key}"), v));
+                }
+            }
+        }
+        out
+    }
+
+    async fn setting_objects(&self) -> Vec<ObjectSummary> {
+        if let Some(cfg) = self.config().await {
+            return cfg
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, v)| ObjectSummary::new(ObjectKind::Setting, k.as_str(), None).with_detail(truncate(&crate::integrations::prometheus::text_value(v), 120)).with_badge("config"))
+                .collect();
+        }
+        self.health_facts()
+            .await
+            .into_iter()
+            .map(|(k, v)| ObjectSummary::new(ObjectKind::Setting, k, None).with_detail(truncate(&v, 120)).with_badge("health"))
+            .collect()
+    }
+
+    /// Buckets the explorer walks when no parent was given.
+    async fn scan_buckets(&self) -> Vec<String> {
+        match &self.bucket {
+            Some(b) => vec![b.clone()],
+            None => {
+                let mut names = self.buckets().await.unwrap_or_default();
+                names.truncate(BUCKET_WALK);
+                names
+            }
+        }
+    }
+
+    async fn measurement_objects(&self, parent: Option<&str>) -> Vec<ObjectSummary> {
+        let buckets = match parent {
+            Some(b) => vec![b.to_string()],
+            None => self.scan_buckets().await,
+        };
+        let mut out = Vec::new();
+        for bucket in buckets {
+            for name in self.measurements(&bucket).await.unwrap_or_default() {
+                out.push(ObjectSummary::new(ObjectKind::Measurement, name, Some(bucket.clone())));
+            }
+        }
+        out
+    }
+
+    async fn list_objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        let mut out = match kind {
+            ObjectKind::Database => {
+                let orgs = self.orgs().await;
+                if orgs.is_empty() {
+                    // v1 (and a token without org read rights): databases are the containers.
+                    self.buckets().await.unwrap_or_default().into_iter().map(|n| ObjectSummary::new(ObjectKind::Database, n, None).with_badge("database")).collect()
+                } else {
+                    orgs.iter()
+                        .map(|o| {
+                            let mut s = ObjectSummary::new(ObjectKind::Database, jtext(o, "name"), None).with_badge("org");
+                            let description = jtext(o, "description");
+                            let detail = if description.is_empty() { jtext(o, "id") } else { description };
+                            if !detail.is_empty() {
+                                s = s.with_detail(truncate(&detail, 120));
+                            }
+                            s
+                        })
+                        .collect()
+                }
+            }
+            ObjectKind::Bucket => self
+                .bucket_objects()
+                .await
+                .iter()
+                .map(|b| {
+                    let kind_badge = jtext(b, "type");
+                    let mut s = ObjectSummary::new(ObjectKind::Bucket, jtext(b, "name"), None).with_detail(format!("retention {}", retention_of(b)));
+                    if !kind_badge.is_empty() {
+                        s = s.with_badge(kind_badge);
+                    }
+                    s
+                })
+                .collect(),
+            ObjectKind::Measurement => self.measurement_objects(parent).await,
+            ObjectKind::Task => self
+                .tasks()
+                .await
+                .iter()
+                .map(|t| {
+                    let mut s = ObjectSummary::new(ObjectKind::Task, jtext(t, "name"), None);
+                    let schedule = task_schedule(t);
+                    if !schedule.is_empty() {
+                        s = s.with_detail(schedule);
+                    }
+                    let status = jtext(t, "status");
+                    if !status.is_empty() {
+                        s = s.with_badge(status);
+                    }
+                    s
+                })
+                .collect(),
+            ObjectKind::User => self
+                .users()
+                .await
+                .iter()
+                .map(|u| {
+                    let mut s = ObjectSummary::new(ObjectKind::User, jtext(u, "name"), None);
+                    let status = jtext(u, "status");
+                    if !status.is_empty() {
+                        s = s.with_badge(status);
+                    }
+                    let id = jtext(u, "id");
+                    if !id.is_empty() {
+                        s = s.with_detail(id);
+                    }
+                    s
+                })
+                .collect(),
+            ObjectKind::Setting => self.setting_objects().await,
+            _ => Vec::new(),
+        };
+        out.sort_by(|a, b| a.reference.parent.cmp(&b.reference.parent).then_with(|| a.reference.name.cmp(&b.reference.name)));
+        out.truncate(OBJECT_CAP);
+        Ok(out)
+    }
+
+    async fn find_named(&self, items: Vec<Json>, name: &str, what: &str) -> AppResult<Json> {
+        items.into_iter().find(|i| jtext(i, "name") == name).ok_or_else(|| AppError::not_found(format!("{what} `{name}` not found.")))
+    }
+
+    async fn measurement_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let bucket = reference.parent.clone().or_else(|| self.bucket.clone()).ok_or_else(|| AppError::invalid_input("A measurement needs its bucket."))?;
+        let fields = self.keys(&bucket, &reference.name, "FieldKeys").await.unwrap_or_default();
+        let tags: Vec<String> = self.keys(&bucket, &reference.name, "TagKeys").await.unwrap_or_default().into_iter().filter(|t| !t.starts_with('_')).collect();
+        let script = format!(
+            "from(bucket: {})\n  |> range(start: {DEFAULT_RANGE})\n  |> filter(fn: (r) => r._measurement == {})",
+            flux_string(&bucket),
+            flux_string(&reference.name)
+        );
+        let mut detail = ObjectDetail::empty(reference)
+            .definition(script, CodeLanguage::Text)
+            .property("bucket", bucket.clone())
+            .property("fields", fields.len().to_string())
+            .property("tags", tags.len().to_string());
+        detail.rows = Some(key_rows(&fields, &tags));
+        detail.columns = tags
+            .iter()
+            .map(|t| (t.clone(), "tag"))
+            .chain(fields.iter().map(|f| (f.clone(), "field")))
+            .enumerate()
+            .map(|(i, (name, ty))| ColumnInfo { name, data_type: ty.into(), nullable: true, primary_key: false, ordinal: i as u32 + 1 })
+            .collect();
+        // `DROP MEASUREMENT` is InfluxQL, which `execute` routes at the session
+        // bucket — so it is only offered when that is the bucket being viewed.
+        if self.bucket.as_deref() == Some(bucket.as_str()) {
+            detail = detail.action(ObjectAction::destructive("drop", "Drop measurement", format!("DROP MEASUREMENT {}", quote_ident(&reference.name))));
+        }
+        Ok(detail)
+    }
+
+    async fn bucket_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let bucket = self.find_named(self.bucket_objects().await, &reference.name, "Bucket").await?;
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&bucket), CodeLanguage::Json).property("retention", retention_of(&bucket));
+        detail = props(detail, &bucket, &["id", "orgID", "type", "description", "createdAt", "updatedAt", "schemaType"]);
+        let mut children: Vec<ObjectSummary> = self
+            .measurements(&reference.name)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| ObjectSummary::new(ObjectKind::Measurement, m, Some(reference.name.clone())))
+            .collect();
+        children.truncate(CHILD_CAP);
+        detail.children = children;
+        Ok(detail)
+    }
+
+    async fn org_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let orgs = self.orgs().await;
+        if orgs.is_empty() {
+            // v1: the "database" is its own container; list its measurements.
+            let mut detail = ObjectDetail::empty(reference).definition(format!("SHOW MEASUREMENTS ON {}", quote_ident(&reference.name)), CodeLanguage::Text);
+            detail.children = self
+                .measurements(&reference.name)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .take(CHILD_CAP)
+                .map(|m| ObjectSummary::new(ObjectKind::Measurement, m, Some(reference.name.clone())))
+                .collect();
+            return Ok(detail);
+        }
+        let org = self.find_named(orgs, &reference.name, "Organization").await?;
+        let mut detail = ObjectDetail::empty(reference).definition(pretty(&org), CodeLanguage::Json);
+        detail = props(detail, &org, &["id", "description", "createdAt", "updatedAt"]);
+        let org_id = jtext(&org, "id");
+        detail.children = self
+            .bucket_objects()
+            .await
+            .iter()
+            .filter(|b| org_id.is_empty() || jtext(b, "orgID") == org_id)
+            .map(|b| ObjectSummary::new(ObjectKind::Bucket, jtext(b, "name"), None).with_detail(format!("retention {}", retention_of(b))))
+            .collect();
+        Ok(detail)
+    }
+
+    async fn task_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let task = self.find_named(self.tasks().await, &reference.name, "Task").await?;
+        let flux = jtext(&task, "flux");
+        let mut detail = ObjectDetail::empty(reference).definition(flux, CodeLanguage::Text);
+        detail = props(detail, &task, &["id", "status", "every", "cron", "offset", "orgID", "org", "createdAt", "updatedAt", "latestCompleted", "lastRunStatus", "lastRunError"]);
+        Ok(detail)
+    }
+
+    async fn user_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        let user = self.find_named(self.users().await, &reference.name, "User").await?;
+        Ok(props(ObjectDetail::empty(reference).definition(pretty(&user), CodeLanguage::Json), &user, &["id", "status"]))
+    }
+
+    async fn setting_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        if let Some(cfg) = self.config().await {
+            if let Some(v) = cfg.get(&reference.name) {
+                let text = crate::integrations::prometheus::text_value(v);
+                let structured = v.is_object() || v.is_array();
+                let language = if structured { CodeLanguage::Json } else { CodeLanguage::Text };
+                let body = if structured { pretty(v) } else { text.clone() };
+                return Ok(ObjectDetail::empty(reference).definition(body, language).property("value", truncate(&text, 500)));
+            }
+        }
+        let value = self
+            .health_facts()
+            .await
+            .into_iter()
+            .find(|(k, _)| *k == reference.name)
+            .map(|(_, v)| v)
+            .ok_or_else(|| AppError::not_found(format!("Setting `{}` not found.", reference.name)))?;
+        Ok(ObjectDetail::empty(reference).definition(value.clone(), CodeLanguage::Text).property("value", value))
+    }
+
+    async fn detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        match reference.kind {
+            ObjectKind::Database => self.org_detail(reference).await,
+            ObjectKind::Bucket => self.bucket_detail(reference).await,
+            ObjectKind::Measurement => self.measurement_detail(reference).await,
+            ObjectKind::Task => self.task_detail(reference).await,
+            ObjectKind::User => self.user_detail(reference).await,
+            ObjectKind::Setting => self.setting_detail(reference).await,
+            _ => Ok(ObjectDetail::empty(reference)),
+        }
+    }
+
+    // WHAT:  Flux scripts run through /api/v2/query with the dashboard `v`
+    //        record injected; anything else is InfluxQL with the window appended.
+    async fn range(&self, req: &RangeQueryRequest) -> AppResult<RangeResult> {
+        let query = req.query.trim();
+        if query.is_empty() {
+            return Err(AppError::invalid_input("Enter a Flux or InfluxQL expression."));
+        }
+        if looks_like_flux(query) {
+            let csv = self.flux(&flux_with_window(query, req.start, req.end, req.step_seconds)).await?;
+            return Ok(RangeResult { series: csv_to_series(&csv), warnings: Vec::new() });
+        }
+        let sql = influxql_with_window(query, req.start, req.end);
+        let body = self.influxql(&sql, None).await?;
+        Ok(RangeResult { series: influxql_series(&body)?, warnings: Vec::new() })
+    }
+
+    async fn stats(&self) -> AppResult<ServerStats> {
+        let health: Json = self.http.get_json("/health").await.unwrap_or(Json::Null);
+        let metrics = self.http.get_text("/metrics").await.map(|t| parse_exposition(&t)).unwrap_or_default();
+        if health.is_null() && metrics.is_empty() {
+            return Err(AppError::driver("Neither /health nor /metrics answered."));
+        }
+        let now = chrono::Utc::now();
+
+        let mut server = vec![Stat::text("API", if self.api == Api::V2 { "v2" } else { "v1" })];
+        for (label, key) in [("Version", "version"), ("Status", "status"), ("Commit", "commit")] {
+            let v = jtext(&health, key);
+            if !v.is_empty() {
+                server.push(Stat::text(label, truncate(&v, 40)));
+            }
+        }
+        if let Some(started) = metrics.first("process_start_time_seconds") {
+            server.push(Stat::text("Uptime", human_duration(now.timestamp() as f64 - started)));
+        }
+        if let Some(org) = &self.org {
+            server.push(Stat::text("Org", org.clone()));
+        }
+        if let Some(b) = &self.bucket {
+            server.push(Stat::text("Bucket", b.clone()));
+        }
+
+        let buckets = self.bucket_objects().await;
+        let mut storage = Vec::new();
+        if !buckets.is_empty() {
+            storage.push(Stat::number("Buckets", buckets.len() as f64, None));
+        }
+        if let Some(bucket) = &self.bucket {
+            if let Ok(m) = self.measurements(bucket).await {
+                storage.push(Stat::number("Measurements", m.len() as f64, None).with_hint(format!("in {bucket}")));
+            }
+        }
+        for (label, metric) in [("Bolt reads", "boltdb_reads_total"), ("Bolt writes", "boltdb_writes_total")] {
+            if let Some(v) = metrics.sum(metric) {
+                storage.push(Stat::number(label, v, None));
+            }
+        }
+        if let Some(v) = metrics.sum("influxdb_info_uptime_seconds") {
+            storage.push(Stat::text("Reported uptime", human_duration(v)));
+        }
+
+        let mut queries = Vec::new();
+        for (label, metric) in [
+            ("Query requests", "influxdb_http_query_request_count"),
+            ("Query request bytes", "influxdb_http_query_request_bytes"),
+            ("Query response bytes", "influxdb_http_query_response_bytes"),
+            ("Write requests", "influxdb_http_write_request_count"),
+            ("API requests", "http_api_requests_total"),
+        ] {
+            if let Some(v) = metrics.sum(metric) {
+                queries.push(Stat::number(label, v, None));
+            }
+        }
+
+        let mut tasks = Vec::new();
+        for (label, metric) in [
+            ("Scheduler total", "task_scheduler_total_execute_promises"),
+            ("Scheduler failures", "task_scheduler_total_execute_failure"),
+            ("Currently running", "task_scheduler_current_execution"),
+            ("Workers busy", "task_scheduler_workers_busy"),
+        ] {
+            if let Some(v) = metrics.sum(metric) {
+                tasks.push(Stat::number(label, v, None));
+            }
+        }
+        let task_list = self.tasks().await;
+        if !task_list.is_empty() {
+            let active = task_list.iter().filter(|t| jtext(t, "status") == "active").count();
+            tasks.push(Stat::number("Tasks", task_list.len() as f64, None));
+            tasks.push(Stat::number("Tasks active", active as f64, None));
+        }
+
+        let mut memory = Vec::new();
+        for (label, metric) in [
+            ("RSS", "process_resident_memory_bytes"),
+            ("Heap alloc", "go_memstats_alloc_bytes"),
+            ("Heap in use", "go_memstats_heap_inuse_bytes"),
+            ("Sys", "go_memstats_sys_bytes"),
+        ] {
+            if let Some(v) = metrics.first(metric) {
+                memory.push(Stat::number(label, mib(v), Some("MB")));
+            }
+        }
+        if let Some(v) = metrics.first("go_goroutines") {
+            memory.push(Stat::number("Goroutines", v, None));
+        }
+
+        let groups = [("Server", server), ("Storage", storage), ("Queries", queries), ("Tasks", tasks), ("Memory", memory)]
+            .into_iter()
+            .filter(|(_, stats)| !stats.is_empty())
+            .map(|(title, stats)| StatGroup { title: title.to_string(), stats })
+            .collect();
+        Ok(ServerStats::now(groups))
+    }
+}
+
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities { sql: false, namespaces: true, fixed_columns: false, paging: true, row_estimate: false, views: false, transactions: false, exact_estimate: false },
+        object_kinds: vec![K::Database, K::Bucket, K::Measurement, K::Task, K::User, K::Setting],
+        tools: vec![T::Stats, T::MetricsExplorer],
+    }
+}
+
 #[async_trait]
 impl Integration for InfluxIntegration {
     fn engine(&self) -> Engine {
@@ -614,7 +1329,7 @@ impl Integration for InfluxIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { sql: false, namespaces: true, fixed_columns: false, paging: true, row_estimate: false, views: false, transactions: false, exact_estimate: false }
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
@@ -745,6 +1460,22 @@ impl Integration for InfluxIntegration {
     }
 
     async fn close(&self) {}
+
+    async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
+        self.list_objects(kind, parent).await
+    }
+
+    async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
+        self.detail(reference).await
+    }
+
+    async fn server_stats(&self) -> AppResult<ServerStats> {
+        self.stats().await
+    }
+
+    async fn query_range(&self, req: &RangeQueryRequest) -> AppResult<RangeResult> {
+        self.range(req).await
+    }
 }
 
 #[cfg(test)]
@@ -858,6 +1589,73 @@ mod tests {
         let p = influxql_predicate(&FilterRule { column: "v".into(), op: FilterOp::Gt, value: "2".into() });
         assert_eq!(p.as_deref(), Some("\"v\" > 2"));
         assert!(influxql_predicate(&FilterRule { column: "v".into(), op: FilterOp::IsNull, value: String::new() }).is_none());
+    }
+
+    #[test]
+    fn annotated_csv_becomes_series_per_tag_set() {
+        let csv = "#datatype,string,long,dateTime:RFC3339,double,string,string,string\n#group,false,false,false,false,true,true,true\n#default,_result,,,,,,\n,result,table,_time,_value,_measurement,_field,host\n,,0,2024-01-01T00:01:00Z,1.5,cpu,usage,h1\n,,0,2024-01-01T00:00:00Z,1,cpu,usage,h1\n,,1,2024-01-01T00:00:00Z,2,cpu,usage,h2\n";
+        let series = csv_to_series(csv);
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].name, "cpu.usage{host=\"h1\"}");
+        // Points come back ascending even though the CSV listed them out of order.
+        assert_eq!(series[0].points, vec![[1704067200.0, 1.0], [1704067260.0, 1.5]]);
+        assert_eq!(series[1].name, "cpu.usage{host=\"h2\"}");
+        assert_eq!(series[1].points.len(), 1);
+        assert!(series[0].labels.iter().any(|l| l.name == "host" && l.value == "h1"));
+        // A table with no _time / _value column contributes nothing.
+        assert!(csv_to_series("a,b\n1,2\n").is_empty());
+    }
+
+    #[test]
+    fn influxql_json_becomes_series_per_column() {
+        let body = serde_json::json!({"results": [{"series": [
+            {"name": "cpu", "tags": {"host": "h1"}, "columns": ["time", "usage", "load"], "values": [
+                ["2024-01-01T00:00:00Z", 0.5, 3],
+                ["2024-01-01T00:01:00Z", 0.7, null]
+            ]}
+        ]}]});
+        let series = influxql_series(&body).unwrap_or_default();
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].name, "cpu.usage{host=\"h1\"}");
+        assert_eq!(series[0].points, vec![[1704067200.0, 0.5], [1704067260.0, 0.7]]);
+        assert_eq!(series[1].name, "cpu.load{host=\"h1\"}");
+        assert_eq!(series[1].points, vec![[1704067200.0, 3.0]]);
+        assert!(influxql_series(&serde_json::json!({"results": [{"error": "boom"}]})).is_err());
+    }
+
+    #[test]
+    fn range_queries_carry_the_window() {
+        let flux = flux_with_window("from(bucket: \"b\") |> range(start: v.timeRangeStart)", 1704067200.0, 1704070800.0, 60.0);
+        assert!(flux.starts_with("v = {timeRangeStart: time(v: \"2024-01-01T00:00:00Z\"), timeRangeStop: time(v: \"2024-01-01T01:00:00Z\"), windowPeriod: 60s}\n"));
+        assert!(flux.ends_with("|> range(start: v.timeRangeStart)"));
+        assert!(looks_like_flux("from(bucket: \"b\")"));
+        assert!(looks_like_flux("x |> mean()"));
+        assert!(!looks_like_flux("SELECT * FROM cpu"));
+
+        let sql = influxql_with_window("SELECT mean(usage) FROM cpu", 1704067200.0, 1704070800.0);
+        assert_eq!(sql, "SELECT mean(usage) FROM cpu WHERE time >= '2024-01-01T00:00:00Z' AND time <= '2024-01-01T01:00:00Z'");
+        let grouped = influxql_with_window("SELECT mean(usage) FROM cpu WHERE host = 'h1' GROUP BY time(1m)", 1704067200.0, 1704070800.0);
+        assert_eq!(grouped, "SELECT mean(usage) FROM cpu WHERE host = 'h1' AND time >= '2024-01-01T00:00:00Z' AND time <= '2024-01-01T01:00:00Z' GROUP BY time(1m)");
+        // A query that already bounds time is left untouched.
+        assert_eq!(influxql_with_window("SELECT * FROM cpu WHERE time > now() - 1h;", 0.0, 1.0), "SELECT * FROM cpu WHERE time > now() - 1h");
+    }
+
+    #[test]
+    fn stat_helpers_read_influx_shapes() {
+        assert_eq!(retention_of(&serde_json::json!({"retentionRules": [{"everySeconds": 604800}]})), "7d 0h 0m");
+        assert_eq!(retention_of(&serde_json::json!({"retentionRules": [{"everySeconds": 0}]})), "infinite");
+        assert_eq!(retention_of(&serde_json::json!({})), "infinite");
+        assert_eq!(task_schedule(&serde_json::json!({"every": "1h"})), "every 1h");
+        assert_eq!(task_schedule(&serde_json::json!({"cron": "0 * * * *"})), "cron 0 * * * *");
+        assert_eq!(task_schedule(&serde_json::json!({})), "");
+        assert_eq!(time_seconds(&Value::DateTime("2024-01-01T00:00:00Z".into())), Some(1704067200.0));
+        assert_eq!(time_seconds(&Value::Int(1_704_067_200_000_000_000)), Some(1704067200.0));
+        assert_eq!(time_seconds(&Value::Int(1_704_067_200)), Some(1704067200.0));
+        assert_eq!(time_seconds(&Value::Null), None);
+        assert_eq!(value_number(&Value::Text("2.5".into())), Some(2.5));
+        let rows = key_rows(&["usage".to_string()], &["host".to_string()]);
+        assert_eq!(rows.rows.len(), 2);
+        assert_eq!(rows.rows[0][0], Value::Text("tag".into()));
     }
 
     // WHAT:  Live round trip against InfluxDB 2.x. Skipped unless

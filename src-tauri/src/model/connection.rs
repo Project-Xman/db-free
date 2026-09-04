@@ -81,6 +81,7 @@ pub enum Engine {
     Cockroachdb,
     Tidb,
     Yugabytedb,
+    Spacetimedb,
     // Embedded / serverless SQL
     Sqlite,
     Rocksdb,
@@ -99,6 +100,9 @@ pub enum Engine {
     Redpanda,
     // Object
     Objectdb,
+    S3,
+    Minio,
+    CloudflareR2,
     // Hierarchical / network (legacy, reached over their SQL gateways)
     IbmIms,
     RaimaRdm,
@@ -117,7 +121,9 @@ pub enum Engine {
 // WHY:   Many products are wire-compatible (Postgres family, MySQL family,
 //        Cassandra CQL, Elasticsearch REST, Kafka protocol…). One adapter per
 //        protocol, many engines per adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum Family {
     Postgres,
     Mysql,
@@ -163,6 +169,8 @@ pub enum Family {
     Sparql,
     Basex,
     Existdb,
+    Spacetimedb,
+    S3,
 }
 
 // WHAT:  Product category — the section the picker groups engines under.
@@ -212,7 +220,7 @@ pub enum FormKind {
 }
 
 impl Engine {
-    pub const ALL: [Engine; 69] = [
+    pub const ALL: [Engine; 73] = [
         Engine::Postgres,
         Engine::Mysql,
         Engine::Mariadb,
@@ -258,6 +266,7 @@ impl Engine {
         Engine::Snowflake,
         Engine::Bigquery,
         Engine::Cockroachdb,
+        Engine::Spacetimedb,
         Engine::Tidb,
         Engine::Yugabytedb,
         Engine::Sqlite,
@@ -273,6 +282,9 @@ impl Engine {
         Engine::Kafka,
         Engine::Redpanda,
         Engine::Objectdb,
+        Engine::S3,
+        Engine::Minio,
+        Engine::CloudflareR2,
         Engine::IbmIms,
         Engine::RaimaRdm,
         Engine::Basex,
@@ -334,6 +346,8 @@ impl Engine {
             Engine::Libsql => Family::Libsql,
             Engine::ValTown => Family::ValTown,
             Engine::CloudflareD1 => Family::CloudflareD1,
+            Engine::Spacetimedb => Family::Spacetimedb,
+            Engine::S3 | Engine::Minio | Engine::CloudflareR2 => Family::S3,
             Engine::Immudb => Family::Immudb,
             Engine::Qldb => Family::Qldb,
             Engine::Kafka | Engine::Redpanda => Family::Kafka,
@@ -371,11 +385,11 @@ impl Engine {
             Engine::Postgis | Engine::Spatialite => EngineKind::Spatial,
             Engine::Memcached | Engine::Dragonfly => EngineKind::InMemory,
             Engine::Clickhouse | Engine::Duckdb | Engine::Druid | Engine::Snowflake | Engine::Bigquery => EngineKind::Analytical,
-            Engine::Cockroachdb | Engine::Tidb | Engine::Yugabytedb => EngineKind::NewSql,
+            Engine::Cockroachdb | Engine::Tidb | Engine::Yugabytedb | Engine::Spacetimedb => EngineKind::NewSql,
             Engine::Sqlite | Engine::Rocksdb | Engine::Libsql | Engine::ValTown | Engine::CloudflareD1 => EngineKind::Embedded,
             Engine::Immudb | Engine::Qldb => EngineKind::Ledger,
             Engine::Kafka | Engine::Redpanda => EngineKind::Streaming,
-            Engine::Objectdb => EngineKind::Object,
+            Engine::Objectdb | Engine::S3 | Engine::Minio | Engine::CloudflareR2 => EngineKind::Object,
             Engine::IbmIms => EngineKind::Hierarchical,
             Engine::RaimaRdm => EngineKind::Network,
             Engine::Basex | Engine::Existdb => EngineKind::Xml,
@@ -387,7 +401,7 @@ impl Engine {
     pub fn form(self) -> FormKind {
         match self.family() {
             Family::Sqlite | Family::Duckdb | Family::Rocksdb => FormKind::File,
-            Family::Dynamodb | Family::Qldb => FormKind::Aws,
+            Family::Dynamodb | Family::Qldb | Family::S3 => FormKind::Aws,
             Family::Firestore | Family::Bigquery => FormKind::Gcp,
             Family::Libsql
             | Family::ValTown
@@ -414,7 +428,8 @@ impl Engine {
             | Family::Surrealdb
             | Family::Orientdb
             | Family::Immudb
-            | Family::Objectdb => FormKind::HttpToken,
+            | Family::Objectdb
+            | Family::Spacetimedb => FormKind::HttpToken,
             Family::Postgres
             | Family::Mysql
             | Family::Mssql
@@ -483,6 +498,10 @@ impl Engine {
             Engine::Libsql => "libsql",
             Engine::ValTown => "val_town",
             Engine::CloudflareD1 => "cloudflare_d1",
+            Engine::Spacetimedb => "spacetimedb",
+            Engine::S3 => "s3",
+            Engine::Minio => "minio",
+            Engine::CloudflareR2 => "cloudflare_r2",
             Engine::Supabase => "supabase",
             Engine::Planetscale => "planetscale",
             Engine::Neon => "neon",
@@ -559,6 +578,10 @@ impl Engine {
             Engine::Libsql => "LibSQL / Turso",
             Engine::ValTown => "Val Town",
             Engine::CloudflareD1 => "Cloudflare D1",
+            Engine::Spacetimedb => "SpacetimeDB",
+            Engine::S3 => "Amazon S3",
+            Engine::Minio => "MinIO",
+            Engine::CloudflareR2 => "Cloudflare R2",
             Engine::Supabase => "Supabase",
             Engine::Planetscale => "PlanetScale",
             Engine::Neon => "Neon",
@@ -661,6 +684,10 @@ impl Engine {
             Engine::Immudb => Some(8080),
             Engine::Kafka | Engine::Redpanda => Some(9092),
             Engine::Objectdb => Some(6136),
+            // `spacetime start` serves the HTTP API on 3000.
+            Engine::Spacetimedb => Some(3000),
+            // The endpoint URL carries the port for object storage.
+            Engine::S3 | Engine::Minio | Engine::CloudflareR2 => None,
             Engine::Basex => Some(8984),
             Engine::Existdb => Some(8080),
             Engine::ApacheJena => Some(3030),
@@ -700,11 +727,13 @@ pub struct EngineFacts {
     pub kind: EngineKind,
     pub form: FormKind,
     pub default_port: Option<u16>,
+    /// Adapter that speaks to it: what the object explorer and tool tabs key on.
+    pub family: Family,
 }
 
 impl Engine {
     pub fn facts(self) -> EngineFacts {
-        EngineFacts { kind: self.kind(), form: self.form(), default_port: self.default_port() }
+        EngineFacts { kind: self.kind(), form: self.form(), default_port: self.default_port(), family: self.family() }
     }
 }
 
