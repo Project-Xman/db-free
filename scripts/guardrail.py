@@ -150,8 +150,10 @@ def check_rust(path: Path, text: str) -> list[Finding]:
     for crate, owners in VENDOR_OWNERS.items():
         if not any(rel.startswith(o) for o in owners):
             # A leading `::`/identifier char means it is a path inside this crate
-            # (e.g. adapters::keyring::...), not the vendor crate itself.
-            match = re.search(rf"(?<![A-Za-z0-9_:]){crate}::", text) or re.search(rf"\buse {crate}\b", text)
+            # (e.g. adapters::keyring::...), not the vendor crate itself. The
+            # integrations registry calls sibling modules that share a vendor
+            # crate's name (`duckdb::connect(conn)`): only `connect(` is allowed there.
+            match = re.search(rf"(?<![A-Za-z0-9_:]){crate}::(?!connect\()", text) or re.search(rf"\buse {crate}\b", text)
             if match:
                 findings.append(Finding(path, line_of(text, match.start()), "vendor-boundary",
                     f"`{crate}` may only be used in {', '.join(owners)}. Map it to AppError there and expose a model type."))

@@ -24,4 +24,12 @@ rowEstimate: boolean,
 /**
  * Distinguishes tables from views.
  */
-views: boolean, };
+views: boolean, 
+/**
+ * `BEGIN … COMMIT` wraps multi-statement scripts (imports, pending changes).
+ */
+transactions: boolean, 
+/**
+ * `row_estimate` is an exact count, not a statistics guess.
+ */
+exactEstimate: boolean, };

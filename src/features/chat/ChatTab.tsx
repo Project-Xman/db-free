@@ -169,6 +169,9 @@ export function ChatTab({ connectionId }: { connectionId: string }) {
         const reply = await ipc("ai_generate", {
           connectionId: connection.id,
           prompt: text,
+          currentQuery: null,
+          currentTable: null,
+          errorContext: null,
           conversationHistory: historyToSend,
         });
 

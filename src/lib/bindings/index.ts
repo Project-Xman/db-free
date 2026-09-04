@@ -44,6 +44,7 @@ export type * from "./ExportedFile";
 export type * from "./FilterOp";
 export type * from "./FilterRule";
 export type * from "./ForeignKey";
+export type * from "./FormKind";
 export type * from "./HistoryEntry";
 export type * from "./HistoryOrigin";
 export type * from "./HistoryRequest";

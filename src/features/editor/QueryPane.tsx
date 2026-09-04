@@ -212,7 +212,9 @@ export function QueryPane({ connection, tabId, seedSql }: QueryPaneProps) {
         connectionId: connection.id,
         prompt: promptText,
         currentQuery: sql.trim().length > 0 ? sql : null,
+        currentTable: null,
         errorContext: lastError,
+        conversationHistory: null,
       });
       setAiText(reply.text);
       setAiGeneratedSql(reply.sql);

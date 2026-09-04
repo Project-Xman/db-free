@@ -62,6 +62,7 @@ const http = (o: Partial<EngineMeta> & Pick<EngineMeta, "label" | "kind" | "hint
   fields: { host: "Server URL", password: "API key / token" },
   ...o,
 });
+const meta = (o: EngineMeta): EngineMeta => o;
 const file = (o: Partial<EngineMeta> & Pick<EngineMeta, "label" | "kind" | "hint" | "schemes">): EngineMeta => ({
   form: "file",
   defaultPort: null,
@@ -86,12 +87,12 @@ export const ENGINES = {
   // ---- Document
   mongodb: server({ label: "MongoDB", kind: "document", defaultPort: 27017, defaultDatabase: "test", icon: "braces", hint: "Documents · JSON commands", commandLanguage: "Command", schemes: ["mongodb", "mongodb+srv"] }),
   couchdb: http({ label: "CouchDB", kind: "document", defaultPort: 5984, defaultUser: "admin", icon: "braces", hint: "Documents · Mango over HTTP", commandLanguage: "Mango", schemes: ["couchdb", "couch"], fields: { host: "Server URL", username: "User", password: "Password", database: "Database" } }),
-  firestore: { label: "Firestore", kind: "document", form: "gcp", defaultPort: null, defaultDatabase: "", defaultUser: "", icon: "braces", hint: "Documents · Google Cloud", commandLanguage: "Query", schemes: ["firestore"], fields: { database: "Project ID", username: "Database ID", password: "Service-account JSON" } },
+  firestore: meta({ label: "Firestore", kind: "document", form: "gcp", defaultPort: null, defaultDatabase: "", defaultUser: "", icon: "braces", hint: "Documents · Google Cloud", commandLanguage: "Query", schemes: ["firestore"], fields: { database: "Project ID", username: "Database ID", password: "Service-account JSON" } }),
 
   // ---- Key-value
   redis: server({ label: "Redis", kind: "key_value", defaultPort: 6379, defaultDatabase: "0", icon: "hash", hint: "Key-value · commands", commandLanguage: "Command", schemes: ["redis", "rediss"] }),
   valkey: server({ label: "Valkey", kind: "key_value", defaultPort: 6379, defaultDatabase: "0", icon: "hash", hint: "Key-value · Redis-compatible", commandLanguage: "Command", schemes: ["valkey", "valkeys"] }),
-  dynamodb: { label: "DynamoDB", kind: "key_value", form: "aws", defaultPort: null, defaultDatabase: "", defaultUser: "", icon: "hash", hint: "Key-value · AWS PartiQL", commandLanguage: "PartiQL", schemes: ["dynamodb"], fields: { host: "Region", username: "Access key ID", password: "Secret access key", database: "Endpoint override" }, hostPlaceholder: "us-east-1" },
+  dynamodb: meta({ label: "DynamoDB", kind: "key_value", form: "aws", defaultPort: null, defaultDatabase: "", defaultUser: "", icon: "hash", hint: "Key-value · AWS PartiQL", commandLanguage: "PartiQL", schemes: ["dynamodb"], fields: { host: "Region", username: "Access key ID", password: "Secret access key", database: "Endpoint override" }, hostPlaceholder: "us-east-1" }),
 
   // ---- Wide-column
   cassandra: server({ label: "Cassandra", kind: "wide_column", defaultPort: 9042, icon: "columns", hint: "Wide-column · CQL", commandLanguage: "CQL", schemes: ["cassandra", "cql"], fields: { database: "Keyspace" } }),
@@ -142,7 +143,7 @@ export const ENGINES = {
   duckdb: file({ label: "DuckDB", kind: "analytical", icon: "columns", hint: "Analytical · embedded SQL", schemes: ["duckdb"] }),
   druid: http({ label: "Apache Druid", kind: "analytical", defaultPort: 8888, icon: "columns", hint: "Analytical · Druid SQL", commandLanguage: SQL, schemes: ["druid"], fields: { host: "Router URL", username: "User", password: "Password" } }),
   snowflake: http({ label: "Snowflake", kind: "analytical", defaultPort: null, icon: "columns", hint: "Analytical · cloud SQL", commandLanguage: SQL, schemes: ["snowflake"], fields: { host: "Account identifier", database: "Database.Schema", username: "User", password: "Password or PAT" }, hostPlaceholder: "xy12345.us-east-1" }),
-  bigquery: { label: "BigQuery", kind: "analytical", form: "gcp", defaultPort: null, defaultDatabase: "", defaultUser: "", icon: "columns", hint: "Analytical · GoogleSQL", commandLanguage: SQL, schemes: ["bigquery", "bq"], fields: { database: "Project ID", username: "Dataset (optional)", password: "Service-account JSON" } },
+  bigquery: meta({ label: "BigQuery", kind: "analytical", form: "gcp", defaultPort: null, defaultDatabase: "", defaultUser: "", icon: "columns", hint: "Analytical · GoogleSQL", commandLanguage: SQL, schemes: ["bigquery", "bq"], fields: { database: "Project ID", username: "Dataset (optional)", password: "Service-account JSON" } }),
 
   // ---- NewSQL / distributed SQL
   cockroachdb: server({ label: "CockroachDB", kind: "new_sql", defaultPort: 26257, defaultDatabase: "defaultdb", defaultUser: "root", hint: "Distributed SQL · PG wire", schemes: ["cockroachdb", "cockroach", "crdb"] }),
@@ -158,7 +159,7 @@ export const ENGINES = {
 
   // ---- Ledger
   immudb: http({ label: "immudb", kind: "ledger", defaultPort: 3323, defaultDatabase: "defaultdb", defaultUser: "immudb", hint: "Immutable ledger · SQL / KV", commandLanguage: SQL, schemes: ["immudb"], fields: { host: "REST URL (port 3323)", database: "Database", username: "User", password: "Password" } }),
-  qldb: { label: "Amazon QLDB", kind: "ledger", form: "aws", defaultPort: null, defaultDatabase: "", defaultUser: "", icon: "database", hint: "Immutable ledger · PartiQL", commandLanguage: "PartiQL", schemes: ["qldb"], fields: { host: "Region", username: "Access key ID", password: "Secret access key", database: "Ledger name" }, hostPlaceholder: "us-east-1" },
+  qldb: meta({ label: "Amazon QLDB", kind: "ledger", form: "aws", defaultPort: null, defaultDatabase: "", defaultUser: "", icon: "database", hint: "Immutable ledger · PartiQL", commandLanguage: "PartiQL", schemes: ["qldb"], fields: { host: "Region", username: "Access key ID", password: "Secret access key", database: "Ledger name" }, hostPlaceholder: "us-east-1" }),
 
   // ---- Event / streaming
   kafka: server({ label: "Apache Kafka", kind: "streaming", defaultPort: 9092, icon: "rows", hint: "Event streaming · topics", commandLanguage: "Consume", schemes: ["kafka"], fields: { host: "Bootstrap servers", username: "SASL user", password: "SASL password", database: "Topic filter (optional)" } }),
