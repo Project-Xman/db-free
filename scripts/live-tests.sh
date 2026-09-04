@@ -234,7 +234,11 @@ fi
 if want prometheus; then
   echo "=== prometheus"
   if start prometheus -p 59090:9090 prom/prometheus:latest && wait_http http://127.0.0.1:59090/-/healthy 60; then
-    sleep 5
+    # Prometheus only has series after it has scraped itself at least once.
+    for _ in $(seq 60); do
+      [ "$(curl -s "http://127.0.0.1:59090/api/v1/query?query=up" | grep -c '"value"')" != "0" ] && break
+      sleep 1
+    done
     DBFREE_TEST_PROMETHEUS_URL=http://127.0.0.1:59090 run_test prometheus integrations::prometheus::tests::live_round_trip_when_configured
   else SKIPPED+=("prometheus"); fi
   docker rm -f dbfree-prometheus >/dev/null 2>&1

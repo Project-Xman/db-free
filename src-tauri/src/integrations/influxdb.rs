@@ -9,7 +9,7 @@ use crate::model::{
 };
 use async_trait::async_trait;
 use reqwest::Method;
-use serde_json::Value as Json;
+use serde_json::{json, Value as Json};
 use std::sync::Arc;
 
 // ============================================================================
@@ -79,20 +79,26 @@ pub async fn connect(conn: &ResolvedConnection) -> AppResult<Arc<dyn Integration
     Ok(Arc::new(integration))
 }
 
-// WHAT:  `/health` answers on both; a 1.x version (or a missing /api/v2/ping) means v1.
+// WHAT:  `/health` answers on both; a 1.x version means v1, 2.x/3.x mean v2.
+// HOW:   OSS 2.x reports "v2.9.1" (leading `v`) while older builds report
+//        "2.7.1", so the prefix is stripped before the major digit is read.
+//        `/api/v2/ping` is the fallback and answers 401 (not 404) when it
+//        exists but the request is unauthenticated — that still proves v2.
 async fn detect_api(http: &HttpClient) -> AppResult<Api> {
     let health: Json = http.get_json("/health").await?;
     let version = health.get("version").and_then(Json::as_str).unwrap_or_default();
-    if version.starts_with("1.") {
+    let major = version.trim_start_matches(['v', 'V']);
+    if major.starts_with("1.") || major == "1" {
         return Ok(Api::V1);
     }
-    if version.starts_with('2') || version.starts_with('3') {
+    if major.starts_with('2') || major.starts_with('3') {
         return Ok(Api::V2);
     }
-    let ping = http.send(http.request(Method::GET, "/api/v2/ping")).await;
-    Ok(match ping {
+    Ok(match http.send(http.request(Method::GET, "/api/v2/ping")).await {
         Ok(_) => Api::V2,
         Err(AppError::NotFound { .. }) => Api::V1,
+        // 401/403 means the endpoint exists and only the credentials were missing.
+        Err(AppError::NotConnected { .. }) => Api::V2,
         Err(e) => return Err(e),
     })
 }
@@ -311,7 +317,10 @@ fn page_flux(bucket: &str, measurement: &str, query: &PageQuery, count_only: boo
     }
     out.push_str("  |> group()\n");
     if count_only {
-        out.push_str("  |> count(column: \"_time\")\n");
+        // `count(column: "_time")` is rejected ("unsupported aggregate column
+        // type time") and any field column may be absent after a filter, so the
+        // row count is accumulated instead — it works for every schema.
+        out.push_str("  |> reduce(identity: {n: 0}, fn: (r, accumulator) => ({n: accumulator.n + 1}))\n");
         return out;
     }
     let sort: Vec<String> = query.sort.iter().map(|s| flux_string(&s.column)).collect();
@@ -468,12 +477,21 @@ impl InfluxIntegration {
         }
     }
 
+    // WHAT:  Runs a Flux script and returns annotated CSV.
+    // WHY:   Posting `application/vnd.flux` returns CSV *without* the
+    //        `#datatype` header, so every column would decode as text. The JSON
+    //        dialect form is the only way to ask for annotations, which is what
+    //        makes numbers, booleans and timestamps come back typed.
     async fn flux(&self, script: &str) -> AppResult<String> {
         if self.api != Api::V2 {
             return Err(AppError::invalid_input("Flux needs InfluxDB 2.x; this server is 1.x. Use InfluxQL instead."));
         }
         let path = format!("/api/v2/query{}", self.org_query());
-        self.http.post_raw(&path, "application/vnd.flux", script.to_string(), Some("application/csv")).await
+        let body = json!({
+            "query": script,
+            "dialect": { "annotations": ["datatype", "group", "default"], "header": true },
+        });
+        self.http.post_raw(&path, "application/json", body.to_string(), Some("application/csv")).await
     }
 
     async fn influxql(&self, sql: &str, db: Option<&str>) -> AppResult<Json> {
@@ -676,7 +694,7 @@ impl Integration for InfluxIntegration {
                 let q = PageQuery { sort: vec![], filters: filters.to_vec(), offset: 0, limit: 1 };
                 let csv = self.flux(&page_flux(bucket, &table.name, &q, true)).await?;
                 let set = csv_to_result_set(&csv, 10);
-                let idx = set.columns.iter().position(|c| c.name == "_time").unwrap_or(0);
+                let idx = set.columns.iter().position(|c| c.name == "n").unwrap_or(0);
                 Ok(match set.rows.first().and_then(|r| r.get(idx)) {
                     Some(Value::Int(n)) => *n,
                     _ => 0,
@@ -795,7 +813,7 @@ mod tests {
         assert!(flux.ends_with("limit(n: 10, offset: 20)\n"));
         let count = page_flux("b", "cpu", &PageQuery { sort: vec![], filters: vec![], offset: 0, limit: 1 }, true);
         assert!(count.contains("range(start: -30d)"));
-        assert!(count.ends_with("count(column: \"_time\")\n"));
+        assert!(count.ends_with("reduce(identity: {n: 0}, fn: (r, accumulator) => ({n: accumulator.n + 1}))\n"));
         assert!(!count.contains("limit("));
         assert_eq!(flux_field("weird-name"), "r[\"weird-name\"]");
     }
@@ -870,11 +888,18 @@ mod tests {
         // Write a few points through the v2 write API.
         let http = HttpClient::new(input.host.clone().unwrap_or_default(), Auth::Header { name: "Authorization".into(), value: format!("Token {}", resolved.secret.clone().unwrap_or_default()) }, false).unwrap_or_else(|e| panic!("{e}"));
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
-        let lines = format!("dbfree_cpu,host=h1 usage=0.5 {}\ndbfree_cpu,host=h2 usage=0.9 {}\ndbfree_cpu,host=h1 usage=0.7 {}", now - 3_000_000_000, now - 2_000_000_000, now - 1_000_000_000);
+        // A unique measurement per run so a re-used bucket cannot skew the counts.
+        let measurement = format!("dbfree_cpu_{now}");
+        let lines = format!(
+            "{measurement},host=h1 usage=0.5 {}\n{measurement},host=h2 usage=0.9 {}\n{measurement},host=h1 usage=0.7 {}",
+            now - 3_000_000_000,
+            now - 2_000_000_000,
+            now - 1_000_000_000
+        );
         http.post_raw(&format!("/api/v2/write?org={}&bucket={}&precision=ns", encode(&input.username.clone().unwrap_or_default()), encode(&bucket)), "text/plain", lines, None).await.unwrap_or_else(|e| panic!("write: {e}"));
         let cat = i.catalog().await.unwrap_or_else(|e| panic!("catalog: {e}"));
-        assert!(cat.schemas.iter().any(|s| s.tables.iter().any(|t| t.name == "dbfree_cpu")), "{cat:?}");
-        let table = TableRef { schema: Some(bucket.clone()), name: "dbfree_cpu".into() };
+        assert!(cat.schemas.iter().any(|s| s.tables.iter().any(|t| t.name == measurement)), "{cat:?}");
+        let table = TableRef { schema: Some(bucket.clone()), name: measurement.clone() };
         let cols = i.columns(&table).await.unwrap_or_else(|e| panic!("columns: {e}"));
         let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"host") && names.contains(&"usage"), "{names:?}");
@@ -887,12 +912,12 @@ mod tests {
         let page = i.fetch_page(&table, &q).await.unwrap_or_else(|e| panic!("page: {e}"));
         assert_eq!(page.rows.len(), 2, "{page:?}");
         assert_eq!(i.count(&table, &q.filters).await.unwrap_or_default(), 2);
-        let out = i.execute(&format!("from(bucket: \"{bucket}\") |> range(start: -1h) |> filter(fn: (r) => r._measurement == \"dbfree_cpu\")"), 100).await.unwrap_or_else(|e| panic!("flux: {e}"));
+        let out = i.execute(&format!("from(bucket: \"{bucket}\") |> range(start: -1h) |> filter(fn: (r) => r._measurement == \"{measurement}\")"), 100).await.unwrap_or_else(|e| panic!("flux: {e}"));
         match &out[0] {
             StatementResult::Rows { result } => assert_eq!(result.rows.len(), 3, "{result:?}"),
             other => panic!("unexpected {other:?}"),
         }
-        let out = i.execute("SELECT * FROM dbfree_cpu", 100).await.unwrap_or_else(|e| panic!("influxql: {e}"));
+        let out = i.execute(&format!("SELECT * FROM {measurement}"), 100).await.unwrap_or_else(|e| panic!("influxql: {e}"));
         match &out[0] {
             StatementResult::Rows { result } => assert_eq!(result.rows.len(), 3, "{result:?}"),
             other => panic!("unexpected {other:?}"),

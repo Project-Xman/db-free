@@ -53,6 +53,19 @@ pub async fn connect(conn: &ResolvedConnection) -> AppResult<Arc<dyn Integration
     let http = HttpClient::new(base, HttpClient::auth_from_connection(conn), insecure)?;
     let integration = SurrealIntegration { engine: s.engine, http, namespace, database, read_only: s.read_only };
     integration.ping().await?;
+    // SurrealDB 2.x rejects every statement until the namespace and database
+    // exist. Creating them is idempotent and needs no privileges beyond the
+    // ones a user who can write already has, so a fresh server is usable
+    // immediately instead of failing with "The namespace 'x' does not exist".
+    if !s.read_only {
+        let bootstrap = format!(
+            "DEFINE NAMESPACE IF NOT EXISTS {}; USE NS {}; DEFINE DATABASE IF NOT EXISTS {};",
+            ident(&integration.namespace),
+            ident(&integration.namespace),
+            ident(&integration.database)
+        );
+        let _ = integration.sql(&bootstrap).await;
+    }
     Ok(Arc::new(integration))
 }
 
