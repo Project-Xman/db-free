@@ -49,9 +49,16 @@ run_engine() { # run_engine <name> <cargo filter> <env assignments…>
   log "$name"
   local out
   if ! out=$(cd "$ROOT/src-tauri" && env "$@" cargo test --lib "$filter" -- --test-threads=1 2>&1); then
-    printf '%s\n' "$out" | grep -E "panicked at|assertion|error\[|^error" | head -5
+    printf '%s\n' "$out" | grep -E -A1 "panicked at|assertion|error\[|^error" | head -8
     FAIL+=("$name")
     return 1
+  fi
+  # A missing native client library is a prerequisite of this machine, not a
+  # defect in the adapter: report it as skipped with the reason, not as a failure.
+  if printf '%s\n' "$out" | grep -q "Oracle Instant Client was not found"; then
+    note "skipped (Oracle Instant Client not installed on this host)"
+    SKIP+=("$name")
+    return 0
   fi
   # `0 passed` means the gate variable was unset: the server never came up.
   if printf '%s\n' "$out" | grep -qE "test result: ok\. 0 passed"; then
@@ -80,6 +87,7 @@ port_of() {
     immudb) echo 58082 ;;
     redpanda) echo 59092 ;;
     existdb) echo 58083 ;; fuseki) echo 53030 ;;
+    minio) echo 59000 ;; spacetimedb) echo 53100 ;;
     oracle) echo 51521 ;;
     *) echo "" ;;
   esac
@@ -112,6 +120,26 @@ ready() { # ready <service> <seconds>
         # real cluster-health response instead.
         elasticsearch) curl -s -f -o /dev/null --max-time 3 "http://127.0.0.1:59200/_cluster/health?wait_for_status=yellow&timeout=2s" && return 0 ;;
         opensearch) curl -s -f -o /dev/null --max-time 3 "http://127.0.0.1:59201/_cluster/health?wait_for_status=yellow&timeout=2s" && return 0 ;;
+        # These bind their port well before the HTTP API answers.
+        arangodb) curl -s -f -o /dev/null --max-time 3 -u root:dbfree "http://127.0.0.1:58529/_api/version" && return 0 ;;
+        orientdb) curl -s -f -o /dev/null --max-time 3 -u root:dbfree "http://127.0.0.1:52480/listDatabases" && return 0 ;;
+        # SpacetimeDB answers /v1/ping as soon as the host is up.
+        spacetimedb) curl -s -f -o /dev/null --max-time 3 "http://127.0.0.1:53100/v1/ping" && return 0 ;;
+        # MinIO answers /minio/health/live once the object API is serving.
+        minio) curl -s -f -o /dev/null --max-time 3 "http://127.0.0.1:59000/minio/health/live" && return 0 ;;
+        # ClickHouse accepts on 8123 ~30s before it will answer a query.
+        clickhouse) [ "$(curl -s --max-time 3 -u default:dbfree 'http://127.0.0.1:58123/?query=SELECT%201')" = "1" ] && return 0 ;;
+        # immudb listens before /api/login will mint a token; probe the login itself.
+        immudb) curl -s -f -o /dev/null --max-time 3 -X POST -H 'Content-Type: application/json' \
+            -d '{"user":"aW1tdWRi","password":"aW1tdWRi"}' "http://127.0.0.1:58082/api/login" && return 0 ;;
+        # eXist-db is a JVM app: the port is open long before the REST collection is.
+        existdb) curl -s -f -o /dev/null --max-time 3 -u admin: "http://127.0.0.1:58083/exist/rest/db" && return 0 ;;
+        # Fuseki likewise; the dataset POST below only works once this answers.
+        fuseki) curl -s -f -o /dev/null --max-time 3 -u admin:dbfree "http://127.0.0.1:53030/\$/datasets" && return 0 ;;
+        # Oracle opens 1521 minutes before the PDB is mounted and openable.
+        oracle) docker exec "$id" bash -lc 'echo "SELECT 1 FROM dual;" | sqlplus -s system/dbfree@//localhost:1521/FREEPDB1' 2>/dev/null | grep -q "1" && return 0 ;;
+        # Druid's router answers /status/health only once the services are up.
+        druid) [ "$(curl -s --max-time 3 http://127.0.0.1:58888/status/health)" = "true" ] && return 0 ;;
         # Milvus opens 19530 long before its components report healthy.
         milvus) [ "$(curl -s --max-time 3 http://127.0.0.1:59091/healthz)" = "OK" ] && return 0 ;;
         # /health answers before DOCKER_INFLUXDB_INIT_* has finished creating
@@ -151,6 +179,7 @@ CATEGORIES=(
   "vector:qdrant chroma milvus"
   "search:elasticsearch opensearch meilisearch typesense"
   "multi-model:arangodb surrealdb orientdb weaviate"
+  "object:minio"
   "olap:clickhouse"
   "ledger:immudb"
   "streaming:redpanda"
@@ -158,7 +187,7 @@ CATEGORIES=(
   "rdf:fuseki"
   "embedded:sqlite duckdb rocksdb"
 )
-[ "${WITH_HEAVY:-0}" = "1" ] && CATEGORIES+=("heavy:oracle druid")
+[ "${WITH_HEAVY:-0}" = "1" ] && CATEGORIES+=("heavy:oracle druid spacetimedb")
 
 # WHAT:  Runs one engine once its service is up. Named so the group loop can
 #        stay a flat list of one-liners.
@@ -226,6 +255,16 @@ test_service() { # test_service <service>
         DBFREE_TEST_MEILISEARCH_URL=http://127.0.0.1:57700 DBFREE_TEST_MEILISEARCH_KEY=dbfreekey ;;
     typesense) run_engine typesense integrations::typesense::tests::live \
         DBFREE_TEST_TYPESENSE_URL=http://127.0.0.1:58108 DBFREE_TEST_TYPESENSE_KEY=dbfreekey ;;
+    minio)
+        # The seed job creates the bucket and its keys; it exits when done.
+        "${COMPOSE[@]}" up -d minio-seed >/dev/null 2>&1
+        for _ in $(seq 60); do
+          [ "$("${COMPOSE[@]}" ps -a --format '{{.Service}} {{.State}}' 2>/dev/null | grep -c 'minio-seed exited')" != "0" ] && break
+          sleep 1
+        done
+        run_engine s3 integrations::s3::tests::live \
+          DBFREE_TEST_S3_ENDPOINT=http://127.0.0.1:59000 DBFREE_TEST_S3_REGION=us-east-1 \
+          DBFREE_TEST_S3_KEY=minioadmin DBFREE_TEST_S3_SECRET=minioadmin DBFREE_TEST_S3_BUCKET=dbfree ;;
     clickhouse) run_engine clickhouse integrations::clickhouse::tests::live \
         DB_FREE_CLICKHOUSE_URL=http://127.0.0.1:58123 DB_FREE_CLICKHOUSE_USER=default DB_FREE_CLICKHOUSE_PASSWORD=dbfree ;;
     immudb) run_engine immudb integrations::immudb::tests::live \
@@ -244,6 +283,15 @@ test_service() { # test_service <service>
         DBFREE_TEST_ORACLE_URL=127.0.0.1:51521 DBFREE_TEST_ORACLE_SERVICE=FREEPDB1 \
         DBFREE_TEST_ORACLE_USER=system DBFREE_TEST_ORACLE_PASSWORD=dbfree ;;
     druid) run_engine druid integrations::druid::tests::live DBFREE_TEST_DRUID_URL=http://127.0.0.1:58888 ;;
+    spacetimedb)
+        # Publishing the module is a WASM build; wait for the seed to finish.
+        "${COMPOSE[@]}" up -d spacetimedb-seed >/dev/null 2>&1
+        for _ in $(seq 600); do
+          curl -s -f -o /dev/null --max-time 3 "http://127.0.0.1:53100/v1/database/quickstart/schema?version=9" && break
+          sleep 1
+        done
+        run_engine spacetimedb integrations::spacetimedb::tests::live \
+          DBFREE_TEST_SPACETIMEDB_URL=http://127.0.0.1:53100 DBFREE_TEST_SPACETIMEDB_DB=quickstart ;;
   esac
 }
 
@@ -286,11 +334,15 @@ for entry in "${CATEGORIES[@]}"; do
     deps=("${servers[@]}")
     for svc in "${servers[@]}"; do
       [ "$svc" = "milvus" ] && deps+=(milvus-etcd milvus-minio)
+      [ "$svc" = "druid" ] && deps+=(druid-zk druid-db druid-coordinator druid-broker druid-historical)
     done
     "${COMPOSE[@]}" up -d --no-recreate "${deps[@]}" >/dev/null 2>&1
 
     for svc in "${servers[@]}"; do
-      if ready "$svc" 300; then
+      # Druid brings up six JVMs (emulated on Apple Silicon); give it longer.
+      wait_for=300
+      [ "$svc" = "druid" ] && wait_for=900
+      if ready "$svc" "$wait_for"; then
         test_service "$svc"
       else
         note "$svc never became ready"

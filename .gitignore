@@ -10,3 +10,7 @@ src-tauri/bindings
 .agents/
 release/
 src-tauri/target-*
+
+# Artifacts from scripts/test-by-category.sh
+category-report.md
+.category-logs/

@@ -227,11 +227,119 @@ services:
       nofile: { soft: 262144, hard: 262144 }
     ports: ["58123:8123"]
 
+  # Druid has no single-container mode: a query needs ZooKeeper, a metadata
+  # store, the coordinator/overlord, a broker, a historical and the router.
+  # `standalone-realtime` was removed years ago — it made the container exit at
+  # once, which is why this engine only ever reported "never became ready".
+  # The image is published for amd64 only, so on Apple Silicon every one of
+  # these runs under emulation and the stack needs a lot of RAM.
+  druid-zk:
+    image: zookeeper:3.8
+    profiles: ["heavy"]
+  druid-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: druid
+      POSTGRES_PASSWORD: druid
+      POSTGRES_DB: druid
+    profiles: ["heavy"]
+  druid-coordinator:
+    image: apache/druid:31.0.1
+    platform: linux/amd64
+    command: ["coordinator"]
+    depends_on: [druid-zk, druid-db]
+    env_file: [druid.env]
+    profiles: ["heavy"]
+  druid-broker:
+    image: apache/druid:31.0.1
+    platform: linux/amd64
+    command: ["broker"]
+    depends_on: [druid-coordinator]
+    env_file: [druid.env]
+    profiles: ["heavy"]
+  druid-historical:
+    image: apache/druid:31.0.1
+    platform: linux/amd64
+    command: ["historical"]
+    depends_on: [druid-coordinator]
+    env_file: [druid.env]
+    profiles: ["heavy"]
   druid:
     image: apache/druid:31.0.1
-    command: ["standalone-realtime"]
+    platform: linux/amd64
+    command: ["router"]
+    depends_on: [druid-broker, druid-historical]
+    env_file: [druid.env]
     ports: ["58888:8888"]
     profiles: ["heavy"]
+
+  # SpacetimeDB serves no tables until a module is published, and a module is a
+  # Rust crate compiled to WASM — minutes of build, so this sits behind `heavy`.
+  # `spacetimedb-seed` writes a two-column module and publishes it as
+  # `quickstart`, which is what the live test reads.
+  spacetimedb:
+    image: clockworklabs/spacetime:latest
+    command: ["start", "--listen-addr", "0.0.0.0:3000"]
+    ports: ["53100:3000"]
+    profiles: ["heavy"]
+  spacetimedb-seed:
+    image: clockworklabs/spacetime:latest
+    depends_on: [spacetimedb]
+    profiles: ["heavy"]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        export PATH=/usr/local/cargo/bin:$$PATH
+        mkdir -p /tmp/mod/src
+        cat > /tmp/mod/Cargo.toml <<'TOML'
+        [package]
+        name = "mymod"
+        version = "0.1.0"
+        edition = "2021"
+        [lib]
+        crate-type = ["cdylib"]
+        [dependencies]
+        spacetimedb = "2.10"
+        TOML
+        cat > /tmp/mod/src/lib.rs <<'RS'
+        use spacetimedb::{reducer, table, ReducerContext, Table};
+        #[table(accessor = person, public)]
+        pub struct Person { #[primary_key] #[auto_inc] id: u64, name: String, age: u32 }
+        #[reducer]
+        pub fn add(ctx: &ReducerContext, name: String, age: u32) {
+            ctx.db.person().insert(Person { id: 0, name, age });
+        }
+        RS
+        until spacetime server add --url http://spacetimedb:3000 test -y 2>/dev/null; do sleep 2; done
+        rustup target add wasm32-unknown-unknown
+        spacetime publish -p /tmp/mod --server test -y quickstart
+        spacetime call --server test quickstart add ann 31 || true
+        spacetime call --server test quickstart add bob 45 || true
+
+  # ---------------------------------------------------------------- object
+  # MinIO speaks the S3 REST API, so it exercises the SigV4 signing path for
+  # real. `minio-seed` creates a bucket with a couple of keys so the listing,
+  # the prefix push-down and the object columns all have something to return.
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["59000:9000"]
+  minio-seed:
+    image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set t http://minio:9000 minioadmin minioadmin; do sleep 1; done;
+      mc mb --ignore-existing t/dbfree;
+      echo hello | mc pipe t/dbfree/logs/2026/app.log;
+      echo world | mc pipe t/dbfree/logs/2026/error.log;
+      echo other | mc pipe t/dbfree/reports/q1.csv;
+      "
 
   # ---------------------------------------------------------------- ledger
   immudb:
