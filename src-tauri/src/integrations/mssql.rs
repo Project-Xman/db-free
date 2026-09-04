@@ -186,6 +186,27 @@ impl Integration for MssqlIntegration {
 
     async fn catalog(&self) -> AppResult<SchemaCatalog> {
         let mut client = self.client.lock().await;
+        let mut schemas_map: std::collections::BTreeMap<String, Vec<TableInfo>> =
+            std::collections::BTreeMap::new();
+
+        // WHAT:  Seed the map with every user schema before adding tables.
+        // WHY:   Deriving schemas from table rows alone hides an empty schema —
+        //        `dbo` on a fresh database — so the sidebar looks broken until
+        //        the first table exists.
+        let schema_sql = "SELECT s.name FROM sys.schemas s \
+                          JOIN sys.database_principals p ON p.principal_id = s.principal_id \
+                          WHERE p.is_fixed_role = 0 AND s.name NOT IN ('sys', 'INFORMATION_SCHEMA') \
+                          ORDER BY s.name";
+        if let Ok(stream) = client.simple_query(schema_sql).await {
+            if let Ok(rows) = stream.into_first_result().await {
+                for row in rows {
+                    if let Some(ColumnData::String(Some(name))) = row.into_iter().next() {
+                        schemas_map.entry(name.to_string()).or_default();
+                    }
+                }
+            }
+        }
+
         let sql = "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
                    FROM INFORMATION_SCHEMA.TABLES \
                    WHERE TABLE_TYPE IN ('BASE TABLE', 'VIEW') \
@@ -193,8 +214,6 @@ impl Integration for MssqlIntegration {
         let stream = client.simple_query(sql).await.map_err(AppError::from)?;
         let rows = stream.into_first_result().await.map_err(AppError::from)?;
 
-        let mut schemas_map: std::collections::BTreeMap<String, Vec<TableInfo>> =
-            std::collections::BTreeMap::new();
         for row in rows {
             let mut iter = row.into_iter();
             let schema = match iter.next() {
@@ -504,6 +523,7 @@ impl Integration for MssqlIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ConnectionSummary, Environment, FilterOp, FilterRule, PageQuery, SslMode};
 
     #[test]
     fn mssql_ident_quoting() {
@@ -515,4 +535,67 @@ mod tests {
         };
         assert_eq!(qualified_name(&table), "[sales].[orders]");
     }
+
+    // WHAT:  Live round trip. Skipped unless DBFREE_TEST_MSSQL_HOST is set, e.g.
+    //        the `mssql` service in docker-compose.test.yml.
+    #[tokio::test]
+    async fn live_round_trip_when_configured() {
+        let Ok(host) = std::env::var("DBFREE_TEST_MSSQL_HOST") else {
+            return;
+        };
+        let resolved = ResolvedConnection {
+            summary: ConnectionSummary {
+                id: "t".into(),
+                name: "t".into(),
+                engine: Engine::Mssql,
+                environment: Environment::Local,
+                read_only: false,
+                host: Some(host),
+                port: std::env::var("DBFREE_TEST_MSSQL_PORT").ok().and_then(|p| p.parse().ok()),
+                database: Some(std::env::var("DBFREE_TEST_MSSQL_DB").unwrap_or_else(|_| "master".into())),
+                username: Some(std::env::var("DBFREE_TEST_MSSQL_USER").unwrap_or_else(|_| "sa".into())),
+                file_path: None,
+                ssl_mode: SslMode::Require,
+                has_secret: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+            secret: std::env::var("DBFREE_TEST_MSSQL_PASSWORD").ok(),
+        };
+        let db = connect(&resolved).await.unwrap_or_else(|e| panic!("connect: {e}"));
+        assert_eq!(db.engine(), Engine::Mssql);
+        db.ping().await.unwrap_or_else(|e| panic!("ping: {e}"));
+        let version = db.server_version().await.unwrap_or_default().unwrap_or_default();
+        assert!(!version.is_empty(), "no version reported");
+
+        let _ = db.execute("DROP TABLE IF EXISTS dbfree_smoke", 10).await;
+        db.execute("CREATE TABLE dbfree_smoke (id INT PRIMARY KEY, name NVARCHAR(50))", 10)
+            .await
+            .unwrap_or_else(|e| panic!("create: {e}"));
+        db.execute("INSERT INTO dbfree_smoke (id, name) VALUES (1, 'ada'), (2, 'alan'), (3, 'grace')", 10)
+            .await
+            .unwrap_or_else(|e| panic!("insert: {e}"));
+
+        let catalog = db.catalog().await.unwrap_or_else(|e| panic!("catalog: {e}"));
+        assert!(catalog.schemas.iter().any(|s| s.tables.iter().any(|t| t.name == "dbfree_smoke")), "{catalog:?}");
+        let table = TableRef { schema: Some("dbo".into()), name: "dbfree_smoke".into() };
+        let cols = db.columns(&table).await.unwrap_or_else(|e| panic!("columns: {e}"));
+        assert!(cols.iter().any(|c| c.name == "id" && c.primary_key), "{cols:?}");
+
+        let page = db
+            .fetch_page(&table, &PageQuery { sort: vec![], filters: vec![], offset: 0, limit: 10 })
+            .await
+            .unwrap_or_else(|e| panic!("page: {e}"));
+        assert_eq!(page.rows.len(), 3, "{page:?}");
+        let filters = vec![FilterRule { column: "name".into(), op: FilterOp::StartsWith, value: "a".into() }];
+        assert_eq!(db.count(&table, &filters).await.unwrap_or_default(), 2);
+
+        match db.execute("SELECT name FROM dbfree_smoke ORDER BY name", 10).await.unwrap_or_default().first() {
+            Some(StatementResult::Rows { result }) => assert_eq!(result.rows.len(), 3, "{result:?}"),
+            other => panic!("expected rows, got {other:?}"),
+        }
+        let _ = db.execute("DROP TABLE dbfree_smoke", 10).await;
+        db.close().await;
+    }
+
 }

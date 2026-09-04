@@ -208,6 +208,22 @@ impl Integration for PostgresIntegration {
     }
 
     async fn catalog(&self) -> AppResult<SchemaCatalog> {
+        // WHAT:  Every visible schema, then its tables and views.
+        // WHY:   Listing schemas separately means an *empty* schema still shows
+        //        in the sidebar. Deriving them from the table rows alone hid
+        //        `public` on a fresh database, so the tree looked broken until
+        //        the user created their first table.
+        let schema_rows = sqlx::query(
+            "SELECT n.nspname AS schema \
+             FROM pg_namespace n \
+             WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+               AND n.nspname NOT LIKE 'pg_temp%' AND n.nspname NOT LIKE 'pg_toast_temp%' \
+               AND has_schema_privilege(n.oid, 'USAGE') \
+             ORDER BY n.nspname",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
         let rows = sqlx::query(
             "SELECT n.nspname AS schema, c.relname AS name, c.relkind::text AS kind, \
                     c.reltuples::bigint AS estimate \
@@ -220,6 +236,10 @@ impl Integration for PostgresIntegration {
         .fetch_all(&self.pool)
         .await?;
         let mut schemas: BTreeMap<String, Vec<TableInfo>> = BTreeMap::new();
+        for row in schema_rows {
+            let schema: String = row.try_get("schema")?;
+            schemas.entry(schema).or_default();
+        }
         for row in rows {
             let schema: String = row.try_get("schema")?;
             let name: String = row.try_get("name")?;

@@ -1,0 +1,277 @@
+# SOT: test-database-stack, docker-compose-engines
+#
+# WHAT:  One container per database engine DB Free ships an adapter for, so the
+#        live round-trip tests can run against real servers instead of mocks.
+# WHY:   Unit tests prove request/response shaping; only a real server proves an
+#        adapter connects, lists, pages and queries. Every bug found so far
+#        (immudb's ports, InfluxDB's CSV dialect, Cassandra's broadcast address,
+#        HBase's Accept headers) was invisible until something real answered.
+# HOW:   ./scripts/test-all-dbs.sh              # start, wait, test, report
+#        docker compose -f docker-compose.test.yml up -d <service>
+# WHERE: scripts/test-all-dbs.sh (runner), scripts/live-tests.sh (single engine)
+#
+# Host ports are all in the 5xxxx range so nothing collides with a database you
+# already run locally. Everything is throwaway: no volumes, `down` wipes it.
+#
+# There are deliberately no healthchecks: the images disagree about what is
+# installed (typesense has no curl, immudb has no shell) and in-container probes
+# time out when 30 engines share a laptop. scripts/test-all-dbs.sh waits on the
+# published port from the host instead, which works the same for every image.
+
+name: dbfree-test
+
+services:
+  # ---------------------------------------------------------------- relational
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: dbfree
+      POSTGRES_DB: dbfree
+    ports: ["55432:5432"]
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: dbfree
+      MYSQL_DATABASE: dbfree
+    ports: ["53306:3306"]
+
+  mariadb:
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: dbfree
+      MARIADB_DATABASE: dbfree
+    ports: ["53307:3306"]
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "DbFree!Passw0rd"
+      MSSQL_PID: Developer
+    ports: ["51433:1433"]
+
+  # ---------------------------------------------------------------- document
+  mongodb:
+    image: mongo:7
+    ports: ["57017:27017"]
+
+  couchdb:
+    image: couchdb:3
+    environment:
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: dbfree
+    ports: ["55984:5984"]
+
+  # ---------------------------------------------------------------- key-value
+  redis:
+    image: redis:7-alpine
+    ports: ["56379:6379"]
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    ports: ["56380:6379"]
+
+  memcached:
+    image: memcached:alpine
+    ports: ["51211:11211"]
+
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports: ["58000:8000"]
+
+  # ---------------------------------------------------------------- wide-column
+  cassandra:
+    image: cassandra:5
+    environment:
+      CASSANDRA_NUM_TOKENS: "1"
+      HEAP_NEWSIZE: 128M
+      MAX_HEAP_SIZE: 1024M
+    ports: ["59042:9042"]
+
+  hbase:
+    image: harisekhon/hbase:latest
+    ports: ["58080:8080", "58085:8085"]
+
+  # ---------------------------------------------------------------- graph
+  neo4j:
+    image: neo4j:5
+    environment:
+      NEO4J_AUTH: neo4j/dbfreepass
+      NEO4J_server_memory_heap_max__size: 512M
+    ports: ["57474:7474", "57687:7687"]
+
+  # ---------------------------------------------------------------- time-series
+  influxdb:
+    image: influxdb:2
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: dbfreepass
+      DOCKER_INFLUXDB_INIT_ORG: dbfree
+      DOCKER_INFLUXDB_INIT_BUCKET: metrics
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: dbfreetoken
+    ports: ["58086:8086"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports: ["59090:9090"]
+
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:latest
+    command: ["-selfScrapeInterval=5s"]
+    ports: ["58428:8428"]
+
+  # ---------------------------------------------------------------- vector
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports: ["56333:6333"]
+
+  chroma:
+    image: chromadb/chroma:latest
+    ports: ["58001:8000"]
+
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.28.2
+    environment:
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: /tmp/weaviate
+      DEFAULT_VECTORIZER_MODULE: none
+      CLUSTER_HOSTNAME: node1
+    ports: ["58081:8080"]
+
+  # Milvus needs etcd + object storage; `milvus-standalone` bundles them.
+  milvus-etcd:
+    image: quay.io/coreos/etcd:v3.5.16
+    command:
+      ["etcd", "-advertise-client-urls=http://127.0.0.1:2379", "-listen-client-urls=http://0.0.0.0:2379",
+       "--data-dir=/etcd"]
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+
+  milvus-minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    command: minio server /minio_data --console-address ":9001"
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+
+  milvus:
+    image: milvusdb/milvus:v2.5.4
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    ports: ["59530:19530", "59091:9091"]
+    depends_on: [milvus-etcd, milvus-minio]
+
+  # ---------------------------------------------------------------- search
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports: ["59200:9200"]
+
+  opensearch:
+    image: opensearchproject/opensearch:2
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports: ["59201:9200"]
+
+  meilisearch:
+    image: getmeili/meilisearch:latest
+    environment:
+      MEILI_MASTER_KEY: dbfreekey
+      MEILI_ENV: development
+    ports: ["57700:7700"]
+
+  typesense:
+    image: typesense/typesense:27.1
+    command: ["--data-dir", "/tmp", "--api-key=dbfreekey", "--enable-cors"]
+    ports: ["58108:8108"]
+
+  # ---------------------------------------------------------------- multi-model
+  arangodb:
+    image: arangodb:3.12
+    environment:
+      ARANGO_ROOT_PASSWORD: dbfree
+    ports: ["58529:8529"]
+
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    command: ["start", "--user", "root", "--pass", "dbfree", "--bind", "0.0.0.0:8000"]
+    ports: ["58002:8000"]
+
+  orientdb:
+    image: orientdb:latest
+    environment:
+      ORIENTDB_ROOT_PASSWORD: dbfree
+    ports: ["52480:2480"]
+
+  # ---------------------------------------------------------------- OLAP
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: dbfree
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    ports: ["58123:8123"]
+
+  druid:
+    image: apache/druid:31.0.1
+    command: ["standalone-realtime"]
+    ports: ["58888:8888"]
+    profiles: ["heavy"]
+
+  # ---------------------------------------------------------------- ledger
+  immudb:
+    image: codenotary/immudb:latest
+    ports: ["53322:3322", "58082:8080"]
+
+  # ---------------------------------------------------------------- streaming
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://127.0.0.1:59092
+    ports: ["59092:9092"]
+
+  # ---------------------------------------------------------------- XML
+  existdb:
+    image: existdb/existdb:latest
+    ports: ["58083:8080"]
+
+  # ---------------------------------------------------------------- RDF
+  fuseki:
+    image: stain/jena-fuseki:latest
+    environment:
+      ADMIN_PASSWORD: dbfree
+      FUSEKI_DATASET_1: ds
+    ports: ["53030:3030"]
+
+  # ---------------------------------------------------------------- relational (heavy)
+  # Oracle is ~2 GB and slow to initialise; opt in with `--profile heavy`.
+  oracle:
+    image: gvenzl/oracle-free:slim
+    environment:
+      ORACLE_PASSWORD: dbfree
+    ports: ["51521:1521"]
+    profiles: ["heavy"]

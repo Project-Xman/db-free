@@ -95,6 +95,31 @@ fn is_blob_type(type_name: &str) -> bool {
     matches!(type_name, "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BIT" | "GEOMETRY")
 }
 
+// WHAT:  True when a column the driver calls binary may really hold JSON text.
+// WHY:   MariaDB has no distinct JSON type: `JSON` is an alias for LONGTEXT
+//        with a CHECK constraint, and sqlx surfaces that column as BLOB. Without
+//        this, a MariaDB JSON column renders as an opaque base64 blob instead of
+//        a browsable document. MySQL reports JSON properly and is unaffected.
+fn may_hold_json(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" | "VARCHAR" | "CHAR" | "BLOB" | "LONGBLOB" | "MEDIUMBLOB" | "TINYBLOB"
+    )
+}
+
+// WHAT:  Promotes a text payload that is a JSON object or array to Value::Json.
+// WHY:   So MariaDB JSON columns get the same tree inspector as MySQL's.
+fn promote_json(text: &str) -> Option<Value> {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        return None;
+    }
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(json) if json.is_object() || json.is_array() => Some(Value::Json(json)),
+        _ => None,
+    }
+}
+
 fn is_binary_flagged_string(type_name: &str) -> bool {
     matches!(type_name, "BINARY" | "VARBINARY")
 }
@@ -135,7 +160,18 @@ fn decode_cell(row: &MySqlRow, index: usize) -> Value {
     let type_name = raw.type_info().name().to_ascii_uppercase();
     if is_blob_type(&type_name) {
         return match <Vec<u8> as Decode<'_, MySql>>::decode(raw) {
-            Ok(bytes) => Value::Bytes(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            Ok(bytes) => {
+                // A MariaDB JSON column arrives here as BLOB; promote it when the
+                // payload really is a JSON document, otherwise keep it binary.
+                if may_hold_json(&type_name) {
+                    if let Ok(text) = std::str::from_utf8(&bytes) {
+                        if let Some(json) = promote_json(text) {
+                            return json;
+                        }
+                    }
+                }
+                Value::Bytes(base64::engine::general_purpose::STANDARD.encode(bytes))
+            }
             Err(_) => Value::Unsupported(format!("<{}>", type_name.to_ascii_lowercase())),
         };
     }
@@ -149,7 +185,14 @@ fn decode_cell(row: &MySqlRow, index: usize) -> Value {
         };
     }
     match <String as Decode<'_, MySql>>::decode(raw) {
-        Ok(text) => text_to_value(&type_name, &text),
+        Ok(text) => {
+            if may_hold_json(&type_name) {
+                if let Some(json) = promote_json(&text) {
+                    return json;
+                }
+            }
+            text_to_value(&type_name, &text)
+        }
         Err(_) => match row.try_get_raw(index) {
             // Non-UTF-8 payload in a text column: keep it as bytes rather than fail the row.
             Ok(raw) => <Vec<u8> as Decode<'_, MySql>>::decode(raw)
@@ -173,7 +216,14 @@ fn decode_meta_cell(row: &MySqlRow, index: usize) -> Value {
     }
     let type_name = raw.type_info().name().to_ascii_uppercase();
     match <String as Decode<'_, MySql>>::decode(raw) {
-        Ok(text) => text_to_value(&type_name, &text),
+        Ok(text) => {
+            if may_hold_json(&type_name) {
+                if let Some(json) = promote_json(&text) {
+                    return json;
+                }
+            }
+            text_to_value(&type_name, &text)
+        }
         Err(_) => Value::Unsupported(format!("<{}>", type_name.to_ascii_lowercase())),
     }
 }
@@ -567,4 +617,5 @@ mod tests {
         my.execute("DROP TABLE dbfree_t", 10).await.unwrap_or_else(|e| panic!("drop: {e}"));
         my.close().await;
     }
+
 }
