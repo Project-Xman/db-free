@@ -1,5 +1,7 @@
 # SOT: cargo-env, libclang-path
-# librocksdb-sys runs bindgen at build time and needs libclang. Xcode's toolchain
-# ships it; CommandLineTools too. CI sets LIBCLANG_PATH explicitly (see release.yml).
-[env]
-LIBCLANG_PATH = { value = "/Library/Developer/CommandLineTools/usr/lib", force = false }
+# librocksdb-sys runs bindgen at build time and needs libclang. Do NOT pin
+# LIBCLANG_PATH here: a `[env]` entry applies on every host, so a macOS path
+# (CommandLineTools / Xcode) short-circuits clang-sys' search on Linux and
+# Windows and the build script then panics with "Unable to find libclang".
+# clang-sys already probes the Xcode and CommandLineTools lib dirs on macOS and
+# /usr/lib*/**  on Linux; CI exports LIBCLANG_PATH per platform (release.yml).
