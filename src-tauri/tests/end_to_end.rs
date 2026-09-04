@@ -1,5 +1,10 @@
 // SOT: end-to-end-engine-tests, full-stack-connection-flow
 
+// An integration test *is* the place to panic: a failed assertion is the
+// result. The crate-wide clippy denies apply here because tests/ is its own
+// crate rather than a `#[cfg(test)]` module.
+#![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+
 //! End-to-end tests that drive an engine the way the app does: store a
 //! connection, resolve it, connect through `integrations::connect`, then go
 //! through the guard and the services the `#[tauri::command]`s call.

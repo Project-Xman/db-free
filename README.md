@@ -56,6 +56,30 @@ pnpm tauri build            # host platform: .dmg (macOS), .msi/.exe (Windows), 
 
 Pushing to `main` builds installers for all three platforms (macOS universal, Windows, Linux) and uploads them as workflow artifacts. Tagging `v*` attaches them to a draft GitHub release.
 
+## Testing engines
+
+`pnpm check` runs the guardrail, tsc, eslint, clippy and every unit + end-to-end
+test. Adapter unit tests cover request/response shaping; the end-to-end suite
+drives the real command path (connect → catalog → paged browse → filter → query,
+plus the read-only lock and destructive confirmation) on the file engines.
+
+Adapters also carry live round-trip tests gated on an environment variable, so
+they are skipped unless a server is configured:
+
+```
+./scripts/live-tests.sh                 # every engine with a container image
+./scripts/live-tests.sh qdrant neo4j    # just these
+```
+
+Each engine gets a throwaway container on a high port (5xxxx, so nothing
+collides with your own stack) and is removed afterwards. Verified live so far:
+memcached, meilisearch, typesense, qdrant, chroma, weaviate, elasticsearch,
+couchdb, arangodb, surrealdb, orientdb, neo4j, cassandra, kafka/redpanda,
+influxdb, prometheus, immudb, hbase, existdb, dynamodb (local), SPARQL (Fuseki),
+duckdb, rocksdb, postgres, mysql, sqlite. Cloud-only engines (Snowflake,
+BigQuery, Firestore, QLDB, Pinecone, Oracle) are unit-tested and carry live
+tests that activate when you set their `DBFREE_TEST_*` variables.
+
 ## Quality gate
 
 ```sh
