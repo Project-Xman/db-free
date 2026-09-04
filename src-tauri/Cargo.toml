@@ -38,6 +38,10 @@ tiberius = { version = "0.12", default-features = false, features = ["rustls", "
 scylla = { version = "1", features = ["rustls-023", "chrono-04"] }
 neo4rs = "0.8"
 rskafka = { version = "0.6", features = ["transport-tls"] }
+# TLS client configs for the scylla / rskafka transports (both take an Arc<rustls::ClientConfig>).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+webpki-roots = "1"
 duckdb = { version = "1.4", features = ["bundled"] }
 rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime", "lz4", "zstd", "snappy"] }
 oracle = "0.6"

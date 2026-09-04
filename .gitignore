@@ -9,3 +9,4 @@ src-tauri/bindings
 .heroui-docs/
 .agents/
 release/
+src-tauri/target-*

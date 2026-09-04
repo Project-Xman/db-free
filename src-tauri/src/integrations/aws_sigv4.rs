@@ -78,16 +78,18 @@ pub struct SignedHeaders {
 // WHAT:  Signs a POST with a JSON body for `service` (e.g. "dynamodb", "qldb-session").
 //        Returns every header the request must carry (host, x-amz-date, x-amz-target,
 //        content-type, x-amz-security-token, authorization).
-pub fn sign_post(
-    creds: &AwsCredentials,
-    service: &str,
-    host: &str,
-    path: &str,
-    amz_target: Option<&str>,
-    content_type: &str,
-    body: &[u8],
-    now: chrono::DateTime<chrono::Utc>,
-) -> AppResult<SignedHeaders> {
+pub struct SignRequest<'a> {
+    pub service: &'a str,
+    pub host: &'a str,
+    pub path: &'a str,
+    pub amz_target: Option<&'a str>,
+    pub content_type: &'a str,
+    pub body: &'a [u8],
+    pub now: chrono::DateTime<chrono::Utc>,
+}
+
+pub fn sign_post(creds: &AwsCredentials, req: &SignRequest<'_>) -> AppResult<SignedHeaders> {
+    let SignRequest { service, host, path, amz_target, content_type, body, now } = *req;
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
     let date_stamp = now.format("%Y%m%d").to_string();
     let payload_hash = sha256_hex(body);
@@ -147,7 +149,18 @@ mod tests {
         let k_signing = hmac(&k_service, b"aws4_request").unwrap_or_default();
         assert_eq!(hex::encode(k_signing), "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9");
         let now = chrono::DateTime::parse_from_rfc3339("2015-08-30T12:36:00Z").map(|d| d.with_timezone(&chrono::Utc));
-        let signed = sign_post(&creds, "dynamodb", "dynamodb.us-east-1.amazonaws.com", "/", Some("DynamoDB_20120810.ListTables"), "application/x-amz-json-1.0", b"{}", now.unwrap_or_default());
+        let signed = sign_post(
+            &creds,
+            &SignRequest {
+                service: "dynamodb",
+                host: "dynamodb.us-east-1.amazonaws.com",
+                path: "/",
+                amz_target: Some("DynamoDB_20120810.ListTables"),
+                content_type: "application/x-amz-json-1.0",
+                body: b"{}",
+                now: now.unwrap_or_default(),
+            },
+        );
         let signed = signed.unwrap_or(SignedHeaders { headers: vec![] });
         let auth = signed.headers.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.clone()).unwrap_or_default();
         assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/dynamodb/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-target, Signature="));
