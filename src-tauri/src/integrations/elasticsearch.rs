@@ -474,8 +474,14 @@ impl ElasticsearchIntegration {
         resp.text().await.map_err(|e| AppError::driver(e.to_string()))
     }
 
+    // WHAT:  Runs SQL through whichever SQL endpoint the server provides.
+    // WHY:   The two disagree about `format`. Elasticsearch needs
+    //        `?format=json` to return `{columns, rows}`. OpenSearch treats
+    //        `format=json` as "give me raw DSL hits" and only its default
+    //        (jdbc) shape carries `{schema, datarows}` — asking for json there
+    //        silently returned one opaque row instead of the result table.
     async fn run_sql(&self, sql: &str, max_rows: usize) -> AppResult<ResultSet> {
-        let path = if self.is_opensearch() { "/_plugins/_sql?format=json" } else { "/_sql?format=json" };
+        let path = if self.is_opensearch() { "/_plugins/_sql" } else { "/_sql?format=json" };
         let body = if self.is_opensearch() { json!({"query": sql}) } else { json!({"query": sql, "fetch_size": max_rows.min(10_000)}) };
         let out: Json = self.http.post_json(path, &body).await?;
         Ok(sql_result(&out, max_rows))
@@ -521,6 +527,19 @@ fn encode_path(segment: &str) -> String {
     segment.replace('/', "%2F").replace(' ', "%20")
 }
 
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities { sql: false, namespaces: false, fixed_columns: false, paging: true, row_estimate: true, views: true, transactions: false, exact_estimate: true },
+        object_kinds: vec![K::Index, K::Alias, K::Template, K::Pipeline, K::Policy, K::Node, K::Shard, K::Task, K::Snapshot, K::User, K::Role],
+        tools: vec![T::Stats, T::SearchPlayground],
+    }
+}
+
 #[async_trait]
 impl Integration for ElasticsearchIntegration {
     fn engine(&self) -> Engine {
@@ -528,7 +547,7 @@ impl Integration for ElasticsearchIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { sql: false, namespaces: false, fixed_columns: false, paging: true, row_estimate: true, views: true, transactions: false, exact_estimate: true }
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {

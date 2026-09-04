@@ -12,6 +12,7 @@ use crate::model::{
 use async_trait::async_trait;
 use base64::Engine as _;
 use scylla::client::session::{Session, TlsContext};
+use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::errors::TranslationError;
 use scylla::policies::address_translator::{AddressTranslator, UntranslatedPeer};
@@ -45,6 +46,12 @@ use std::time::Duration;
 
 const MAX_SCAN_ROWS: u64 = 5_000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+// WHAT:  Per-request ceiling, above the driver's 30 s default.
+// WHY:   Schema changes (CREATE/DROP KEYSPACE) wait for agreement across the
+//        cluster and routinely pass 30 s on a busy or single-node instance,
+//        which surfaced as a spurious "client timeout" on a statement that in
+//        fact succeeded. The guard still applies its own timeout on top.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const SYSTEM_KEYSPACES: &[&str] = &[
     "system",
     "system_auth",
@@ -202,7 +209,11 @@ async fn first_contact_addr(nodes: &[String]) -> Option<SocketAddr> {
 pub async fn connect(conn: &ResolvedConnection) -> AppResult<Arc<dyn Integration>> {
     let s = &conn.summary;
     let nodes = known_nodes(s.host.as_deref(), s.port);
-    let mut builder = SessionBuilder::new().known_nodes(nodes.clone()).connection_timeout(CONNECT_TIMEOUT);
+    let profile = ExecutionProfile::builder().request_timeout(Some(REQUEST_TIMEOUT)).build();
+    let mut builder = SessionBuilder::new()
+        .known_nodes(nodes.clone())
+        .connection_timeout(CONNECT_TIMEOUT)
+        .default_execution_profile_handle(profile.into_handle());
     // Single contact point = a local / port-forwarded node whose broadcast
     // address is very likely unreachable; route peers back through it.
     if nodes.len() == 1 {
@@ -748,6 +759,19 @@ impl CassandraIntegration {
     }
 }
 
+// WHAT:  What this family offers the object explorer and the tool tabs.
+// WHY:   Declared here, next to the adapter that must answer `objects()` for
+//        every kind listed; rendered by the capability matrix for every engine.
+// WHERE: src-tauri/src/integrations/mod.rs (FamilyProfile), src/lib/objects.ts
+pub fn profile() -> crate::integrations::FamilyProfile {
+    use crate::model::{ObjectKind as K, Tool as T};
+    crate::integrations::FamilyProfile {
+        capabilities: Capabilities { transactions: false, ..Capabilities::SQL },
+        object_kinds: vec![K::Keyspace, K::Table, K::MaterializedView, K::Index, K::Type, K::Function, K::Aggregate, K::Role, K::Grant, K::Node, K::Setting],
+        tools: vec![T::Stats, T::Erd],
+    }
+}
+
 #[async_trait]
 impl Integration for CassandraIntegration {
     fn engine(&self) -> Engine {
@@ -755,7 +779,7 @@ impl Integration for CassandraIntegration {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { transactions: false, ..Capabilities::SQL }
+        profile().capabilities
     }
 
     async fn ping(&self) -> AppResult<()> {
