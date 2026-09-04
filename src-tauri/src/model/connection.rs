@@ -685,6 +685,29 @@ impl Engine {
     }
 }
 
+// WHAT:  The facts about an engine that Rust owns, exported so the UI registry
+//        can be checked against them instead of restating them by hand.
+// WHY:   `src/lib/engines.ts` carries labels, hints and field names the Rust
+//        core has no opinion on, but `kind`, `form` and `defaultPort` are
+//        decided here. Exporting them makes a disagreement a TypeScript error
+//        rather than a wrong port in a connection dialog.
+// HOW:   `pnpm bindings` writes EngineFacts.ts; engines.ts does
+//        `satisfies Record<Engine, EngineMeta & EngineFacts[…]>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct EngineFacts {
+    pub kind: EngineKind,
+    pub form: FormKind,
+    pub default_port: Option<u16>,
+}
+
+impl Engine {
+    pub fn facts(self) -> EngineFacts {
+        EngineFacts { kind: self.kind(), form: self.form(), default_port: self.default_port() }
+    }
+}
+
 // WHAT:  Deployment environment badge. Production defaults to read-only.
 // WHERE: src/lib/environments.ts (colour tokens per variant)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]

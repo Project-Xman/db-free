@@ -11,6 +11,7 @@ Checks what clippy / tsc / eslint cannot express cheaply:
   type-safety     no any / unknown (outside ipc.ts) / ts-ignore in the UI
   design-tokens   no hardcoded palette classes or hex colours in className
   open-gap        @guardrail-gap markers still present
+  engine-facts    src/lib/engines.ts agrees with Rust on kind / form / defaultPort
 
     python3 scripts/guardrail.py            # scan src/ and src-tauri/src
     python3 scripts/guardrail.py --changed-only a.rs b.tsx
@@ -21,6 +22,7 @@ Exit 0 = clean. Exit 1 = violations. Exit 2 = bad usage.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -224,6 +226,71 @@ def check_file(path: Path, text: str) -> list[Finding]:
     return findings
 
 
+
+
+# WHAT:  The UI engine registry must agree with the Rust core on every field
+#        Rust owns: the picker category, the connection-form kind and the
+#        default port.
+# WHY:   `src/lib/engines.ts` restates them for the UI. A disagreement means a
+#        connection dialog with the wrong fields or a wrong prefilled port —
+#        silent, and only visible when a user tries to connect. The values are
+#        generated from `Engine::facts()` into EngineFacts.gen.ts by
+#        `pnpm bindings`; this compares the two.
+def check_engine_facts() -> list[Finding]:
+    facts_path = TS_SRC / "lib" / "bindings" / "EngineFacts.gen.ts"
+    engines_path = TS_SRC / "lib" / "engines.ts"
+    if not facts_path.exists() or not engines_path.exists():
+        return []
+    facts_text = facts_path.read_text(encoding="utf-8")
+    engines_text = engines_path.read_text(encoding="utf-8")
+
+    rust: dict[str, dict[str, object]] = {}
+    for name, body in re.findall(r"^  (\w+): (\{.*\}),$", facts_text, flags=re.M):
+        try:
+            rust[name] = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+
+    try:
+        start = engines_text.index("export const ENGINES = {")
+        end = engines_text.index("} satisfies Record<Engine, EngineMeta>")
+    except ValueError:
+        return []
+    body = engines_text[start:end]
+
+    findings: list[Finding] = []
+    for name, facts in sorted(rust.items()):
+        match = re.search(rf"^  {re.escape(name)}: (\w+)\((.*)\),$", body, flags=re.M)
+        if not match:
+            findings.append(Finding(engines_path, 1, "engine-facts",
+                f"`{name}` is in Engine::ALL but missing from ENGINES in src/lib/engines.ts."))
+            continue
+        helper, entry = match.group(1), match.group(2)
+        line = line_of(engines_text, start + match.start())
+
+        kind = re.search(r'kind: "([a-z_]+)"', entry)
+        if kind and kind.group(1) != facts["kind"]:
+            findings.append(Finding(engines_path, line, "engine-facts",
+                f"`{name}` kind is \"{kind.group(1)}\" but Engine::kind() says \"{facts['kind']}\". Run `pnpm bindings` and fix one side."))
+
+        form = re.search(r'form: "([a-z_]+)"', entry)
+        form_value = form.group(1) if form else {"server": "server", "http": "http_token", "file": "file"}.get(helper)
+        if form_value is not None and form_value != facts["form"]:
+            findings.append(Finding(engines_path, line, "engine-facts",
+                f"`{name}` form is \"{form_value}\" but Engine::form() says \"{facts['form']}\"."))
+
+        port = re.search(r"defaultPort: (null|\d+)", entry)
+        port_value = None
+        if port:
+            port_value = None if port.group(1) == "null" else int(port.group(1))
+        elif helper in {"http", "file"}:
+            port_value = None
+        if port and port_value != facts["defaultPort"]:
+            findings.append(Finding(engines_path, line, "engine-facts",
+                f"`{name}` defaultPort is {port_value} but Engine::default_port() says {facts['defaultPort']}."))
+    return findings
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--changed-only", nargs="*", default=None, metavar="FILE")
@@ -243,6 +310,10 @@ def main() -> int:
         except UnicodeDecodeError:
             continue
         findings.extend(check_file(path, text))
+
+    # Cross-file rule: only meaningful on a full scan.
+    if args.changed_only is None:
+        findings.extend(check_engine_facts())
 
     # Deliberate gaps are reported every run but never fail the build: the
     # marker exists so deferred work announces itself, not to block shipping.

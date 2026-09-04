@@ -3,6 +3,11 @@ import type { ConnectionInput, Engine, EngineKind, FormKind, SslMode } from "./b
 import type { IconName } from "./icons";
 
 // WHAT:  UI metadata per engine, keyed by the Rust `Engine` enum.
+//
+// `kind`, `form` and `defaultPort` are decided by Rust (`Engine::facts()`), so
+// this object is checked against the generated `ENGINE_FACTS`: change a port or
+// a category on one side only and `tsc` fails here rather than the app opening
+// a connection dialog with the wrong fields.
 // WHY:   Adding an engine in Rust makes this object fail `satisfies` until the
 //        entry exists — the registry pattern, not a hand-written list.
 //        `kind` and `form` mirror `Engine::kind()` / `Engine::form()` in Rust so
@@ -43,32 +48,38 @@ export interface FieldLabels {
 
 const SQL = "SQL";
 
-const server = (o: Partial<EngineMeta> & Pick<EngineMeta, "label" | "kind" | "hint" | "schemes">): EngineMeta => ({
-  form: "server",
+// WHAT:  Per-form-kind defaults, so each entry only states what is unusual.
+// WHY:   Generic in `T` (not `=> EngineMeta`) so the literal `kind` / `form` /
+//        `defaultPort` survive into the object and can be checked against the
+//        Rust-generated ENGINE_FACTS below.
+type Base = Partial<EngineMeta> & Pick<EngineMeta, "label" | "kind" | "hint" | "schemes">;
+
+const server = <T extends Base>(o: T) => ({
+  form: "server" as const,
   defaultPort: null,
   defaultDatabase: "",
   defaultUser: "",
-  icon: "database",
+  icon: "database" as const,
   commandLanguage: SQL,
   ...o,
 });
-const http = (o: Partial<EngineMeta> & Pick<EngineMeta, "label" | "kind" | "hint" | "schemes">): EngineMeta => ({
-  form: "http_token",
+const http = <T extends Base>(o: T) => ({
+  form: "http_token" as const,
   defaultPort: null,
   defaultDatabase: "",
   defaultUser: "",
-  icon: "database",
+  icon: "database" as const,
   commandLanguage: "Query",
   fields: { host: "Server URL", password: "API key / token" },
   ...o,
 });
-const meta = (o: EngineMeta): EngineMeta => o;
-const file = (o: Partial<EngineMeta> & Pick<EngineMeta, "label" | "kind" | "hint" | "schemes">): EngineMeta => ({
-  form: "file",
+const meta = <T extends EngineMeta>(o: T) => o;
+const file = <T extends Base>(o: T) => ({
+  form: "file" as const,
   defaultPort: null,
   defaultDatabase: "",
   defaultUser: "",
-  icon: "file",
+  icon: "file" as const,
   commandLanguage: SQL,
   ...o,
 });
@@ -211,18 +222,33 @@ export const CATEGORIES: readonly { kind: EngineKind; label: string; blurb: stri
 ];
 
 // WHAT:  Object.keys with the key union kept (the object is `satisfies Record<Engine, …>`).
+// WHAT:  The widened view every consumer reads.
+// WHY:   `ENGINES` deliberately keeps literal `kind` / `form` / `defaultPort`
+//        types so it can be checked against the Rust-generated ENGINE_FACTS.
+//        Switches and lookups want the full unions, not one engine's literal.
+const REGISTRY: Record<Engine, EngineMeta> = ENGINES;
+
+// WHAT:  The Rust core owns `kind`, `form` and `defaultPort`; the entries above
+//        restate them for the picker and the connection form.
+// WHY:   A disagreement is silent — a dialog with the wrong fields, or a wrong
+//        prefilled port, noticed only when a user tries to connect.
+// HOW:   `pnpm bindings` generates EngineFacts.gen.ts from `Engine::facts()`,
+//        and the `engine-facts` rule in scripts/guardrail.py (part of
+//        `pnpm check`) fails the build if any engine drifts. The helper spreads
+//        widen literal types, so this is checked there rather than by `tsc`.
+
 function engineKeys(): Engine[] {
-  return Object.keys(ENGINES).filter((k): k is Engine => k in ENGINES);
+  return Object.keys(REGISTRY).filter((k): k is Engine => k in REGISTRY);
 }
 
 export const ENGINE_ORDER: Engine[] = engineKeys();
 
 export function engineMeta(engine: Engine): EngineMeta {
-  return ENGINES[engine];
+  return REGISTRY[engine];
 }
 
 export function enginesOfKind(kind: EngineKind): Engine[] {
-  return ENGINE_ORDER.filter((e) => ENGINES[e].kind === kind);
+  return ENGINE_ORDER.filter((e) => REGISTRY[e].kind === kind);
 }
 
 // WHAT:  Engines whose "tables" are keys with a per-key inspector (KeyTab) rather than a grid.
@@ -233,7 +259,7 @@ export function isKeyValueEngine(engine: Engine): boolean {
 // WHAT:  What the sidebar calls the things in the catalogue.
 export function collectionNoun(engine: Engine): string {
   if (isKeyValueEngine(engine)) return "Keys";
-  switch (ENGINES[engine].kind) {
+  switch (REGISTRY[engine].kind) {
     case "document":
     case "multi_model":
     case "vector":
@@ -258,7 +284,7 @@ export function collectionNoun(engine: Engine): string {
 
 // WHAT:  ER diagrams need foreign keys, which only relational-style engines expose.
 export function supportsErd(engine: Engine): boolean {
-  return ENGINES[engine].commandLanguage === "SQL" || ENGINES[engine].commandLanguage === "CQL";
+  return REGISTRY[engine].commandLanguage === "SQL" || REGISTRY[engine].commandLanguage === "CQL";
 }
 
 export function categoryLabel(kind: EngineKind): string {
@@ -275,7 +301,7 @@ const DEFAULT_FIELD_LABELS: FieldLabels = {
 };
 
 export function fieldLabels(engine: Engine): FieldLabels {
-  return { ...DEFAULT_FIELD_LABELS, ...(ENGINES[engine].fields ?? {}) };
+  return { ...DEFAULT_FIELD_LABELS, ...(REGISTRY[engine].fields ?? {}) };
 }
 
 // WHAT:  Hosted services that are one of the engines above with fixed settings.
@@ -317,9 +343,9 @@ export function parseConnectionString(raw: string): ConnectionInput | null {
   const text = raw.trim();
   if (text.length === 0) return null;
   const scheme = text.split("://")[0]?.toLowerCase() ?? "";
-  const engine = ENGINE_ORDER.find((e) => ENGINES[e].schemes.includes(scheme));
+  const engine = ENGINE_ORDER.find((e) => REGISTRY[e].schemes.includes(scheme));
   if (!engine) return null;
-  const meta = ENGINES[engine];
+  const meta = REGISTRY[engine];
   if (meta.form === "file") {
     const path = text.replace(/^[a-z_]+:\/\//i, "");
     return { ...blankInput(engine), name: path.split("/").pop() ?? meta.label, filePath: path };

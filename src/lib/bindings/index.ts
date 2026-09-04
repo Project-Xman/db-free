@@ -33,6 +33,7 @@ export type * from "./DocumentBody";
 export type * from "./DocumentKind";
 export type * from "./EditorBuffer";
 export type * from "./Engine";
+export type * from "./EngineFacts";
 export type * from "./EngineKind";
 export type * from "./Environment";
 export type * from "./ExecuteQueryRequest";
