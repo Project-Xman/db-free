@@ -10,11 +10,15 @@ import {
   ArrowLeft01Icon,
   ArrowLeft02Icon,
   ArrowRight01Icon,
+  ArrowShrink01Icon,
   ArrowUp02Icon,
+  ArrowExpand01Icon,
   BinaryCodeIcon,
   Calendar03Icon,
   Cancel01Icon,
+  Clock01Icon,
   ComputerTerminal01Icon,
+  Copy01Icon,
   DatabaseIcon,
   Delete02Icon,
   Download04Icon,
@@ -91,7 +95,11 @@ export type IconName =
   | "file"
   | "folder"
   | "link"
-  | "info";
+  | "info"
+  | "clock"
+  | "copy"
+  | "expand"
+  | "collapse";
 
 // WHAT:  App icon vocabulary → Hugeicons (stroke-rounded, free set). Call sites
 //        stay `<Icon name="table" />`; swap a glyph here, not in features.
@@ -138,6 +146,10 @@ const GLYPHS: Record<IconName, IconSvgElement> = {
   folder: Folder01Icon,
   link: Link04Icon,
   info: InformationCircleIcon,
+  clock: Clock01Icon,
+  copy: Copy01Icon,
+  expand: ArrowExpand01Icon,
+  collapse: ArrowShrink01Icon,
 };
 
 interface IconProps extends Omit<SVGProps<SVGSVGElement>, "name" | "strokeWidth"> {

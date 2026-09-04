@@ -1,20 +1,26 @@
-// SOT: form-fields, text-field, select-field, toggle-field, segmented-control, checkbox-field
+// SOT: form-fields, text-field, select-field, toggle-field, segmented-control, checkbox-field, datetime-field, number-input
 import type { ReactNode } from "react";
 import {
   Button,
+  Calendar,
   Checkbox as HeroCheckbox,
+  DateField,
+  DatePicker,
   Description,
   Input,
   InputGroup,
   Label,
   ListBox,
+  NumberField,
   Select,
   Switch,
   Tabs,
   TextField,
+  TimeField,
 } from "@heroui/react";
 import { cn } from "@/lib/cn";
 import { Icon, type IconName } from "@/lib/icons";
+import { formatDbDate, formatDbTime, parseDbDate, parseDbTime, type TemporalKind } from "@/lib/datetime";
 
 // WHAT:  Thin typed wrappers over HeroUI form controls.
 // WHY:   HeroUI selection APIs speak `Key`; features want their own string unions.
@@ -210,5 +216,138 @@ export function Segmented<T extends string>({ value, options, onChange, label, c
         </Tabs.List>
       </Tabs.ListContainer>
     </Tabs>
+  );
+}
+
+interface DateTimeFieldProps {
+  /// date → calendar + day segments; time → clock segments; datetime → both.
+  kind: TemporalKind;
+  /// DB text (`YYYY-MM-DD`, `HH:MM:SS`, `YYYY-MM-DD HH:MM:SS[.f][+00]`); "" = empty.
+  value: string;
+  onChange: (text: string) => void;
+  label?: string | undefined;
+  ariaLabel?: string | undefined;
+  /// Fits a grid row: no label, cell-height group, tighter padding.
+  compact?: boolean;
+  autoFocus?: boolean;
+  isDisabled?: boolean;
+  className?: string | undefined;
+}
+
+// WHAT:  HeroUI DatePicker / TimeField speaking DB text. Timestamps edit all
+//        segments (date + 24h time to the second) and pick the day from the
+//        calendar; times get clock segments only.
+// WHERE: https://heroui.com/docs/react/components/{date-picker,time-field,calendar}
+export function DateTimeField({ kind, value, onChange, label, ariaLabel, compact = false, autoFocus = false, isDisabled = false, className }: DateTimeFieldProps) {
+  const groupClass = cn("font-mono", compact ? "h-full min-h-0 rounded-sm border-accent bg-background px-1 text-[12px] shadow-none" : "");
+  const segmentClass = compact ? "py-0 text-[12px]" : "";
+  const a11y = ariaLabel ?? label ?? kind;
+  if (kind === "time") {
+    return (
+      <TimeField
+        value={parseDbTime(value)}
+        onChange={(next) => onChange(next ? formatDbTime(next) : "")}
+        granularity="second"
+        hourCycle={24}
+        shouldForceLeadingZeros
+        aria-label={a11y}
+        isDisabled={isDisabled}
+        autoFocus={autoFocus}
+        className={cn(compact ? "h-full" : "w-full", className)}
+      >
+        {label ? <Label>{label}</Label> : null}
+        <TimeField.Group fullWidth className={groupClass}>
+          <TimeField.Prefix>
+            <Icon name="clock" size={12} className="text-muted" />
+          </TimeField.Prefix>
+          <TimeField.Input>{(segment) => <TimeField.Segment segment={segment} className={segmentClass} />}</TimeField.Input>
+        </TimeField.Group>
+      </TimeField>
+    );
+  }
+  const separator = value.includes("T") ? "T" : " ";
+  return (
+    <DatePicker
+      value={parseDbDate(value)}
+      onChange={(next) => onChange(next ? formatDbDate(next, separator) : "")}
+      granularity={kind === "date" ? "day" : "second"}
+      hourCycle={24}
+      shouldForceLeadingZeros
+      hideTimeZone
+      aria-label={a11y}
+      isDisabled={isDisabled}
+      autoFocus={autoFocus}
+      className={cn(compact ? "h-full" : "w-full", className)}
+    >
+      {label ? <Label>{label}</Label> : null}
+      <DateField.Group fullWidth className={groupClass}>
+        <DateField.Input>{(segment) => <DateField.Segment segment={segment} className={segmentClass} />}</DateField.Input>
+        <DateField.Suffix>
+          <DatePicker.Trigger className={compact ? "size-5 min-w-5" : ""}>
+            <DatePicker.TriggerIndicator>
+              <Icon name="calendar" size={compact ? 12 : 14} />
+            </DatePicker.TriggerIndicator>
+          </DatePicker.Trigger>
+        </DateField.Suffix>
+      </DateField.Group>
+      <DatePicker.Popover className="glass-modal rounded-xl">
+        <Calendar aria-label={`${a11y} calendar`}>
+          <Calendar.Header>
+            <Calendar.YearPickerTrigger>
+              <Calendar.YearPickerTriggerHeading />
+              <Calendar.YearPickerTriggerIndicator />
+            </Calendar.YearPickerTrigger>
+            <Calendar.NavButton slot="previous" />
+            <Calendar.NavButton slot="next" />
+          </Calendar.Header>
+          <Calendar.Grid>
+            <Calendar.GridHeader>{(day) => <Calendar.HeaderCell>{day}</Calendar.HeaderCell>}</Calendar.GridHeader>
+            <Calendar.GridBody>{(date) => <Calendar.Cell date={date} />}</Calendar.GridBody>
+          </Calendar.Grid>
+          <Calendar.YearPickerGrid>
+            <Calendar.YearPickerGridBody>{({ year }) => <Calendar.YearPickerCell year={year} />}</Calendar.YearPickerGridBody>
+          </Calendar.YearPickerGrid>
+        </Calendar>
+      </DatePicker.Popover>
+    </DatePicker>
+  );
+}
+
+interface NumberInputProps {
+  /// null = empty.
+  value: number | null;
+  onChange: (next: number | null) => void;
+  /// Whole numbers only (int / serial columns).
+  integer?: boolean;
+  label?: string | undefined;
+  ariaLabel?: string | undefined;
+  /// Fits a grid row: no label, no stepper buttons, cell-height input.
+  compact?: boolean;
+  autoFocus?: boolean;
+  isDisabled?: boolean;
+  className?: string | undefined;
+}
+
+// WHAT:  HeroUI NumberField without locale grouping (DB style `1234567.5`).
+// WHERE: https://heroui.com/docs/react/components/number-field
+export function NumberInput({ value, onChange, integer = false, label, ariaLabel, compact = false, autoFocus = false, isDisabled = false, className }: NumberInputProps) {
+  return (
+    <NumberField
+      value={value ?? Number.NaN}
+      onChange={(next) => onChange(next === undefined || Number.isNaN(next) ? null : next)}
+      formatOptions={{ useGrouping: false, maximumFractionDigits: integer ? 0 : 20 }}
+      step={integer ? 1 : undefined}
+      aria-label={ariaLabel ?? label ?? "number"}
+      isDisabled={isDisabled}
+      autoFocus={autoFocus}
+      className={cn(compact ? "h-full" : "w-full", className)}
+    >
+      {label ? <Label>{label}</Label> : null}
+      <NumberField.Group className={cn("font-mono", compact ? "h-full min-h-0 grid-cols-1 rounded-sm border-accent bg-background shadow-none" : "")}>
+        {compact ? null : <NumberField.DecrementButton />}
+        <NumberField.Input className={cn("w-full tabular-nums", compact ? "h-full px-1 text-[12px]" : "")} />
+        {compact ? null : <NumberField.IncrementButton />}
+      </NumberField.Group>
+    </NumberField>
   );
 }

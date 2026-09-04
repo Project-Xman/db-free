@@ -1,4 +1,4 @@
-// SOT: table-tab, table-toolbar, page-based-browsing, sort-state, export-copy, row-inspector, insert-row-flow, delete-rows-flow, cell-edit-staging, foreign-key-traversal
+// SOT: table-tab, table-toolbar, page-based-browsing, sort-state, export-copy, row-inspector, insert-row-flow, delete-rows-flow, cell-edit-staging, foreign-key-traversal, staged-row-mapping
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button, Chip, CloseButton, Dropdown, Label, Modal, ScrollShadow, Separator, Tooltip } from "@heroui/react";
 import type { CellValue, ColumnInfo, FilterRule, ForeignKey, SortRule, StagedChange, TablePage, TableRef, Value } from "@/lib/bindings";
@@ -7,9 +7,11 @@ import { ipc, normalizeError } from "@/lib/ipc";
 import { DENSITIES, formatCell, formatCount } from "@/lib/format";
 import { engineMeta } from "@/lib/engines";
 import { tableKey, useWorkspace } from "@/stores/workspace";
-import { DataGrid, parseEdited, type GridColumn } from "./DataGrid";
+import { DataGrid, type GridColumn, type StagedCell } from "./DataGrid";
 import { FilterPopover } from "./FilterPopover";
-import { AppSelect, Field } from "@/components/global/Field";
+import { AppSelect } from "@/components/global/Field";
+import { FormValueField } from "@/components/global/ValueEditor";
+import { JsonViewer } from "@/components/global/JsonViewer";
 import { IconButton } from "@/components/global/Button";
 import { EmptyState } from "@/components/global/EmptyState";
 import { Segmented } from "@/components/global/Field";
@@ -41,6 +43,8 @@ function nextChangeId(): string {
 // Stable empty list: a selector must return the same reference for unchanged state.
 const EMPTY_CHANGES: StagedChange[] = [];
 const EMPTY_FKS: ForeignKey[] = [];
+const NULL_VALUE: Value = { t: "null" };
+type InsertChange = Extract<StagedChange, { kind: "insert" }>;
 
 // WHAT:  One open table: toolbar (insert, refresh, filter, sort, export, delete),
 //        pager, virtualized grid with inline editing, record inspector.
@@ -136,20 +140,33 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
     const text = value.t === "json" ? JSON.stringify(value.v) : String(value.v);
     openTable(connectionId, link.table, [{ column: link.column, op: "eq", value: text }]);
   };
-  const getRow = useCallback((i: number): readonly Value[] | undefined => rows[i], [rows]);
   const pkColumns = useMemo(() => columns.filter((c) => c.primaryKey), [columns]);
 
-  // Staged updates for this table, keyed by "row:col" so the grid can highlight them.
+  // WHAT:  Staged changes for this table mapped onto grid rows: updated cells by
+  //        "row:col" (with the old value for the tooltip), deleted rows by index,
+  //        and staged inserts appended as editable ghost rows after the page.
+  const tableChanges = useMemo(() => pending.filter((c) => tableKey(c.table) === tableKey(table)), [pending, table]);
+  const rowIndexOf = useCallback(
+    (key: readonly CellValue[]) => rows.findIndex((r) => key.every((k) => JSON.stringify(r[columns.findIndex((col) => col.name === k.column)]) === JSON.stringify(k.value))),
+    [rows, columns],
+  );
   const staged = useMemo(() => {
-    const map = new Map<string, Value>();
-    for (const c of pending) {
-      if (c.kind !== "update" || JSON.stringify(c.table) !== JSON.stringify(table)) continue;
-      const rowIndex = rows.findIndex((r) => c.key.every((k) => JSON.stringify(r[columns.findIndex((col) => col.name === k.column)]) === JSON.stringify(k.value)));
+    const map = new Map<string, StagedCell>();
+    for (const c of tableChanges) {
+      if (c.kind !== "update") continue;
+      const rowIndex = rowIndexOf(c.key);
       const colIndex = columns.findIndex((col) => col.name === c.column);
-      if (rowIndex >= 0 && colIndex >= 0) map.set(`${rowIndex}:${colIndex}`, c.new);
+      if (rowIndex >= 0 && colIndex >= 0) map.set(`${rowIndex}:${colIndex}`, { value: c.new, old: c.old });
     }
     return map;
-  }, [pending, rows, columns, table]);
+  }, [tableChanges, rowIndexOf, columns]);
+  const deletedRows = useMemo(() => new Set(tableChanges.filter((c) => c.kind === "delete").map((c) => rowIndexOf(c.key)).filter((i) => i >= 0)), [tableChanges, rowIndexOf]);
+  const inserts = useMemo(() => tableChanges.filter((c): c is InsertChange => c.kind === "insert"), [tableChanges]);
+  const allRows = useMemo(
+    () => [...rows, ...inserts.map((c) => columns.map((col) => c.values.find((v) => v.column === col.name)?.value ?? NULL_VALUE))],
+    [rows, inserts, columns],
+  );
+  const getRow = useCallback((i: number): readonly Value[] | undefined => allRows[i], [allRows]);
 
   const keyOf = useCallback(
     (row: readonly Value[]): CellValue[] => pkColumns.map((c) => ({ column: c.name, value: row[columns.findIndex((col) => col.name === c.name)] ?? { t: "null" } })),
@@ -171,9 +188,26 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
   };
 
   const onCellEdit = (rowIndex: number, colIndex: number, next: Value) => {
-    const row = rows[rowIndex];
     const column = columns[colIndex];
-    if (!row || !column) return;
+    if (!column) return;
+    if (rowIndex >= rows.length) {
+      // Ghost row: the edit rewrites the staged insert itself (same id → replaced in place).
+      const insert = inserts[rowIndex - rows.length];
+      if (!insert) return;
+      const values = columns.flatMap((col) => {
+        if (col.name === column.name) return [{ column: col.name, value: next }];
+        const existing = insert.values.find((v) => v.column === col.name);
+        return existing ? [existing] : [];
+      });
+      stageChange(connectionId, { ...insert, values });
+      return;
+    }
+    if (deletedRows.has(rowIndex)) {
+      showError("This row is staged for deletion. Undo the delete in Pending Changes first.");
+      return;
+    }
+    const row = rows[rowIndex];
+    if (!row) return;
     if (pkColumns.length === 0) {
       showError("This table has no primary key, so rows cannot be edited safely.");
       return;
@@ -190,15 +224,24 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
   };
 
   const deleteSelected = () => {
-    if (pkColumns.length === 0) {
+    // Selected ghost rows: drop the staged insert instead of staging a delete.
+    for (const i of selectedRows) {
+      const insert = i >= rows.length ? inserts[i - rows.length] : undefined;
+      if (insert) unstageChange(connectionId, insert.id);
+    }
+    const real = [...selectedRows].filter((i) => i < rows.length && !deletedRows.has(i));
+    if (real.length > 0 && pkColumns.length === 0) {
       showError("This table has no primary key, so rows cannot be deleted safely.");
       return;
     }
-    const changes: StagedChange[] = [...selectedRows]
+    const changes: StagedChange[] = real
       .map((i) => rows[i])
       .filter((r): r is Value[] => r !== undefined)
       .map((r) => ({ kind: "delete", id: nextChangeId(), table, key: keyOf(r) }));
-    if (changes.length === 0) return;
+    if (changes.length === 0) {
+      setSelectedRows(new Set());
+      return;
+    }
     if (settings?.executionMode === "direct" && !window.confirm(`Delete ${changes.length} row(s) now?`)) return;
     setSelectedRows(new Set());
     void applyChanges(changes);
@@ -222,7 +265,7 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
     showInfo(`Copied ${chosen.length} row(s) as ${format.toUpperCase()} to the clipboard.`);
   };
 
-  const selectedRow = cell ? rows[cell.row] : undefined;
+  const selectedRow = cell ? allRows[cell.row] : undefined;
   const selectedValue = cell ? selectedRow?.[cell.col] : undefined;
   const selectedColumn = cell ? columns[cell.col] : undefined;
 
@@ -294,7 +337,7 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
           ) : (
             <DataGrid
               columns={gridColumns}
-              rowCount={rows.length}
+              rowCount={allRows.length}
               getRow={getRow}
               rowHeight={DENSITIES[density].rowHeight}
               sort={sort}
@@ -308,11 +351,13 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
                   return next;
                 })
               }
-              onToggleAll={() => setSelectedRows((s) => (s.size === rows.length ? new Set() : new Set(rows.map((_, i) => i))))}
+              onToggleAll={() => setSelectedRows((s) => (s.size === allRows.length ? new Set() : new Set(allRows.map((_, i) => i))))}
               onCellSelect={(row, col) => setCell({ row, col })}
               selected={cell}
               {...(editable ? { onCellEdit } : {})}
               staged={staged}
+              deletedRows={deletedRows}
+              insertedFrom={rows.length}
               nullDisplay={settings?.nullDisplay ?? "NULL"}
               onLinkOpen={openLinked}
             />
@@ -338,15 +383,16 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
   );
 }
 
-// WHAT:  Insert form: one field per column; blank = omitted (defaults apply), "NULL" = null.
+// WHAT:  Insert form: one typed control per column (number field, date / time
+//        picker, JSON editor, true/false select, text). Empty = omitted so the
+//        database default applies; the NULL toggle sends an explicit NULL.
 function InsertRowModal({ open, onClose, columns, onSubmit }: { open: boolean; onClose: () => void; columns: readonly ColumnInfo[]; onSubmit: (values: CellValue[]) => void }) {
-  const [values, setValues] = useState<Record<string, string>>({});
+  const [values, setValues] = useState<Record<string, Value | undefined>>({});
   const submit = () => {
     const out: CellValue[] = [];
     for (const c of columns) {
-      const text = values[c.name] ?? "";
-      if (text.length === 0) continue;
-      out.push({ column: c.name, value: parseEdited(text, c.dataType, undefined) });
+      const value = values[c.name];
+      if (value !== undefined) out.push({ column: c.name, value });
     }
     setValues({});
     onSubmit(out);
@@ -363,15 +409,7 @@ function InsertRowModal({ open, onClose, columns, onSubmit }: { open: boolean; o
             <Modal.Body className="max-h-[60vh] overflow-y-auto">
               <div className="grid grid-cols-2 gap-3">
                 {columns.map((c) => (
-                  <Field
-                    key={c.name}
-                    label={`${c.name}${c.primaryKey ? " (PK)" : ""}`}
-                    value={values[c.name] ?? ""}
-                    onChange={(v) => setValues((s) => ({ ...s, [c.name]: v }))}
-                    placeholder={c.nullable ? "default / NULL" : c.dataType}
-                    description={c.dataType}
-                    mono
-                  />
+                  <FormValueField key={c.name} column={c} value={values[c.name]} onChange={(v) => setValues((s) => ({ ...s, [c.name]: v }))} />
                 ))}
               </div>
             </Modal.Body>
@@ -433,12 +471,12 @@ function RecordInspector({ columns, row, column, value, table, tabs, activeTab, 
             {columns.map((c, i) => (
               <div key={c.name} className={`flex flex-col gap-0.5 border-b border-separator py-1.5 ${c.name === column.name ? "text-foreground" : "text-muted"}`}>
                 <dt className="flex items-center gap-1.5 font-medium"><Icon name={c.primaryKey ? "key" : "text"} size={11} />{c.name}<span className="ml-auto font-mono text-[10px]">{c.dataType}</span></dt>
-                <dd className="selectable truncate font-mono">{cellText(row[i])}</dd>
+                {row[i]?.t === "json" ? <JsonViewer bare value={row[i].v} defaultDepth={1} className="pl-3" /> : <dd className="selectable truncate font-mono">{cellText(row[i])}</dd>}
               </div>
             ))}
           </dl>
         ) : current === "json" ? (
-          <pre className="selectable p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-foreground">{JSON.stringify(record, null, 2)}</pre>
+          <JsonViewer value={record} className="p-3" />
         ) : current === "sql" ? (
           <pre className="selectable p-3 font-mono text-[11px] leading-relaxed break-all whitespace-pre-wrap text-foreground">{insertSql}</pre>
         ) : (

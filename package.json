@@ -28,6 +28,7 @@
     "@heroui/styles": "^3.2.4",
     "@hugeicons/core-free-icons": "^4.3.0",
     "@hugeicons/react": "^1.1.10",
+    "@internationalized/date": "3.12.4",
     "@lezer/highlight": "^1.2.3",
     "@tanstack/react-virtual": "^3.14.10",
     "@tauri-apps/api": "^2.11.1",
@@ -36,6 +37,7 @@
     "codemirror": "^6.0.2",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "simple-icons": "16.29.0",
     "sql-formatter": "^15.8.2",
     "tailwind-variants": "^3.3.1",
     "zustand": "^5.0.15"

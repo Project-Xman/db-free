@@ -1,12 +1,13 @@
-// SOT: data-grid, virtualized-grid, grid-cell-rendering, column-sort-header, row-selection, inline-cell-edit, foreign-key-link
+// SOT: data-grid, virtualized-grid, grid-cell-rendering, column-sort-header, row-selection, inline-cell-edit, foreign-key-link, change-highlighting
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Button, Input } from "@heroui/react";
+import { Button } from "@heroui/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { SortRule, Value } from "@/lib/bindings";
-import { parseJson } from "@/lib/json";
 import { cellClass, formatCell } from "@/lib/format";
+import { fieldKind } from "@/lib/fields";
 import { Icon, typeIcon } from "@/lib/icons";
 import { Check } from "@/components/global/Field";
+import { CellEditor } from "@/components/global/ValueEditor";
 import { cn } from "@/lib/cn";
 
 export interface GridColumn {
@@ -15,6 +16,12 @@ export interface GridColumn {
   primaryKey?: boolean;
   /// Set when the column is a foreign key; cells get a link button.
   linkTo?: string;
+}
+
+/// A cell with a staged (uncommitted) edit: what it shows now and what the database still holds.
+export interface StagedCell {
+  value: Value;
+  old: Value;
 }
 
 interface DataGridProps {
@@ -30,10 +37,14 @@ interface DataGridProps {
   selectedRows?: ReadonlySet<number>;
   onToggleRow?: (rowIndex: number) => void;
   onToggleAll?: () => void;
-  /// Present = cells are editable (double-click). Receives the typed text or null.
+  /// Present = cells are editable (double-click). Receives the edited Value.
   onCellEdit?: (rowIndex: number, colIndex: number, next: Value) => void;
-  /// Cells with a staged edit render highlighted with the staged value.
-  staged?: ReadonlyMap<string, Value>;
+  /// Cells with a staged edit render highlighted with the staged value ("row:col" keys).
+  staged?: ReadonlyMap<string, StagedCell>;
+  /// Rows staged for deletion: red tint, struck through, not editable.
+  deletedRows?: ReadonlySet<number>;
+  /// Rows at or after this index are staged inserts: green tint, edits update the insert.
+  insertedFrom?: number;
   nullDisplay?: string;
   /// Foreign-key traversal: called from the link button in a linked column's cell.
   onLinkOpen?: (rowIndex: number, colIndex: number) => void;
@@ -47,8 +58,11 @@ const CHECK_WIDTH = 40;
 //        so the owner keeps the data and fetches on demand.
 // HOW:   TanStack Virtual for both axes; absolute positioning inside a single
 //        scroll container; the header and the checkbox gutter are sticky.
-//        Editing: double-click opens an inline input; Enter stages, Esc cancels;
-//        typing `NULL` stages a null.
+//        Editing: double-click opens the typed CellEditor for the column kind
+//        (text, number, date/time picker, JSON modal); Enter commits, Esc cancels.
+//        Change highlighting: staged cell = amber with a left bar and a
+//        "was: …" tooltip, staged delete = red strike-through row, staged
+//        insert = green row appended after the fetched page.
 // WHERE: src/features/grid/TableTab.tsx, src/features/editor/ResultsPane.tsx
 export function DataGrid({
   columns,
@@ -65,6 +79,8 @@ export function DataGrid({
   onToggleAll,
   onCellEdit,
   staged,
+  deletedRows,
+  insertedFrom,
   nullDisplay = "NULL",
   onLinkOpen,
 }: DataGridProps) {
@@ -73,7 +89,7 @@ export function DataGrid({
   useEffect(() => {
     rangeRef.current = onRangeChange;
   });
-  const [editing, setEditing] = useState<{ row: number; col: number; text: string } | null>(null);
+  const [editing, setEditing] = useState<{ row: number; col: number } | null>(null);
 
   const widths = useMemo(() => columns.map((c) => estimateWidth(c)), [columns]);
 
@@ -108,14 +124,6 @@ export function DataGrid({
   const gutter = selectable ? CHECK_WIDTH : 0;
   const allSelected = selectable && rowCount > 0 && selectedRows.size === rowCount;
   const someSelected = selectable && selectedRows.size > 0 && !allSelected;
-
-  const commitEdit = () => {
-    if (!editing || !onCellEdit) return;
-    const column = columns[editing.col];
-    const original = getRow(editing.row)?.[editing.col];
-    onCellEdit(editing.row, editing.col, parseEdited(editing.text, column?.typeName ?? "", original));
-    setEditing(null);
-  };
 
   return (
     <div ref={parentRef} className="relative h-full w-full overflow-auto bg-background/60 font-mono text-[12px] select-none">
@@ -154,17 +162,30 @@ export function DataGrid({
           const row = getRow(vr.index);
           const isSelectedRow = selected?.row === vr.index;
           const isChecked = selectedRows?.has(vr.index) ?? false;
+          const isDeleted = deletedRows?.has(vr.index) ?? false;
+          const isInserted = insertedFrom !== undefined && vr.index >= insertedFrom;
           return (
             <div
               key={vr.key}
               className={cn(
                 "absolute left-0 flex border-b border-separator/40 transition-colors duration-100",
-                isChecked ? "bg-accent/15" : isSelectedRow ? "bg-surface-secondary/80" : vr.index % 2 === 1 ? "bg-surface/20 hover:bg-surface-secondary/40" : "hover:bg-surface-secondary/40",
+                isChecked
+                  ? "bg-accent/15"
+                  : isDeleted
+                    ? "bg-danger-soft/50 line-through decoration-danger/60"
+                    : isInserted
+                      ? "bg-success-soft/40"
+                      : isSelectedRow
+                        ? "bg-surface-secondary/80"
+                        : vr.index % 2 === 1
+                          ? "bg-surface/20 hover:bg-surface-secondary/40"
+                          : "hover:bg-surface-secondary/40",
               )}
               style={{ top: vr.start + HEADER_HEIGHT, height: vr.size, width: totalWidth + gutter }}
+              title={isDeleted ? "Staged for deletion" : isInserted ? "Staged insert" : undefined}
             >
               {selectable ? (
-                <div className="sticky left-0 z-10 flex shrink-0 items-center justify-center border-r border-separator/40 bg-surface/70 backdrop-blur-sm" style={{ width: CHECK_WIDTH }}>
+                <div className={cn("sticky left-0 z-10 flex shrink-0 items-center justify-center border-r border-separator/40 backdrop-blur-sm", isDeleted ? "bg-danger-soft/70" : isInserted ? "bg-success-soft/70" : "bg-surface/70")} style={{ width: CHECK_WIDTH }}>
                   <Check label={`Select row ${vr.index + 1}`} checked={isChecked} onChange={() => onToggleRow(vr.index)} />
                 </div>
               ) : null}
@@ -176,59 +197,64 @@ export function DataGrid({
                   </div>
                 ) : (
                   virtualCols.map((vc) => {
-                    const stagedValue = staged?.get(`${vr.index}:${vc.index}`);
-                    const value = stagedValue ?? row[vc.index];
+                    const column = columns[vc.index];
+                    const stagedCell = staged?.get(`${vr.index}:${vc.index}`);
+                    const value = stagedCell?.value ?? row[vc.index];
                     const formatted = value === undefined ? null : formatCell(value);
                     const isSelected = isSelectedRow && selected.col === vc.index;
                     const isEditing = editing !== null && editing.row === vr.index && editing.col === vc.index;
-                    const linked = columns[vc.index]?.linkTo !== undefined && onLinkOpen !== undefined && value !== undefined && value.t !== "null";
+                    const kind = fieldKind(column?.typeName ?? "", value);
+                    const editable = onCellEdit !== undefined && !isDeleted && value !== undefined && kind !== "bytes" && kind !== "bool";
+                    const linked = column?.linkTo !== undefined && onLinkOpen !== undefined && value !== undefined && value.t !== "null";
+                    // One colour per cell: a change state wins over the value-kind syntax colour.
+                    const tone = stagedCell !== undefined ? "font-medium text-warning" : isDeleted ? "text-danger" : isInserted ? "text-success" : formatted ? cellClass(formatted.kind) : "";
                     return (
                       <div
                         key={vc.key}
                         onClick={() => onCellSelect?.(vr.index, vc.index)}
                         onDoubleClick={() => {
-                          if (onCellEdit && value !== undefined && value.t !== "bytes" && value.t !== "bool") setEditing({ row: vr.index, col: vc.index, text: editText(value) });
+                          if (editable) setEditing({ row: vr.index, col: vc.index });
                         }}
                         className={cn(
                           "absolute top-0 flex h-full cursor-default items-center truncate border-r border-separator/40 px-2",
-                          formatted ? cellClass(formatted.kind) : "",
-                          isSelected ? "bg-accent/20 ring-1 ring-accent ring-inset" : "",
-                          stagedValue !== undefined ? "bg-warning-soft text-warning" : "",
+                          tone,
+                          stagedCell !== undefined ? "border-l-2 border-l-warning bg-warning-soft" : "",
+                          isSelected ? "ring-1 ring-accent ring-inset" : "",
+                          isSelected && stagedCell === undefined ? "bg-accent/20" : "",
+                          isEditing ? "select-text" : "",
                         )}
                         style={{ left: vc.start, width: vc.size }}
-                        title={formatted?.text}
+                        title={stagedCell !== undefined ? `${formatted?.text ?? ""}\nwas: ${formatCell(stagedCell.old).text}` : formatted?.text}
                       >
-                        {isEditing ? (
-                          <Input
-                            autoFocus
-                            value={editing.text}
-                            onChange={(e) => setEditing({ ...editing, text: e.target.value })}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") commitEdit();
-                              if (e.key === "Escape") setEditing(null);
+                        {isEditing && value !== undefined && onCellEdit ? (
+                          <CellEditor
+                            typeName={column?.typeName ?? ""}
+                            value={value}
+                            onCommit={(next) => {
+                              setEditing(null);
+                              onCellEdit(vr.index, vc.index, next);
                             }}
-                            onBlur={() => setEditing(null)}
-                            className="h-[calc(100%-4px)] w-full rounded-sm border border-accent bg-background px-1 font-mono text-[12px] text-foreground"
-                            aria-label="Edit cell"
+                            onCancel={() => setEditing(null)}
                           />
                         ) : value?.t === "bool" ? (
                           // Interactive when the grid is editable: toggling stages / applies the edit.
                           <Check
                             label={value.v ? "true" : "false"}
                             checked={value.v}
-                            {...(onCellEdit ? { onChange: (next: boolean) => onCellEdit(vr.index, vc.index, { t: "bool", v: next }) } : {})}
+                            {...(onCellEdit && !isDeleted ? { onChange: (next: boolean) => onCellEdit(vr.index, vc.index, { t: "bool", v: next }) } : {})}
                           />
                         ) : value?.t === "null" ? (
-                          <span className="truncate">{nullDisplay}</span>
+                          <span className={cn("truncate", stagedCell === undefined && !isDeleted && !isInserted ? "" : "italic")}>{nullDisplay}</span>
                         ) : (
                           <span className="truncate">{formatted?.text ?? ""}</span>
                         )}
+                        {stagedCell !== undefined && !isEditing ? <span aria-hidden="true" className="ml-auto size-1.5 shrink-0 rounded-full bg-warning" /> : null}
                         {linked && !isEditing ? (
                           <Button
                             isIconOnly
                             variant="ghost"
                             size="sm"
-                            aria-label={`Open ${columns[vc.index]?.linkTo ?? "related"} rows`}
+                            aria-label={`Open ${column?.linkTo ?? "related"} rows`}
                             onPress={() => {
                               onLinkOpen(vr.index, vc.index);
                             }}
@@ -250,59 +276,11 @@ export function DataGrid({
   );
 }
 
-function editText(value: Value): string {
-  switch (value.t) {
-    case "null":
-      return "";
-    case "json":
-      return JSON.stringify(value.v);
-    case "bool":
-      return value.v ? "true" : "false";
-    case "int":
-    case "float":
-      return String(value.v);
-    case "decimal":
-    case "text":
-    case "bytes":
-    case "date_time":
-    case "unsupported":
-      return value.v;
-  }
-}
-
-// WHAT:  Turns typed text back into a Value using the column type as a hint.
-export function parseEdited(text: string, typeName: string, original: Value | undefined): Value {
-  const t = typeName.toLowerCase();
-  if (text === "NULL") return { t: "null" };
-  if (t.includes("bool") || original?.t === "bool") {
-    const lower = text.trim().toLowerCase();
-    if (lower === "true" || lower === "1" || lower === "t") return { t: "bool", v: true };
-    if (lower === "false" || lower === "0" || lower === "f") return { t: "bool", v: false };
-  }
-  if (/int|serial/.test(t) || original?.t === "int") {
-    const n = Number(text);
-    if (Number.isInteger(n) && text.trim().length > 0) return { t: "int", v: n };
-  }
-  if (/numeric|decimal|money/.test(t) || original?.t === "decimal") {
-    if (text.trim().length > 0 && !Number.isNaN(Number(text))) return { t: "decimal", v: text.trim() };
-  }
-  if (/real|float|double/.test(t) || original?.t === "float") {
-    const n = Number(text);
-    if (text.trim().length > 0 && !Number.isNaN(n)) return { t: "float", v: n };
-  }
-  if (t.includes("json") || original?.t === "json") {
-    const parsed = parseJson(text);
-    if (parsed !== undefined && typeof parsed === "object") return { t: "json", v: parsed };
-  }
-  if (/date|time/.test(t) || original?.t === "date_time") return { t: "date_time", v: text };
-  return { t: "text", v: text };
-}
-
 function estimateWidth(column: GridColumn): number {
   const t = column.typeName.toLowerCase();
   if (t.includes("bool")) return 120;
   if (/int|serial|numeric|decimal|real|float|double/.test(t)) return 110;
-  if (/timestamp|date|time/.test(t)) return 200;
+  if (/timestamp|date|time/.test(t)) return 220;
   if (t.includes("uuid")) return 300;
   if (/json|text|blob|bytea/.test(t)) return 260;
   return Math.min(320, Math.max(140, column.name.length * 9 + 60));

@@ -406,17 +406,17 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => ({
     }));
   },
 
-  // WHAT:  Review mode: an edit to a cell already staged replaces the earlier one.
+  // WHAT:  Review mode: an edit to a cell already staged (or a re-staged change
+  //        with the same id) replaces the earlier one in place, keeping its position.
   stageChange: (connectionId, change) =>
     set((s) => {
       const current = s.pendingChanges[connectionId] ?? [];
-      const filtered = current.filter((c) => {
-        if (c.kind === "update" && change.kind === "update") {
-          return !(tableKey(c.table) === tableKey(change.table) && c.column === change.column && JSON.stringify(c.key) === JSON.stringify(change.key));
-        }
-        return c.id !== change.id;
-      });
-      return { pendingChanges: { ...s.pendingChanges, [connectionId]: [...filtered, change] }, changesPanelOpen: true };
+      const replaces = (c: StagedChange) =>
+        c.id === change.id ||
+        (c.kind === "update" && change.kind === "update" && tableKey(c.table) === tableKey(change.table) && c.column === change.column && JSON.stringify(c.key) === JSON.stringify(change.key));
+      const index = current.findIndex(replaces);
+      const next = index >= 0 ? current.map((c, i) => (i === index ? change : c)) : [...current, change];
+      return { pendingChanges: { ...s.pendingChanges, [connectionId]: next }, changesPanelOpen: true };
     }),
   unstageChange: (connectionId, changeId) =>
     set((s) => ({ pendingChanges: { ...s.pendingChanges, [connectionId]: (s.pendingChanges[connectionId] ?? []).filter((c) => c.id !== changeId) } })),

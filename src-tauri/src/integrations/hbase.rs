@@ -215,6 +215,8 @@ enum Command {
     Get { table: String, row: String },
     Scan { table: String, spec: ScanSpec },
     Put { table: String, row: String, cells: Vec<(String, String)> },
+    /// Raw REST call, for schema work and anything the shorthand does not cover.
+    Passthrough { method: String, path: String, body: Option<Json> },
 }
 
 fn shell_args(rest: &str) -> Vec<String> {
@@ -234,6 +236,12 @@ fn parse_command(text: &str, max_rows: usize) -> AppResult<Command> {
         let v: Json = serde_json::from_str(t).map_err(|e| AppError::invalid_input(format!("Invalid JSON command: {e}")))?;
         if v.get("list").is_some() {
             return Ok(Command::List);
+        }
+        // `{"method","path","body"}` reaches any REST endpoint — creating a
+        // table is `PUT /t/schema`, which no shorthand can express.
+        if let Some(path) = v.get("path").and_then(Json::as_str) {
+            let method = v.get("method").and_then(Json::as_str).unwrap_or("GET").to_ascii_uppercase();
+            return Ok(Command::Passthrough { method, path: path.to_string(), body: v.get("body").cloned() });
         }
         let table = v.get("table").and_then(Json::as_str).ok_or_else(|| AppError::invalid_input("JSON command needs a \"table\"."))?.to_string();
         if let Some(row) = v.get("get").and_then(Json::as_str) {
@@ -266,7 +274,9 @@ fn parse_command(text: &str, max_rows: usize) -> AppResult<Command> {
             }
             return Ok(Command::Put { table, row, cells });
         }
-        return Err(AppError::invalid_input("JSON command needs one of \"get\", \"scan\", \"put\" or \"list\"."));
+        return Err(AppError::invalid_input(
+            "JSON command needs one of \"get\", \"scan\", \"put\", \"list\", or a raw {\"method\", \"path\", \"body\"}.",
+        ));
     }
     let (verb, rest) = t.split_once(char::is_whitespace).unwrap_or((t, ""));
     let args = shell_args(rest);
@@ -302,8 +312,14 @@ impl HbaseIntegration {
         h
     }
 
+    // WHAT:  Column families of a table, from its REST schema document.
+    // WHY:   HBase REST defaults to a Ruby-ish text dump; only an explicit
+    //        `Accept: application/json` yields JSON, so the header goes on
+    //        every read here (see `json_headers`).
     async fn families(&self, table: &str) -> AppResult<Vec<String>> {
-        let schema: Json = self.http.get_json(&format!("/{}/schema", pct(table))).await?;
+        let req = self.http.request(Method::GET, &format!("/{}/schema", pct(table))).headers(Self::json_headers());
+        let resp = self.http.send(req).await?;
+        let schema: Json = resp.json().await.map_err(|e| AppError::driver(format!("Malformed schema response: {e}")))?;
         let mut fams: Vec<String> = schema
             .get("ColumnSchema")
             .and_then(Json::as_array)
@@ -369,7 +385,9 @@ impl HbaseIntegration {
     }
 
     async fn all_tables(&self) -> AppResult<Vec<String>> {
-        let v: Json = self.http.get_json("/").await?;
+        let req = self.http.request(Method::GET, "/").headers(Self::json_headers());
+        let resp = self.http.send(req).await?;
+        let v: Json = resp.json().await.map_err(|e| AppError::driver(format!("Malformed table list: {e}")))?;
         Ok(v.get("table")
             .and_then(Json::as_array)
             .map(|a| a.iter().filter_map(|t| t.get("name").and_then(Json::as_str)).map(str::to_string).collect())
@@ -568,6 +586,31 @@ impl Integration for HbaseIntegration {
                 self.http.send(req).await?;
                 Ok(vec![StatementResult::Affected { rows_affected: 1 }])
             }
+            Command::Passthrough { method, path, body } => {
+                if self.read_only && method != "GET" {
+                    return Err(AppError::read_only(format!("This connection is read-only; {method} is blocked.")));
+                }
+                let verb = Method::from_bytes(method.as_bytes()).map_err(|_| AppError::invalid_input(format!("Unsupported HTTP method `{method}`.")))?;
+                let mut req = self.http.request(verb, &path).headers(Self::json_headers());
+                if let Some(b) = body {
+                    req = req.header(reqwest::header::CONTENT_TYPE, "application/json").json(&b);
+                }
+                let resp = self.http.send(req).await?;
+                let text = resp.text().await.unwrap_or_default();
+                if text.trim().is_empty() {
+                    return Ok(vec![StatementResult::Affected { rows_affected: 0 }]);
+                }
+                match serde_json::from_str::<Json>(&text) {
+                    Ok(v) => Ok(vec![StatementResult::Rows { result: crate::integrations::http::json_result(v) }]),
+                    Err(_) => Ok(vec![StatementResult::Rows {
+                        result: ResultSet {
+                            columns: vec![ColumnMeta { name: "response".into(), type_name: "string".into() }],
+                            rows: vec![vec![Value::Text(text)]],
+                            truncated: false,
+                        },
+                    }]),
+                }
+            }
         }
     }
 
@@ -577,6 +620,7 @@ impl Integration for HbaseIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ConnectionSummary, Environment, SslMode};
 
     #[test]
     fn scanner_xml_encodes_prefix_and_batch() {
@@ -652,4 +696,76 @@ mod tests {
         assert_eq!(table_path(&TableRef { schema: Some("default".into()), name: "t".into() }), "t");
         assert_eq!(pct("ns:t x"), "ns:t%20x");
     }
+
+    // Runs only when DBFREE_TEST_HBASE_URL is set:
+    // `docker run --rm -d -p 8080:8080 harisekhon/hbase:latest`.
+    #[tokio::test]
+    async fn live_round_trip_when_configured() {
+        let Ok(url) = std::env::var("DBFREE_TEST_HBASE_URL") else {
+            return;
+        };
+        let resolved = ResolvedConnection {
+            summary: ConnectionSummary {
+                id: "t".into(),
+                name: "t".into(),
+                engine: Engine::Hbase,
+                environment: Environment::Local,
+                read_only: false,
+                host: Some(url),
+                port: None,
+                database: None,
+                username: None,
+                file_path: None,
+                ssl_mode: SslMode::Prefer,
+                has_secret: false,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+            secret: None,
+        };
+        let db = connect(&resolved).await.unwrap_or_else(|e| panic!("connect: {e}"));
+        let version = db.server_version().await.unwrap_or_default().unwrap_or_default();
+        assert!(!version.is_empty(), "no version");
+        // Create the table through the REST schema endpoint, then write two rows.
+        let _ = db.execute(r#"{"method":"DELETE","path":"/dbfree_test/schema"}"#, 10).await;
+        db.execute(
+            r#"{"method":"PUT","path":"/dbfree_test/schema","body":{"name":"dbfree_test","ColumnSchema":[{"name":"cf"}]}}"#,
+            10,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create: {e}"));
+        db.execute(r#"{"table":"dbfree_test","put":{"row":"r1","cf:city":"Berlin"}}"#, 10)
+            .await
+            .unwrap_or_else(|e| panic!("put r1: {e}"));
+        db.execute(r#"{"table":"dbfree_test","put":{"row":"r2","cf:city":"Paris"}}"#, 10)
+            .await
+            .unwrap_or_else(|e| panic!("put r2: {e}"));
+
+        let catalog = db.catalog().await.unwrap_or_else(|e| panic!("catalog: {e}"));
+        assert!(
+            catalog.schemas.iter().any(|s| s.tables.iter().any(|t| t.name.ends_with("dbfree_test"))),
+            "{:?}",
+            catalog.schemas.iter().flat_map(|s| s.tables.iter().map(|t| t.name.clone())).collect::<Vec<_>>()
+        );
+        let table = TableRef { schema: None, name: "dbfree_test".into() };
+        let cols = db.columns(&table).await.unwrap_or_else(|e| panic!("columns: {e}"));
+        assert!(cols.first().map(|c| c.name == "row" && c.primary_key).unwrap_or(false), "{cols:?}");
+        let page = db
+            .fetch_page(&table, &PageQuery { sort: vec![], filters: vec![], offset: 0, limit: 10 })
+            .await
+            .unwrap_or_else(|e| panic!("page: {e}"));
+        assert_eq!(page.rows.len(), 2, "{page:?}");
+        assert_eq!(db.count(&table, &[]).await.unwrap_or_default(), 2);
+        let got = db
+            .execute(r#"{"table":"dbfree_test","get":"r1"}"#, 10)
+            .await
+            .unwrap_or_else(|e| panic!("get: {e}"));
+        match got.first() {
+            Some(StatementResult::Rows { result }) => assert!(!result.rows.is_empty(), "{result:?}"),
+            other => panic!("expected rows, got {other:?}"),
+        }
+        let _ = db.execute(r#"{"method":"DELETE","path":"/dbfree_test/schema"}"#, 10).await;
+        db.close().await;
+    }
+
 }
