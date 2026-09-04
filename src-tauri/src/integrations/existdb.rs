@@ -408,6 +408,7 @@ impl ExistIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ConnectionSummary, Environment, SslMode};
 
     const LISTING: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <exist:result xmlns:exist="http://exist.sourceforge.net/NS/exist" exist:hits="0" exist:start="1" exist:count="0">
@@ -459,4 +460,67 @@ world</exist:result>"#);
         assert_eq!(normalise_collection(""), "/db");
         assert_eq!(path_encode("/db/my apps"), "/db/my%20apps");
     }
+
+    // Runs only when DBFREE_TEST_EXISTDB_URL is set:
+    // `docker run --rm -d -p 8080:8080 existdb/existdb:latest`.
+    #[tokio::test]
+    async fn live_round_trip_when_configured() {
+        let Ok(url) = std::env::var("DBFREE_TEST_EXISTDB_URL") else {
+            return;
+        };
+        let resolved = ResolvedConnection {
+            summary: ConnectionSummary {
+                id: "t".into(),
+                name: "t".into(),
+                engine: Engine::Existdb,
+                environment: Environment::Local,
+                read_only: false,
+                host: Some(url),
+                port: None,
+                database: Some("/db".into()),
+                username: Some(std::env::var("DBFREE_TEST_EXISTDB_USER").unwrap_or_else(|_| "admin".into())),
+                file_path: None,
+                ssl_mode: SslMode::Prefer,
+                has_secret: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+            secret: Some(std::env::var("DBFREE_TEST_EXISTDB_PASSWORD").unwrap_or_default()),
+        };
+        let db = connect(&resolved).await.unwrap_or_else(|e| panic!("connect: {e}"));
+        let version = db.server_version().await.unwrap_or_default();
+        assert!(version.is_some(), "no version reported");
+        let cat = db.catalog().await.unwrap_or_else(|e| panic!("catalog: {e}"));
+        assert!(!cat.schemas.is_empty(), "{cat:?}");
+        // /db always has the `system` child collection on a fresh server.
+        assert!(
+            cat.schemas.iter().any(|s| s.tables.iter().any(|t| t.name.contains("system"))),
+            "{:?}",
+            cat.schemas.iter().flat_map(|s| s.tables.iter().map(|t| t.name.clone())).take(20).collect::<Vec<_>>()
+        );
+        let table = cat
+            .schemas
+            .first()
+            .and_then(|s| s.tables.first())
+            .map(|t| TableRef { schema: t.schema.clone(), name: t.name.clone() })
+            .unwrap_or_else(|| panic!("no table in catalog"));
+        let cols = db.columns(&table).await.unwrap_or_else(|e| panic!("columns: {e}"));
+        assert!(cols.iter().any(|c| c.name == "name" && c.primary_key), "{cols:?}");
+        let page = db
+            .fetch_page(&table, &PageQuery { sort: vec![], filters: vec![], offset: 0, limit: 10 })
+            .await
+            .unwrap_or_else(|e| panic!("page: {e}"));
+        assert!(!page.columns.is_empty(), "{page:?}");
+        // XQuery through the REST endpoint.
+        let out = db
+            .execute("for $i in 1 to 3 return <n>{$i}</n>", 10)
+            .await
+            .unwrap_or_else(|e| panic!("xquery: {e}"));
+        match out.first() {
+            Some(StatementResult::Rows { result }) => assert!(!result.rows.is_empty(), "{result:?}"),
+            other => panic!("expected rows, got {other:?}"),
+        }
+        db.close().await;
+    }
+
 }

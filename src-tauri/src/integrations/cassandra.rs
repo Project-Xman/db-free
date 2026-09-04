@@ -13,11 +13,14 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use scylla::client::session::{Session, TlsContext};
 use scylla::client::session_builder::SessionBuilder;
+use scylla::errors::TranslationError;
+use scylla::policies::address_translator::{AddressTranslator, UntranslatedPeer};
 use scylla::frame::response::result::{CollectionType, ColumnType, NativeType};
 use scylla::response::query_result::QueryResult;
 use scylla::statement::Statement;
 use scylla::value::{CqlValue, Row};
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -165,10 +168,48 @@ pub(crate) fn tls_config(mode: SslMode) -> AppResult<Option<Arc<rustls::ClientCo
     Ok(Some(Arc::new(config)))
 }
 
+// WHAT:  Sends every peer address the cluster broadcasts back to the contact
+//        point the user actually configured.
+// WHY:   A node in Docker (or behind NAT / a bastion / port-forward) broadcasts
+//        its own private `broadcast_rpc_address`, e.g. 192.168.215.11:9042. The
+//        driver connects to the contact point, learns that address from
+//        system.local, and then cannot reach it — "connection refused" on a
+//        server that plainly works. Pinning the translation to the address the
+//        user gave keeps single-node and forwarded clusters usable; a real
+//        multi-node cluster reached over routable addresses is unaffected
+//        because it broadcasts addresses that already resolve.
+#[derive(Debug)]
+struct ContactPointTranslator {
+    contact: SocketAddr,
+}
+
+#[async_trait]
+impl AddressTranslator for ContactPointTranslator {
+    async fn translate_address(&self, _peer: &UntranslatedPeer) -> Result<SocketAddr, TranslationError> {
+        Ok(self.contact)
+    }
+}
+
+// WHAT:  Resolves the first contact point to a socket address for the translator.
+async fn first_contact_addr(nodes: &[String]) -> Option<SocketAddr> {
+    let first = nodes.first()?;
+    if let Ok(addr) = first.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    tokio::net::lookup_host(first).await.ok()?.next()
+}
+
 pub async fn connect(conn: &ResolvedConnection) -> AppResult<Arc<dyn Integration>> {
     let s = &conn.summary;
     let nodes = known_nodes(s.host.as_deref(), s.port);
-    let mut builder = SessionBuilder::new().known_nodes(nodes).connection_timeout(CONNECT_TIMEOUT);
+    let mut builder = SessionBuilder::new().known_nodes(nodes.clone()).connection_timeout(CONNECT_TIMEOUT);
+    // Single contact point = a local / port-forwarded node whose broadcast
+    // address is very likely unreachable; route peers back through it.
+    if nodes.len() == 1 {
+        if let Some(contact) = first_contact_addr(&nodes).await {
+            builder = builder.address_translator(Arc::new(ContactPointTranslator { contact }));
+        }
+    }
     let user = s.username.as_deref().map(str::trim).filter(|u| !u.is_empty());
     if let Some(user) = user {
         builder = builder.user(user, conn.secret.clone().unwrap_or_default());
