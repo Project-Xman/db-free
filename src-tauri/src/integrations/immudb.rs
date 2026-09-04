@@ -15,28 +15,32 @@ use std::sync::Arc;
 
 // ============================================================================
 // WHAT:  immudb adapter over its REST gateway (immugw / the embedded HTTP API,
-//        port 3323, base path `/api`).
+//        port 8080, base path `/api` — immudb's web-api server, not the
+//        gRPC port 3322 nor the metrics port 9497).
 // WHY:   immudb is both a SQL database and an immutable key-value store. SQL
 //        tables map 1:1 to the grid; the KV side is exposed as a `kv` schema
 //        with one `keys` table (key, value, tx) fed by a bounded prefix scan.
 // HOW:   POST /api/login {user, password} (base64) → Bearer token, then
-//        POST /api/db/use {databaseName} → per-database token. Reads go to
+//        GET /api/db/use/{database} → per-database token. Reads go to
 //        POST /api/db/sqlquery, writes to POST /api/db/sqlexec (refused when
 //        read-only). Tables via `SELECT * FROM TABLES()` (immudb ≥ 1.3) with a
 //        fallback to GET /api/db/tables; columns via `SELECT * FROM COLUMNS('t')`
-//        or POST /api/db/tables/{t}. Typed cells (`{n}`, `{s}`, `{b}`, `{bs}`,
+//        or POST /api/db/tables/{t}. KV: GET /api/db/get/{b64key},
+//        POST /api/db/{set,scan,history,verifiable/get}. Typed cells (`{n}`, `{s}`, `{b}`, `{bs}`,
 //        `{ts}`, `{f}`, `{null}`) decode to model values. `execute` also takes
 //        shorthand KV commands: `GET key`, `SET key value`, `HISTORY key`,
 //        `VERIFIED GET key`, `SCAN prefix`.
 // WHERE: src-tauri/src/integrations/http.rs (client), integrations/mod.rs (trait)
 // ============================================================================
 
-const DEFAULT_PORT: u16 = 3323;
+const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_DATABASE: &str = "defaultdb";
 const DEFAULT_USER: &str = "immudb";
 const KV_SCHEMA: &str = "kv";
 const KV_TABLE: &str = "keys";
-const MAX_KV_ROWS: usize = 5_000;
+// immudb refuses a scan limit above its own `MaxValueEntries` (2 500 by default),
+// so the key browser pages at that ceiling rather than failing with a 500.
+const MAX_KV_ROWS: usize = 2_500;
 
 pub struct ImmudbIntegration {
     engine: Engine,
@@ -89,8 +93,9 @@ pub async fn connect(conn: &ResolvedConnection) -> AppResult<Arc<dyn Integration
         .ok_or_else(|| AppError::not_connected("immudb login did not return a token."))?
         .to_string();
     let session = HttpClient::new(&base, crate::integrations::http::Auth::Bearer(token), insecure)?;
-    // Selecting the database returns a database-scoped token on immudb 1.x.
-    let use_db: Json = session.post_json("/api/db/use", &json!({ "databaseName": database })).await?;
+    // Selecting the database returns a database-scoped token.
+    // The web API spells this `GET /api/db/use/{name}`; a POST there is 405.
+    let use_db: Json = session.get_json(&format!("/api/db/use/{database}")).await.unwrap_or(Json::Null);
     let http = match use_db.get("token").and_then(Json::as_str).filter(|t| !t.is_empty()) {
         Some(t) => HttpClient::new(&base, crate::integrations::http::Auth::Bearer(t.to_string()), insecure)?,
         None => session,
@@ -356,7 +361,10 @@ impl ImmudbIntegration {
             }
         };
         let idx = |name: &str| rs.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name));
-        let (i_name, i_type, i_null, i_pk) = (idx("name").or_else(|| idx("column")), idx("type"), idx("nullable"), idx("primary_key").or_else(|| idx("primary key")));
+        // `SELECT * FROM COLUMNS('t')` labels the flag column `primary`; older
+        // builds and the /tables fallback spell it `primary_key`.
+        let i_pk = idx("primary").or_else(|| idx("primary_key")).or_else(|| idx("primary key"));
+        let (i_name, i_type, i_null) = (idx("name").or_else(|| idx("column")), idx("type"), idx("nullable"));
         let text = |row: &Vec<Value>, i: Option<usize>| -> String {
             match i.and_then(|i| row.get(i)) {
                 Some(Value::Text(s)) => s.clone(),
@@ -587,12 +595,13 @@ impl ImmudbIntegration {
     async fn run_kv(&self, cmd: KvCommand, max_rows: usize) -> AppResult<StatementResult> {
         match cmd {
             KvCommand::Get(key) => {
-                let v: Json = self.http.post_json("/api/db/get", &json!({ "key": b64(key.as_bytes()) })).await?;
+                // The web API spells this `GET /api/db/get/{base64 key}`.
+                let v: Json = self.http.get_json(&format!("/api/db/get/{}", b64(key.as_bytes()))).await?;
                 Ok(StatementResult::Rows { result: kv_result_set(&[v], false) })
             }
             KvCommand::VerifiedGet(key) => {
                 let body = json!({ "keyRequest": { "key": b64(key.as_bytes()) } });
-                let v: Json = self.http.post_json("/api/db/verified/get", &body).await?;
+                let v: Json = self.http.post_json("/api/db/verifiable/get", &body).await?;
                 let entry = v.get("entry").cloned().unwrap_or(v.clone());
                 let mut rs = kv_result_set(&[entry], false);
                 rs.columns.push(ColumnMeta { name: "verified".into(), type_name: "boolean".into() });

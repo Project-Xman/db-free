@@ -158,7 +158,7 @@ export const ENGINES = {
   cloudflare_d1: http({ label: "Cloudflare D1", kind: "embedded", hint: "Serverless SQLite · REST", commandLanguage: SQL, schemes: ["cloudflare", "d1"], fields: { host: "Account ID", database: "Database ID", password: "API token" }, hostPlaceholder: "Account ID (32 hex characters)" }),
 
   // ---- Ledger
-  immudb: http({ label: "immudb", kind: "ledger", defaultPort: 3323, defaultDatabase: "defaultdb", defaultUser: "immudb", hint: "Immutable ledger · SQL / KV", commandLanguage: SQL, schemes: ["immudb"], fields: { host: "REST URL (port 3323)", database: "Database", username: "User", password: "Password" } }),
+  immudb: http({ label: "immudb", kind: "ledger", defaultPort: 8080, defaultDatabase: "defaultdb", defaultUser: "immudb", hint: "Immutable ledger · SQL / KV", commandLanguage: SQL, schemes: ["immudb"], fields: { host: "Web API URL (port 8080)", database: "Database", username: "User", password: "Password" } }),
   qldb: meta({ label: "Amazon QLDB", kind: "ledger", form: "aws", defaultPort: null, defaultDatabase: "", defaultUser: "", icon: "database", hint: "Immutable ledger · PartiQL", commandLanguage: "PartiQL", schemes: ["qldb"], fields: { host: "Region", username: "Access key ID", password: "Secret access key", database: "Ledger name" }, hostPlaceholder: "us-east-1" }),
 
   // ---- Event / streaming

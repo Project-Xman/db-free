@@ -547,6 +547,7 @@ impl Integration for DynamoIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ConnectionSummary, Environment, SslMode};
 
     #[test]
     fn decodes_attribute_values() {
@@ -608,4 +609,79 @@ mod tests {
         assert_eq!(names, vec!["pk", "sk", "extra"]);
         assert_eq!(types[2], "boolean");
     }
+
+    // Runs only when DBFREE_TEST_DYNAMODB_ENDPOINT is set:
+    // `docker run --rm -d -p 8000:8000 amazon/dynamodb-local`.
+    #[tokio::test]
+    async fn live_round_trip_when_configured() {
+        let Ok(endpoint) = std::env::var("DBFREE_TEST_DYNAMODB_ENDPOINT") else {
+            return;
+        };
+        let resolved = ResolvedConnection {
+            summary: ConnectionSummary {
+                id: "t".into(),
+                name: "t".into(),
+                engine: Engine::Dynamodb,
+                environment: Environment::Local,
+                read_only: false,
+                host: Some(std::env::var("DBFREE_TEST_DYNAMODB_REGION").unwrap_or_else(|_| "us-east-1".into())),
+                port: None,
+                database: Some(endpoint),
+                username: Some(std::env::var("DBFREE_TEST_DYNAMODB_KEY").unwrap_or_else(|_| "dummy".into())),
+                file_path: None,
+                ssl_mode: SslMode::Prefer,
+                has_secret: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+            secret: Some(std::env::var("DBFREE_TEST_DYNAMODB_SECRET").unwrap_or_else(|_| "dummy".into())),
+        };
+        let db = connect(&resolved).await.unwrap_or_else(|e| panic!("connect: {e}"));
+        let _ = db
+            .execute(r#"{"Operation":"DeleteTable","Params":{"TableName":"dbfree_test"}}"#, 10)
+            .await;
+        db.execute(
+            r#"{"Operation":"CreateTable","Params":{"TableName":"dbfree_test","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],"BillingMode":"PAY_PER_REQUEST"}}"#,
+            10,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create: {e}"));
+        db.execute(
+            r#"{"Operation":"PutItem","Params":{"TableName":"dbfree_test","Item":{"pk":{"S":"a"},"city":{"S":"Berlin"},"n":{"N":"1"}}}}"#,
+            10,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("put a: {e}"));
+        db.execute(
+            r#"{"Operation":"PutItem","Params":{"TableName":"dbfree_test","Item":{"pk":{"S":"b"},"city":{"S":"Paris"},"n":{"N":"2"}}}}"#,
+            10,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("put b: {e}"));
+
+        let catalog = db.catalog().await.unwrap_or_else(|e| panic!("catalog: {e}"));
+        assert!(catalog.schemas.iter().any(|s| s.tables.iter().any(|t| t.name == "dbfree_test")), "{catalog:?}");
+        let table = TableRef { schema: None, name: "dbfree_test".into() };
+        let cols = db.columns(&table).await.unwrap_or_else(|e| panic!("columns: {e}"));
+        assert!(cols.first().map(|c| c.name == "pk" && c.primary_key).unwrap_or(false), "{cols:?}");
+        assert!(cols.iter().any(|c| c.name == "city"), "{cols:?}");
+        let page = db
+            .fetch_page(&table, &PageQuery { sort: vec![], filters: vec![], offset: 0, limit: 10 })
+            .await
+            .unwrap_or_else(|e| panic!("page: {e}"));
+        assert_eq!(page.rows.len(), 2, "{page:?}");
+        let filters = vec![FilterRule { column: "city".into(), op: FilterOp::Eq, value: "Paris".into() }];
+        assert_eq!(db.count(&table, &filters).await.unwrap_or_default(), 1);
+        let rows = db
+            .execute("SELECT * FROM \"dbfree_test\" WHERE pk = 'a'", 10)
+            .await
+            .unwrap_or_else(|e| panic!("partiql: {e}"));
+        match rows.first() {
+            Some(StatementResult::Rows { result }) => assert_eq!(result.rows.len(), 1, "{result:?}"),
+            other => panic!("expected rows, got {other:?}"),
+        }
+        let _ = db.execute(r#"{"Operation":"DeleteTable","Params":{"TableName":"dbfree_test"}}"#, 10).await;
+        db.close().await;
+    }
+
 }

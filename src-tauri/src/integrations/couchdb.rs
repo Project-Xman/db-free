@@ -479,6 +479,7 @@ pub fn split_blank_lines(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ConnectionSummary, Environment, SslMode};
 
     #[test]
     fn selector_maps_operators() {
@@ -521,4 +522,73 @@ mod tests {
         assert_eq!(view_parts("documents"), None);
         assert_eq!(encode_path_segment("a b/c"), "a%20b%2Fc");
     }
+
+    fn live_conn(url: String) -> ResolvedConnection {
+        ResolvedConnection {
+            summary: ConnectionSummary {
+                id: "t".into(),
+                name: "t".into(),
+                engine: Engine::Couchdb,
+                environment: Environment::Local,
+                read_only: false,
+                host: Some(url),
+                port: None,
+                database: Some("dbfree_test".into()),
+                username: std::env::var("DBFREE_TEST_COUCHDB_USER").ok(),
+                file_path: None,
+                ssl_mode: SslMode::Prefer,
+                has_secret: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+            secret: std::env::var("DBFREE_TEST_COUCHDB_PASSWORD").ok(),
+        }
+    }
+
+    // Runs only when DBFREE_TEST_COUCHDB_URL is set (with _USER and _PASSWORD):
+    // `docker run --rm -d -p 5984:5984 -e COUCHDB_USER=admin -e COUCHDB_PASSWORD=pw couchdb:3`.
+    #[tokio::test]
+    async fn live_round_trip_when_configured() {
+        let Ok(url) = std::env::var("DBFREE_TEST_COUCHDB_URL") else {
+            return;
+        };
+        let resolved = live_conn(url);
+        // The database must exist before `connect` can attach to it.
+        let boot = HttpClient::from_connection(&resolved, Some(5984), false, HttpClient::auth_from_connection(&resolved))
+            .unwrap_or_else(|e| panic!("client: {e}"));
+        let _ = boot.send(boot.request(Method::PUT, "/dbfree_test")).await;
+        let db = connect(&resolved).await.unwrap_or_else(|e| panic!("connect: {e}"));
+        let version = db.server_version().await.unwrap_or_default().unwrap_or_default();
+        assert!(version.to_lowercase().contains("couchdb"), "{version}");
+        db.execute(r#"{"method":"PUT","path":"/dbfree_test/doc1","body":{"city":"Berlin","n":1}}"#, 10)
+            .await
+            .unwrap_or_else(|e| panic!("put doc1: {e}"));
+        db.execute(r#"{"method":"PUT","path":"/dbfree_test/doc2","body":{"city":"Paris","n":2}}"#, 10)
+            .await
+            .unwrap_or_else(|e| panic!("put doc2: {e}"));
+
+        let catalog = db.catalog().await.unwrap_or_else(|e| panic!("catalog: {e}"));
+        assert!(catalog.schemas.iter().any(|s| s.tables.iter().any(|t| t.name == "documents")));
+        let table = TableRef { schema: Some("dbfree_test".into()), name: "documents".into() };
+        let cols = db.columns(&table).await.unwrap_or_else(|e| panic!("columns: {e}"));
+        assert!(cols.iter().any(|c| c.name == "_id" && c.primary_key), "{cols:?}");
+        assert!(cols.iter().any(|c| c.name == "city"), "{cols:?}");
+        let page = db
+            .fetch_page(&table, &PageQuery { sort: vec![], filters: vec![], offset: 0, limit: 10 })
+            .await
+            .unwrap_or_else(|e| panic!("page: {e}"));
+        assert!(page.rows.len() >= 2, "{page:?}");
+        assert!(db.count(&table, &[]).await.unwrap_or_default() >= 2);
+        let found = db
+            .execute(r#"{"selector":{"city":"Paris"}}"#, 10)
+            .await
+            .unwrap_or_else(|e| panic!("find: {e}"));
+        match found.first() {
+            Some(StatementResult::Rows { result }) => assert_eq!(result.rows.len(), 1, "{result:?}"),
+            other => panic!("expected rows, got {other:?}"),
+        }
+        let _ = db.execute(r#"{"method":"DELETE","path":"/dbfree_test"}"#, 10).await;
+        db.close().await;
+    }
+
 }

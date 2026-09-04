@@ -513,6 +513,7 @@ impl Integration for SparqlIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ConnectionSummary, Environment, SslMode};
 
     #[test]
     fn endpoints_per_engine() {
@@ -596,4 +597,68 @@ mod tests {
         assert_eq!(local_name("http://xmlns.com/foaf/0.1/name"), "name");
         assert_eq!(local_name("http://ex#Age"), "Age");
     }
+
+    // Runs only when DBFREE_TEST_SPARQL_URL is set:
+    // `docker run --rm -d -p 3030:3030 -e ADMIN_PASSWORD=pw stain/jena-fuseki`
+    // (create the dataset first, or set _DATASET to an existing one).
+    #[tokio::test]
+    async fn live_round_trip_when_configured() {
+        let Ok(url) = std::env::var("DBFREE_TEST_SPARQL_URL") else {
+            return;
+        };
+        let resolved = ResolvedConnection {
+            summary: ConnectionSummary {
+                id: "t".into(),
+                name: "t".into(),
+                engine: Engine::ApacheJena,
+                environment: Environment::Local,
+                read_only: false,
+                host: Some(url),
+                port: None,
+                database: Some(std::env::var("DBFREE_TEST_SPARQL_DATASET").unwrap_or_else(|_| "ds".into())),
+                username: std::env::var("DBFREE_TEST_SPARQL_USER").ok(),
+                file_path: None,
+                ssl_mode: SslMode::Prefer,
+                has_secret: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+            secret: std::env::var("DBFREE_TEST_SPARQL_PASSWORD").ok(),
+        };
+        let db = connect(&resolved).await.unwrap_or_else(|e| panic!("connect: {e}"));
+        db.execute(
+            "INSERT DATA { <http://ex/a> <http://ex/name> \"Ada\" ; a <http://ex/Person> . <http://ex/b> <http://ex/name> \"Bob\" ; a <http://ex/Person> . }",
+            10,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("insert: {e}"));
+
+        let catalog = db.catalog().await.unwrap_or_else(|e| panic!("catalog: {e}"));
+        assert!(!catalog.schemas.is_empty(), "{catalog:?}");
+        let table = TableRef { schema: Some("graphs".into()), name: "default".into() };
+        let cols = db.columns(&table).await.unwrap_or_else(|e| panic!("columns: {e}"));
+        assert!(cols.iter().any(|c| c.name == "subject"), "{cols:?}");
+        let page = db
+            .fetch_page(&table, &PageQuery { sort: vec![], filters: vec![], offset: 0, limit: 20 })
+            .await
+            .unwrap_or_else(|e| panic!("page: {e}"));
+        assert!(page.rows.len() >= 4, "{page:?}");
+        assert!(db.count(&table, &[]).await.unwrap_or_default() >= 4);
+        let rows = db
+            .execute("SELECT ?s WHERE { ?s a <http://ex/Person> }", 10)
+            .await
+            .unwrap_or_else(|e| panic!("select: {e}"));
+        match rows.first() {
+            Some(StatementResult::Rows { result }) => assert_eq!(result.rows.len(), 2, "{result:?}"),
+            other => panic!("expected rows, got {other:?}"),
+        }
+        let ask = db.execute("ASK { <http://ex/a> ?p ?o }", 10).await.unwrap_or_else(|e| panic!("ask: {e}"));
+        match ask.first() {
+            Some(StatementResult::Rows { result }) => assert_eq!(result.rows[0][0], Value::Bool(true), "{result:?}"),
+            other => panic!("expected rows, got {other:?}"),
+        }
+        let _ = db.execute("DELETE WHERE { ?s ?p ?o }", 10).await;
+        db.close().await;
+    }
+
 }

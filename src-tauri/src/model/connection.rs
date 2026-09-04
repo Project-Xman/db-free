@@ -657,7 +657,8 @@ impl Engine {
             Engine::Surrealdb => Some(8000),
             Engine::Orientdb => Some(2480),
             Engine::Druid => Some(8888),
-            Engine::Immudb => Some(3322),
+            // immudb's HTTP web-api port (3322 is gRPC, which this adapter does not speak).
+            Engine::Immudb => Some(8080),
             Engine::Kafka | Engine::Redpanda => Some(9092),
             Engine::Objectdb => Some(6136),
             Engine::Basex => Some(8984),
