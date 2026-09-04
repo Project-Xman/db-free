@@ -1,7 +1,6 @@
 // SOT: form-fields, text-field, select-field, toggle-field, segmented-control, checkbox-field, datetime-field, number-input
 import type { ReactNode } from "react";
 import {
-  Button,
   Calendar,
   Checkbox as HeroCheckbox,
   DateField,
@@ -115,7 +114,14 @@ export function AppSelect<T extends string>({ value, options, onChange, label, a
         )}
       >
         {icon === undefined && current?.leading ? <span className="flex shrink-0 items-center">{current.leading}</span> : leading ? <Icon name={leading} size={plain ? 12 : 14} className="shrink-0 text-accent" /> : null}
-        <Select.Value className={cn("min-w-0 truncate text-left leading-normal", plain ? "max-w-[150px]" : "flex-1")} />
+        {/* Select.Value renders the whole selected ListBox.Item by default, so an
+            option with a leading logo would draw it a second time next to the one
+            the trigger already shows. Render just the label in that case. */}
+        <Select.Value className={cn("min-w-0 truncate text-left leading-normal", plain ? "max-w-[150px]" : "flex-1")}>
+          {({ defaultChildren, isPlaceholder, state }) =>
+            isPlaceholder || state.selectedItems.length === 0 ? defaultChildren : (current?.label ?? defaultChildren)
+          }
+        </Select.Value>
         <Icon name="chevron-down" size={12} className="shrink-0 text-muted" />
       </Select.Trigger>
       <Select.Popover>
@@ -141,23 +147,22 @@ interface ToggleProps {
 }
 
 export function Toggle({ checked, onChange, label, description }: ToggleProps) {
+  // WHAT:  HeroUI's own anatomy: the control and the label live inside
+  //        Switch.Content, with Description as a sibling.
+  // WHY:   Rendering the label in a separate Button next to the Switch made the
+  //        thumb overlap the text, and clicking the label did nothing for
+  //        screen readers. Switch.Content is already the click target.
+  // WHERE: https://heroui.com/docs/react/components/switch (with-description)
   return (
-    <div className={cn("flex gap-3", description ? "items-start" : "items-center")}>
-      <Switch isSelected={checked} onChange={onChange} aria-label={label.length > 0 ? label : "toggle"} className={description ? "mt-0.5" : ""}>
-        {/* Switch.Content is the interactive react-aria SwitchButton; Control alone renders a dead pill. */}
-        <Switch.Content>
-          <Switch.Control>
-            <Switch.Thumb />
-          </Switch.Control>
-        </Switch.Content>
-      </Switch>
-      {label.length > 0 || description ? (
-        <Button variant="ghost" size="sm" onPress={() => onChange(!checked)} className="h-auto min-w-0 p-0 text-left bg-transparent hover:bg-transparent font-normal">
-          {label.length > 0 ? <span className="block text-[13px] text-foreground">{label}</span> : null}
-          {description ? <span className="block text-xs text-muted">{description}</span> : null}
-        </Button>
-      ) : null}
-    </div>
+    <Switch isSelected={checked} onChange={onChange} aria-label={label.length > 0 ? label : "toggle"} className="w-full">
+      <Switch.Content className="flex items-center gap-3">
+        <Switch.Control>
+          <Switch.Thumb />
+        </Switch.Control>
+        {label.length > 0 ? <span className="text-[13px] text-foreground">{label}</span> : null}
+      </Switch.Content>
+      {description ? <Description className="text-xs text-muted">{description}</Description> : null}
+    </Switch>
   );
 }
 

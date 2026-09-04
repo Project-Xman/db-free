@@ -31,15 +31,15 @@ export function IconRail() {
   const inWorkspace = page.kind === "workspace";
 
   return (
-    <nav className="flex w-14 shrink-0 flex-col items-center glass-dock pb-3" aria-label="Primary">
+    <nav className="flex w-11 shrink-0 flex-col items-center glass-dock pb-2.5" aria-label="Primary">
       <div className={cn("drag-region w-full shrink-0", isMac() ? "h-11" : "h-3")} data-tauri-drag-region />
       <Button
         isIconOnly
         onPress={() => setPaletteOpen(true)}
-        className="group mb-3 flex size-9 min-w-9 items-center justify-center rounded-xl bg-accent text-accent-foreground shadow-md shadow-accent/25 liquid-hover hover:scale-105"
+        className="group mb-2.5 flex size-8 min-w-8 items-center justify-center rounded-lg bg-accent text-accent-foreground shadow-md shadow-accent/25 liquid-hover hover:scale-105"
         aria-label="Command palette (⌘K)"
       >
-        <Icon name="database" size={17} />
+        <Icon name="database" size={16} />
       </Button>
       <div className="flex flex-col items-center gap-1.5">
         <IconButton
@@ -49,7 +49,7 @@ export function IconRail() {
           onPress={goConnections}
           size={16}
         />
-        <Separator className="my-1.5 w-6 opacity-40" />
+        <Separator className="my-1.5 w-5 opacity-40" />
         {SIDEBARS.map((s) => (
           <IconButton
             key={s.mode}
@@ -61,7 +61,7 @@ export function IconRail() {
             size={16}
           />
         ))}
-        <Separator className="my-1.5 w-6 opacity-40" />
+        <Separator className="my-1.5 w-5 opacity-40" />
         <IconButton icon="history" label="Query history" isDisabled={!connected} onPress={() => activeId && openHistory(activeId)} size={16} />
         <IconButton icon="download" label="Export / Import" isDisabled={!connected} onPress={() => activeId && openTransfer(activeId)} size={16} />
         <IconButton icon="braces" label="Chat with database" isDisabled={!connected} onPress={() => activeId && openChat(activeId)} size={16} />
