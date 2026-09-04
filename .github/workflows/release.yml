@@ -9,6 +9,9 @@
 #        native runner rather than cross-compiling: webkit2gtk and the bundled C
 #        dependencies (librocksdb-sys via bindgen, aws-lc-sys via cmake) are painful
 #        to cross-build, and GitHub now publishes arm64 runners for Linux and Windows.
+#        Every platform exports LIBCLANG_PATH here rather than in src-tauri/.cargo/
+#        config.toml: a cargo [env] entry is host-agnostic and would point Linux at
+#        a macOS path.
 #        macOS stays a single universal bundle because one .dmg then runs on both
 #        Apple Silicon and Intel — two separate mac bundles would be strictly worse
 #        for users and double the mac build time.
@@ -37,7 +40,13 @@ jobs:
         with: { node-version: 22, cache: pnpm }
       - uses: dtolnay/rust-toolchain@stable
       # libclang: librocksdb-sys runs bindgen at build time. cmake: aws-lc-sys (scylla TLS).
-      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev pkg-config libclang-dev clang cmake
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev pkg-config libclang-dev clang cmake
+          lib=$(ls /usr/lib/llvm-*/lib/libclang.so* /usr/lib/*/libclang*.so* 2>/dev/null | head -n1)
+          test -n "$lib" || { echo "libclang not found after install"; exit 1; }
+          echo "LIBCLANG_PATH=$(dirname "$lib")" >> "$GITHUB_ENV"
       - uses: swatinem/rust-cache@v2
         with: { workspaces: src-tauri }
       - run: pnpm install --frozen-lockfile
@@ -84,7 +93,13 @@ jobs:
           targets: ${{ matrix.family == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - if: matrix.family == 'linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev pkg-config libclang-dev clang cmake
+        name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev pkg-config libclang-dev clang cmake
+          lib=$(ls /usr/lib/llvm-*/lib/libclang.so* /usr/lib/*/libclang*.so* 2>/dev/null | head -n1)
+          test -n "$lib" || { echo "libclang not found after install"; exit 1; }
+          echo "LIBCLANG_PATH=$(dirname "$lib")" >> "$GITHUB_ENV"
       - if: matrix.family == 'windows'
         run: choco install -y llvm cmake --installargs 'ADD_CMAKE_TO_PATH=System'
       - if: matrix.family == 'macos'
