@@ -8,6 +8,7 @@ pub mod query;
 pub mod schema;
 pub mod settings;
 pub mod transfer;
+pub mod update;
 pub mod value;
 
 pub use connection::{
@@ -33,3 +34,4 @@ pub use settings::{AiProvider, AiSettings, AppSettings, ExecutionMode, RunScope}
 pub use transfer::{AiReply, ExportReport, ExportedFile, ImportReport, PlanReport, TransferFormat};
 pub use schema::{ColumnInfo, ForeignKey, SchemaCatalog, SchemaInfo, TableInfo, TableKind, TableRef};
 pub use value::Value;
+pub use update::UpdateStatus;

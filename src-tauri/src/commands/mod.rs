@@ -13,6 +13,7 @@ pub mod query;
 pub mod schema;
 pub mod settings;
 pub mod transfer;
+pub mod updates;
 pub mod workflows;
 
 // WHAT:  Every IPC command name, as one enum.
@@ -66,10 +67,12 @@ pub enum CommandName {
     SearchDocuments,
     QueryRange,
     LoadHistory,
+    CheckUpdate,
+    InstallUpdate,
 }
 
 impl CommandName {
-    pub const ALL: [CommandName; 41] = [
+    pub const ALL: [CommandName; 43] = [
         CommandName::ListConnections,
         CommandName::SaveConnection,
         CommandName::DeleteConnection,
@@ -111,6 +114,8 @@ impl CommandName {
         CommandName::SearchDocuments,
         CommandName::QueryRange,
         CommandName::LoadHistory,
+        CommandName::CheckUpdate,
+        CommandName::InstallUpdate,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -156,6 +161,8 @@ impl CommandName {
             CommandName::SearchDocuments => "search_documents",
             CommandName::QueryRange => "query_range",
             CommandName::LoadHistory => "load_history",
+            CommandName::CheckUpdate => "check_update",
+            CommandName::InstallUpdate => "install_update",
         }
     }
 }
@@ -217,6 +224,7 @@ mod tests {
             | CommandName::SearchDocuments
             | CommandName::QueryRange
             | CommandName::LoadHistory => "objects",
+            CommandName::CheckUpdate | CommandName::InstallUpdate => "updates",
         }
     }
 }

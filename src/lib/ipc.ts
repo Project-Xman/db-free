@@ -53,6 +53,7 @@ import type {
   SessionRequest,
   TablePage,
   TablePageRequest,
+  UpdateStatus,
   VectorSearchCommand,
   WorkflowRunReport,
 } from "./bindings";
@@ -106,6 +107,8 @@ interface CommandMap {
   search_documents: { req: SearchCommand; res: SearchResult };
   query_range: { req: RangeQueryCommand; res: RangeResult };
   load_history: { req: ObjectRequest; res: ResultSet };
+  check_update: { req: undefined; res: UpdateStatus };
+  install_update: { req: undefined; res: null };
 }
 
 type MissingFromMap = Exclude<CommandName, keyof CommandMap>;
