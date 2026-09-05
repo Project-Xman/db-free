@@ -13,7 +13,7 @@ export function ToolShell({ tool, right, children }: { tool: Tool; right?: React
   const meta = toolMeta(tool);
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border/40 glass-header px-3">
+      <div className="flex app-toolbar shrink-0 items-center gap-2 border-b border-border/40 glass-header ">
         <Icon name={meta.icon} size={15} className="text-accent" />
         <span className="text-sm font-semibold tracking-tight text-foreground">{meta.label}</span>
         <Chip size="sm" variant="soft" className="hidden text-[10px] text-muted md:inline-flex">

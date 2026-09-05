@@ -17,12 +17,22 @@ import { SqlEditor } from "./SqlEditor";
 import { ResultsPane } from "./ResultsPane";
 import { HistoryPanel } from "./HistoryPanel";
 
+/// Per-tab row cap. The default comes from Settings -> Max query rows, so the
+/// app-wide answer is set once and a single tab can still override it.
 const ROW_CAPS = [
   { value: "500", label: "500 rows" },
   { value: "1000", label: "1,000 rows" },
   { value: "5000", label: "5,000 rows" },
+  { value: "10000", label: "10,000 rows" },
   { value: "20000", label: "20,000 rows" },
+  { value: "50000", label: "50,000 rows" },
+  { value: "100000", label: "100,000 rows" },
 ] satisfies readonly { value: string; label: string }[];
+
+function defaultRowCap(max: number | undefined): (typeof ROW_CAPS)[number]["value"] {
+  const wanted = String(max ?? 1000);
+  return ROW_CAPS.find((c) => c.value === wanted)?.value ?? "1000";
+}
 
 interface QueryPaneProps {
   connection: ConnectionSummary;
@@ -50,7 +60,7 @@ export function QueryPane({ connection, tabId, seedSql }: QueryPaneProps) {
   const [loaded, setLoaded] = useState(false);
   const [running, setRunning] = useState(false);
   const [outcome, setOutcome] = useState<QueryOutcome | null>(null);
-  const [rowCap, setRowCap] = useState<(typeof ROW_CAPS)[number]["value"]>("1000");
+  const [rowCap, setRowCap] = useState<(typeof ROW_CAPS)[number]["value"]>(() => defaultRowCap(settings?.maxQueryRows));
   const [confirm, setConfirm] = useState<{ statements: string[] } | null>(null);
   const [historyKey, setHistoryKey] = useState(0);
   const [showHistory, setShowHistory] = useState(false);
@@ -247,7 +257,7 @@ export function QueryPane({ connection, tabId, seedSql }: QueryPaneProps) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border/40 glass-header px-3">
+      <div className="flex app-toolbar shrink-0 items-center gap-2 border-b border-border/40 glass-header ">
         <Button
           size="sm"
           isPending={running}

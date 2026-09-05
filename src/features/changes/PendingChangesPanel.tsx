@@ -98,7 +98,7 @@ export function PendingChangesPanel({ connectionId }: { connectionId: string }) 
   return (
     <aside className="relative flex shrink-0 flex-col glass-sidebar select-none" style={{ width }}>
       <Resizer direction="horizontal" onResize={handleResize} className="absolute -left-1 top-0 bottom-0" />
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border/40 glass-header px-3">
+      <div className="flex app-toolbar shrink-0 items-center gap-2 border-b border-border/40 glass-header ">
         <span className="text-sm font-semibold text-foreground tracking-tight">Pending Changes</span>
         <span className="ml-auto">
           <CloseButton onPress={() => setOpen(false)} aria-label="Hide panel" />

@@ -232,7 +232,7 @@ export function ChatTab({ connectionId }: { connectionId: string }) {
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col bg-background select-none">
       {/* Header bar */}
-      <div className="flex h-11 shrink-0 items-center justify-between border-b border-border/40 glass-header px-4">
+      <div className="flex app-toolbar shrink-0 items-center justify-between border-b border-border/40 glass-header ">
         <div className="flex items-center gap-2">
           <div className="flex size-6 items-center justify-center rounded-lg bg-accent/15 text-accent">
             <Icon name="braces" size={13} />

@@ -51,7 +51,7 @@ export function TablesPanel() {
 
   return (
     <aside className="flex h-full w-full min-w-0 flex-col glass-sidebar select-none">
-      <div className="drag-region flex h-11 shrink-0 items-center gap-1.5 px-3 border-b border-border/40" data-tauri-drag-region>
+      <div className="drag-region flex h-11 app-pad-x shrink-0 items-center gap-1.5 border-b border-border/40" data-tauri-drag-region>
         <ConnectionSwitcher caption={collectionNoun(connection.engine)} />
         {connection.readOnly ? <EnvBadge environment="none" readOnly /> : null}
         <div className="drag-region h-full min-w-4 flex-1" data-tauri-drag-region />
@@ -163,19 +163,47 @@ function TableRow({ connectionId, table, menu, engine }: { connectionId: string;
   const showError = useWorkspace((s) => s.showError);
   const showInfo = useWorkspace((s) => s.showInfo);
   const [expanded, setExpanded] = useState(false);
+  const columnPreview = useWorkspace((s) => s.settings?.columnPreview ?? true);
   const qualified = table.schema === null ? table.name : `${table.schema}.${table.name}`;
   const speaksSql = engineMeta(engine).commandLanguage === "SQL";
 
   const entries: MenuEntry[] = [
     { id: "open", label: `Open ${table.kind === "view" ? "view" : "table"}`, icon: "table" },
-    { id: "columns", label: expanded ? "Collapse columns" : "Show columns", icon: "columns" },
-    { id: "select", label: "Query this table", icon: "terminal", group: "query", disabled: !speaksSql },
+    { id: "columns", label: expanded ? "Collapse columns" : "Show columns", icon: "columns", disabled: !columnPreview },
+    { id: "select", label: "Open in SQL editor", icon: "terminal", group: "query", disabled: !speaksSql },
     { id: "count", label: "Count rows", icon: "hash", group: "query", disabled: !speaksSql },
+    { id: "duplicate", label: "Duplicate table…", icon: "copy", group: "query", disabled: !speaksSql },
     { id: "export", label: "Export / import…", icon: "download", group: "query" },
     { id: "copy-name", label: "Copy name", icon: "copy", group: "copy" },
     { id: "copy-qualified", label: "Copy qualified name", icon: "copy", group: "copy", disabled: table.schema === null },
+    { id: "copy-schema", label: "Copy table schema", icon: "braces", group: "copy" },
     { id: "refresh", label: "Refresh schema", icon: "refresh", group: "copy" },
+    // Destructive statements are seeded into a query tab rather than run: the
+    // guard's confirmation still applies, and the user sees what will run.
+    { id: "empty", label: "Empty table…", icon: "trash", danger: true, group: "danger", disabled: !speaksSql },
+    { id: "drop", label: "Delete table…", icon: "trash", danger: true, group: "danger", disabled: !speaksSql },
   ];
+
+  // WHAT:  The table's columns as a CREATE TABLE sketch, for pasting into a
+  //        migration or another editor.
+  const copySchema = async () => {
+    let list = columns;
+    if (!list) {
+      try {
+        await loadColumns(connectionId, ref);
+      } catch (raw) {
+        showError(normalizeError(raw));
+        return;
+      }
+      list = useWorkspace.getState().columnsCache[`${connectionId}:${key}`];
+    }
+    if (!list) return;
+    const body = list
+      .map((c) => `  ${c.name} ${c.dataType}${c.nullable ? "" : " NOT NULL"}${c.primaryKey ? " PRIMARY KEY" : ""}`)
+      .join(",\n");
+    await navigator.clipboard.writeText(`CREATE TABLE ${qualified} (\n${body}\n);`);
+    showInfo("Table schema copied.");
+  };
 
   const onMenu = (event: ReactMouseEvent) =>
     menu.open(event, entries, (action) => {
@@ -183,7 +211,11 @@ function TableRow({ connectionId, table, menu, engine }: { connectionId: string;
       else if (action === "columns") toggle();
       else if (action === "select") openQuery(connectionId, `SELECT *\nFROM ${qualified}\nLIMIT 100;`, table.name);
       else if (action === "count") openQuery(connectionId, `SELECT count(*) FROM ${qualified};`, `count ${table.name}`);
+      else if (action === "duplicate") openQuery(connectionId, `CREATE TABLE ${qualified}_copy AS\nSELECT * FROM ${qualified};`, `copy ${table.name}`);
       else if (action === "export") openTransfer(connectionId);
+      else if (action === "copy-schema") void copySchema();
+      else if (action === "empty") openQuery(connectionId, `TRUNCATE TABLE ${qualified};`, `empty ${table.name}`);
+      else if (action === "drop") openQuery(connectionId, `DROP TABLE ${qualified};`, `drop ${table.name}`);
       else if (action === "copy-name") { void navigator.clipboard.writeText(table.name); showInfo("Table name copied."); }
       else if (action === "copy-qualified") { void navigator.clipboard.writeText(qualified); showInfo("Qualified name copied."); }
       else if (action === "refresh") void loadCatalog(connectionId);
@@ -213,9 +245,11 @@ function TableRow({ connectionId, table, menu, engine }: { connectionId: string;
         title={table.kind === "view" ? "view" : "table"}
         onContextMenu={onMenu}
       >
-        <Button isIconOnly variant="ghost" size="sm" aria-label={expanded ? "Collapse columns" : "Expand columns"} onPress={toggle} className="size-4.5 min-w-4.5 rounded-sm text-muted">
-          <Icon name={expanded ? "chevron-down" : "chevron-right"} size={11} />
-        </Button>
+        {columnPreview ? (
+          <Button isIconOnly variant="ghost" size="sm" aria-label={expanded ? "Collapse columns" : "Expand columns"} onPress={toggle} className="size-4.5 min-w-4.5 rounded-sm text-muted">
+            <Icon name={expanded ? "chevron-down" : "chevron-right"} size={11} />
+          </Button>
+        ) : null}
         <Button
           variant="ghost"
           size="sm"
@@ -231,7 +265,7 @@ function TableRow({ connectionId, table, menu, engine }: { connectionId: string;
           ) : null}
         </Button>
       </div>
-      {expanded ? <ColumnList columns={columns} menu={menu} /> : null}
+      {expanded && columnPreview ? <ColumnList columns={columns} menu={menu} /> : null}
     </div>
   );
 }

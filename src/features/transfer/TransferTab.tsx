@@ -105,7 +105,7 @@ export function TransferTab({ connectionId }: { connectionId: string }) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-11 shrink-0 items-center gap-3 border-b border-border bg-surface px-2">
+      <div className="flex app-toolbar shrink-0 items-center gap-3 border-b border-border bg-surface ">
         <Segmented label="Transfer mode" value={mode} onChange={setMode} options={[{ value: "export", label: "Export" }, { value: "import", label: "Import" }]} />
         {mode === "export" ? (
           <>

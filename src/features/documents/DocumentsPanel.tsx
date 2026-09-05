@@ -61,7 +61,7 @@ export function DocumentsPanel({ kind }: { kind: DocumentKind }) {
 
   return (
     <aside className="flex h-full w-full min-w-0 flex-col glass-sidebar select-none">
-      <div className="drag-region flex h-11 shrink-0 items-center gap-1.5 px-3 border-b border-border/40" data-tauri-drag-region>
+      <div className="drag-region flex h-11 app-pad-x shrink-0 items-center gap-1.5 border-b border-border/40" data-tauri-drag-region>
         <ConnectionSwitcher caption={meta.title} />
         <div className="drag-region h-full min-w-4 flex-1" data-tauri-drag-region />
         <span className="flex items-center gap-0.5">

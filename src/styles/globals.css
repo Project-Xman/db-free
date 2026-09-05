@@ -88,6 +88,31 @@
     --tooltip-delay: 400ms;
   }
 
+  /* Density: one setting, three sizes of chrome. The window drag strip stays
+     44px at every density because the macOS traffic lights are positioned
+     against it in tauri.conf.json. */
+  :root {
+    --toolbar-h: 2.75rem;
+    --panel-pad-x: 0.75rem;
+    --panel-pad-y: 0.5rem;
+    --row-h: 1.875rem;
+    --stack-gap: 0.375rem;
+  }
+  :root[data-density="compact"] {
+    --toolbar-h: 2.25rem;
+    --panel-pad-x: 0.5rem;
+    --panel-pad-y: 0.25rem;
+    --row-h: 1.625rem;
+    --stack-gap: 0.125rem;
+  }
+  :root[data-density="comfortable"] {
+    --toolbar-h: 3.25rem;
+    --panel-pad-x: 1rem;
+    --panel-pad-y: 0.75rem;
+    --row-h: 2.25rem;
+    --stack-gap: 0.5rem;
+  }
+
   html,
   body,
   #root {
@@ -114,6 +139,28 @@
   .selectable {
     user-select: text;
   }
+}
+
+@utility app-toolbar {
+  height: var(--toolbar-h);
+  padding-inline: var(--panel-pad-x);
+}
+
+@utility app-pad-x {
+  padding-inline: var(--panel-pad-x);
+}
+
+@utility app-pad {
+  padding-inline: var(--panel-pad-x);
+  padding-block: var(--panel-pad-y);
+}
+
+@utility app-row {
+  height: var(--row-h);
+}
+
+@utility app-stack {
+  gap: var(--stack-gap);
 }
 
 @utility grid-bg {

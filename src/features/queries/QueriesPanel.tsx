@@ -61,7 +61,7 @@ export function QueriesPanel() {
 
   return (
     <aside className="flex h-full w-full flex-col glass-sidebar select-none">
-      <div className="flex h-11 shrink-0 items-center justify-between border-b border-border/40 glass-header px-3">
+      <div className="flex app-toolbar shrink-0 items-center justify-between border-b border-border/40 glass-header ">
         <ConnectionSwitcher caption="Saved queries" />
         <span className="flex items-center gap-0.5">
           <IconButton icon="refresh" label="Refresh" onPress={() => void loadSavedQueries()} />

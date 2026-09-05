@@ -65,7 +65,7 @@ export function CapabilityMatrixPage() {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="drag-region flex h-11 shrink-0 items-center gap-2 border-b border-border/40 glass-header px-3" data-tauri-drag-region>
+      <div className="drag-region flex h-11 app-pad-x shrink-0 items-center gap-2 border-b border-border/40 glass-header " data-tauri-drag-region>
         <Button isIconOnly size="sm" variant="ghost" aria-label="Back to connections" onPress={goConnections} className="size-7 min-w-7 rounded-lg text-muted">
           <Icon name="arrow-left" size={14} />
         </Button>

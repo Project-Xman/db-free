@@ -94,7 +94,7 @@ export function KeyTab({ connectionId, table }: { connectionId: string; table: T
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border bg-surface px-2">
+      <div className="flex app-toolbar shrink-0 items-center gap-2 border-b border-border bg-surface ">
         <Button size="sm" onPress={save} isDisabled={readOnly || type !== "string" || !dirty}>
           <Icon name="check" size={12} />
           Save

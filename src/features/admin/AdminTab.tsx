@@ -41,7 +41,7 @@ export function AdminTab({ connectionId }: { connectionId: string }) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border/40 glass-header px-3">
+      <div className="flex app-toolbar shrink-0 items-center gap-2 border-b border-border/40 glass-header ">
         <Icon name="server" size={15} className="text-accent" />
         <span className="text-sm font-semibold tracking-tight text-foreground">Server</span>
         <Chip size="sm" variant="soft" className="font-mono text-[10px]">
