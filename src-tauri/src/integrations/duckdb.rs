@@ -1176,7 +1176,7 @@ fn collect_stats(conn: &Connection, database: &str) -> AppResult<ServerStats> {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { transactions: true, exact_estimate: false, namespaces: true, ..Capabilities::SQL },
+        capabilities: Capabilities { describes_fields: true, transactions: true, exact_estimate: false, namespaces: true, ..Capabilities::SQL },
         object_kinds: vec![K::Database, K::Schema, K::Table, K::View, K::Sequence, K::Type, K::Function, K::Macro, K::Index, K::Constraint, K::Extension, K::Setting],
         tools: vec![T::Stats, T::Erd],
     }

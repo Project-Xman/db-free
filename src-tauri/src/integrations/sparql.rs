@@ -891,7 +891,7 @@ impl SparqlIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { sql: false, namespaces: true, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: false, exact_estimate: true },
+        capabilities: Capabilities { describes_fields: true, sql: false, namespaces: true, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: false, exact_estimate: true },
         object_kinds: vec![K::Dataset, K::Graph, K::Prefix],
         tools: vec![T::Stats, T::GraphView],
     }

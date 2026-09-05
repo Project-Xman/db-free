@@ -183,7 +183,7 @@ impl PostgresIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { sql: true, namespaces: true, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: true, exact_estimate: false },
+        capabilities: Capabilities { describes_fields: true, sql: true, namespaces: true, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: true, exact_estimate: false },
         object_kinds: vec![K::Database, K::Schema, K::Table, K::View, K::MaterializedView, K::ForeignTable, K::Partition, K::Index, K::Constraint, K::Sequence, K::Type, K::Function, K::Procedure, K::Aggregate, K::Trigger, K::Rule, K::Policy, K::Extension, K::Publication, K::Subscription, K::ReplicationSlot, K::ForeignServer, K::ForeignDataWrapper, K::Role, K::Grant, K::Tablespace, K::Session, K::Lock, K::Replica, K::Setting, K::SlowQuery],
         tools: vec![T::Stats, T::Erd, T::VectorSearch],
     }

@@ -1240,7 +1240,7 @@ fn preview(query: &str, max: usize) -> String {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { transactions: false, exact_estimate: false, ..Capabilities::SQL },
+        capabilities: Capabilities { describes_fields: true, transactions: false, exact_estimate: false, ..Capabilities::SQL },
         object_kinds: vec![K::Database, K::Schema, K::Table, K::View, K::MaterializedView, K::Function, K::Procedure, K::Sequence, K::Stage, K::Stream, K::Task, K::Warehouse, K::Role, K::User, K::Grant, K::SlowQuery],
         tools: vec![T::Stats],
     }

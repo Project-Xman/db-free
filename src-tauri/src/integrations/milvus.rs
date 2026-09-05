@@ -895,7 +895,7 @@ impl MilvusIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities {
+        capabilities: Capabilities { describes_fields: true,
             sql: false,
             namespaces: true,
             fixed_columns: true,

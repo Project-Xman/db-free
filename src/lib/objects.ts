@@ -51,6 +51,7 @@ export const OBJECT_KINDS = {
   document: k("Document", "Documents", "file", "structure"),
   index: k("Index", "Indexes", "list", "structure"),
   constraint: k("Constraint", "Constraints", "shield", "structure"),
+  field: k("Field", "Fields", "columns", "structure"),
   sequence: k("Sequence", "Sequences", "hash", "structure"),
   type: k("Type", "Types", "swatch", "structure"),
   dictionary: k("Dictionary", "Dictionaries", "book", "structure"),

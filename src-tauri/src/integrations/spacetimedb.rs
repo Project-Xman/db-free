@@ -239,7 +239,7 @@ impl SpacetimeIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities {
+        capabilities: Capabilities { describes_fields: true,
             sql: true,
             // One flat table namespace per module: no schemas or databases.
             namespaces: false,

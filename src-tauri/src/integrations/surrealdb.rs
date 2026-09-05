@@ -875,7 +875,7 @@ impl SurrealIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { exact_estimate: true, ..Capabilities::DOCUMENT },
+        capabilities: Capabilities { describes_fields: true, exact_estimate: true, ..Capabilities::DOCUMENT },
         object_kinds: vec![K::Namespace, K::Database, K::Table, K::Index, K::Event, K::Function, K::Setting, K::User, K::Role],
         // RELATE edges carry in / out, which the graph view can draw.
         tools: vec![T::Stats, T::GraphView],

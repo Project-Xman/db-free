@@ -862,7 +862,7 @@ impl DynamoIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { namespaces: false, ..Capabilities::DOCUMENT },
+        capabilities: Capabilities { describes_fields: true, namespaces: false, ..Capabilities::DOCUMENT },
         object_kinds: vec![K::Table, K::Index, K::Stream, K::Backup],
         tools: vec![T::Stats],
     }

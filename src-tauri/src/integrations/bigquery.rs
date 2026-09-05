@@ -619,7 +619,7 @@ impl BigQueryIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { transactions: false, exact_estimate: false, ..Capabilities::SQL },
+        capabilities: Capabilities { describes_fields: true, transactions: false, exact_estimate: false, ..Capabilities::SQL },
         object_kinds: vec![K::Dataset, K::Table, K::View, K::MaterializedView, K::Function, K::Procedure, K::Job],
         tools: vec![T::Stats],
     }

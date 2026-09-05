@@ -1078,7 +1078,7 @@ impl CouchIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { views: true, ..Capabilities::DOCUMENT },
+        capabilities: Capabilities { describes_fields: true, views: true, ..Capabilities::DOCUMENT },
         object_kinds: vec![K::Database, K::Document, K::View, K::Index, K::Replica, K::Task, K::User, K::Node, K::Setting],
         tools: vec![T::Stats],
     }

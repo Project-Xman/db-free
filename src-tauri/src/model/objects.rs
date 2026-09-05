@@ -56,6 +56,8 @@ pub enum ObjectKind {
     Document,
     Index,
     Constraint,
+    /// One column / property / attribute of a table, collection or class.
+    Field,
     Sequence,
     Type,
     Dictionary,
@@ -114,7 +116,7 @@ pub enum ObjectKind {
 }
 
 impl ObjectKind {
-    pub const ALL: [ObjectKind; 80] = [
+    pub const ALL: [ObjectKind; 81] = [
         ObjectKind::Database,
         ObjectKind::Schema,
         ObjectKind::Keyspace,
@@ -143,6 +145,7 @@ impl ObjectKind {
         ObjectKind::Document,
         ObjectKind::Index,
         ObjectKind::Constraint,
+        ObjectKind::Field,
         ObjectKind::Sequence,
         ObjectKind::Type,
         ObjectKind::Dictionary,
@@ -213,6 +216,7 @@ impl ObjectKind {
                 | ObjectKind::EdgeCollection
                 | ObjectKind::Index
                 | ObjectKind::Constraint
+                | ObjectKind::Field
                 | ObjectKind::Sequence
                 | ObjectKind::Type
                 | ObjectKind::Function

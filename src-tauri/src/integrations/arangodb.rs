@@ -1329,7 +1329,7 @@ impl ArangoIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { views: true, exact_estimate: true, ..Capabilities::DOCUMENT },
+        capabilities: Capabilities { describes_fields: true, views: true, exact_estimate: true, ..Capabilities::DOCUMENT },
         object_kinds: vec![
             K::Database,
             K::Collection,

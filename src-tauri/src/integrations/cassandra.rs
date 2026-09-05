@@ -1682,7 +1682,7 @@ fn node_caption(set: &ResultSet, row: &[Value]) -> String {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { transactions: false, ..Capabilities::SQL },
+        capabilities: Capabilities { describes_fields: true, transactions: false, ..Capabilities::SQL },
         object_kinds: vec![K::Keyspace, K::Table, K::MaterializedView, K::Index, K::Type, K::Function, K::Aggregate, K::Role, K::Grant, K::Node, K::Setting],
         tools: vec![T::Stats, T::Erd],
     }
