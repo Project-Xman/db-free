@@ -47,6 +47,7 @@ export function App() {
   const ready = useWorkspace((s) => s.ready);
   const page = useWorkspace((s) => s.page);
   const settings = useWorkspace((s) => s.settings);
+  const density = useWorkspace((s) => s.density);
   const connection = useActiveConnection();
   const connected = useWorkspace((s) => (connection ? s.sessions.includes(connection.id) : false));
   const tab = useActiveTab();
@@ -62,6 +63,11 @@ export function App() {
   //        honour and hides the app's own context menus behind a second click.
   // HOW:   Capture phase, preventDefault only — propagation continues, so the
   //        React handlers that open the app's menus still run.
+  // Density drives the chrome's spacing tokens (globals.css), not just row height.
+  useEffect(() => {
+    document.documentElement.setAttribute("data-density", density);
+  }, [density]);
+
   useEffect(() => {
     const suppress = (event: MouseEvent) => event.preventDefault();
     document.addEventListener("contextmenu", suppress, { capture: true });

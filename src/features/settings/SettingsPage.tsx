@@ -96,7 +96,7 @@ function SettingsBody({ initial }: { initial: AppSettings }) {
 
   return (
     <div className="grid-bg relative flex h-full min-h-0 flex-1 flex-col">
-      <div className="drag-region flex h-11 shrink-0 items-center gap-2 px-4 border-b border-border/40 glass-header" data-tauri-drag-region>
+      <div className="drag-region flex h-11 app-pad-x shrink-0 items-center gap-2 border-b border-border/40 glass-header" data-tauri-drag-region>
         <Button variant="ghost" size="sm" onPress={goConnections} className="rounded-lg text-muted hover:bg-surface-secondary/70 hover:text-foreground liquid-hover">
           <Icon name="chevron-left" size={14} />
           Back
@@ -167,6 +167,15 @@ function SettingsBody({ initial }: { initial: AppSettings }) {
             {section === "grid" ? (
               <>
                 <h2 className="text-sm font-semibold text-foreground">Data Grid</h2>
+                <Row title="Alternating row colours" body="Zebra striping in every grid, for reading long rows across.">
+                  <Toggle checked={draft.alternatingRows} onChange={(v) => patch({ alternatingRows: v })} label="" />
+                </Row>
+                <Row title="Remember table sort and filter" body="Reopen each table with the sort and filters you last used, across restarts.">
+                  <Toggle checked={draft.rememberTableState} onChange={(v) => patch({ rememberTableState: v })} label="" />
+                </Row>
+                <Row title="Table column preview" body="Expandable column list under each table in the sidebar.">
+                  <Toggle checked={draft.columnPreview} onChange={(v) => patch({ columnPreview: v })} label="" />
+                </Row>
                 <Row title="NULL display" body="Text shown for NULL cells.">
                   <Field label="" value={draft.nullDisplay} onChange={(v) => patch({ nullDisplay: v })} className="w-32 [&_label]:hidden" mono />
                 </Row>
@@ -175,6 +184,21 @@ function SettingsBody({ initial }: { initial: AppSettings }) {
             {section === "editor" ? (
               <>
                 <h2 className="text-sm font-semibold text-foreground">Query Behaviour</h2>
+                <Row title="Max query rows" body="Caps how many rows a query in the editor returns. Larger results are trimmed to this limit to keep the app fast; the results banner says when that happened.">
+                  <AppSelect
+                    ariaLabel="Max query rows"
+                    value={String(draft.maxQueryRows)}
+                    options={[
+                      { value: "1000", label: "1,000 rows" },
+                      { value: "5000", label: "5,000 rows" },
+                      { value: "10000", label: "10,000 rows" },
+                      { value: "50000", label: "50,000 rows" },
+                      { value: "100000", label: "100,000 rows" },
+                    ]}
+                    onChange={(v) => patch({ maxQueryRows: Number(v) })}
+                    className="w-40"
+                  />
+                </Row>
                 <Row title="Show Results Pane When Running a Query" body="Automatically expand the SQL results pane when you run a query.">
                   <Toggle checked={draft.showResultsPane} onChange={(v) => patch({ showResultsPane: v })} label="" />
                 </Row>
@@ -394,6 +418,10 @@ function defaultSettings(): AppSettings {
     uiFontSize: 13,
     editorFontSize: 13,
     gridDensity: "cozy",
+    alternatingRows: true,
+    rememberTableState: true,
+    columnPreview: true,
+    maxQueryRows: 10_000,
     nullDisplay: "NULL",
     showResultsPane: true,
     condenseSqlWhenFormatting: false,

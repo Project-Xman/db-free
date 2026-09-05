@@ -105,7 +105,7 @@ export function ObjectTab({ connectionId, reference }: { connectionId: string; r
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border/40 glass-header px-3">
+      <div className="flex app-toolbar shrink-0 items-center gap-2 border-b border-border/40 glass-header ">
         <Icon name={meta.icon} size={15} className="shrink-0 text-accent" />
         <span className="truncate text-sm font-semibold tracking-tight text-foreground">{reference.name}</span>
         <Chip size="sm" variant="soft" className="font-mono text-[10px]">

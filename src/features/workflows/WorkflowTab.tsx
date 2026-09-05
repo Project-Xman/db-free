@@ -83,7 +83,7 @@ export function WorkflowTab({ document: doc }: { document: Document }) {
   return (
     <div className="flex h-full min-h-0">
       <div className="flex min-w-0 flex-1 flex-col">
-        <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border bg-surface px-2">
+        <div className="flex app-toolbar shrink-0 items-center gap-2 border-b border-border bg-surface ">
           <Input
             value={name}
             onChange={(e) => {

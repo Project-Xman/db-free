@@ -119,7 +119,7 @@ function ConnectionFormBody({ editing, preset, draft }: { editing: ConnectionSum
 
   return (
     <div className="grid-bg flex h-full min-h-0 flex-1 flex-col">
-      <div className="drag-region flex h-11 shrink-0 items-center gap-2 px-4 border-b border-border/40 glass-header" data-tauri-drag-region>
+      <div className="drag-region flex h-11 app-pad-x shrink-0 items-center gap-2 border-b border-border/40 glass-header" data-tauri-drag-region>
         <Button variant="ghost" size="sm" onPress={editing ? goConnections : goPicker} className="rounded-lg text-muted hover:bg-surface-secondary/70 hover:text-foreground liquid-hover">
           <Icon name="chevron-left" size={14} />
           Back

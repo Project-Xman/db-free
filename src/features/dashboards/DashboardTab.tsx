@@ -206,7 +206,7 @@ export function DashboardTab({ document: doc, connectionId: initialConnectionId 
   return (
     <div className="flex h-full min-h-0">
       <div className="flex min-w-0 flex-1 flex-col">
-        <ScrollShadow orientation="horizontal" hideScrollBar className="flex h-11 shrink-0 items-center gap-1 border-b border-border bg-surface px-2 whitespace-nowrap">
+        <ScrollShadow orientation="horizontal" hideScrollBar className="flex app-toolbar shrink-0 items-center gap-1 border-b border-border bg-surface whitespace-nowrap">
           <Input
             value={name}
             onChange={(e) => {

@@ -91,7 +91,7 @@ export function DesignerTab({ document: doc }: { document: Document }) {
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">
-      <div className="flex h-11 shrink-0 items-center gap-1 border-b border-border bg-surface px-2">
+      <div className="flex app-toolbar shrink-0 items-center gap-1 border-b border-border bg-surface ">
         <Input
           value={name}
           onChange={(e) => {

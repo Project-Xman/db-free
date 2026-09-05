@@ -103,7 +103,7 @@ export function CommandPalette() {
           <Modal.Dialog className="w-full sm:max-w-[620px] glass-modal rounded-2xl overflow-hidden shadow-2xl p-0 border border-border/60">
             <Modal.Body className="p-3">
               <SearchField value={query} onChange={setQuery} aria-label="Search or run commands" autoFocus className="w-full">
-                <SearchField.Group className="w-full glass-input rounded-xl bg-surface-secondary/40 px-3.5 h-11 border border-border/40">
+                <SearchField.Group className="w-full glass-input rounded-xl bg-surface-secondary/40 h-11 border border-border/40">
                   <SearchField.SearchIcon />
                   <SearchField.Input placeholder="Search commands, tables, queries…" className="w-full text-sm font-sans" />
                   <SearchField.ClearButton />

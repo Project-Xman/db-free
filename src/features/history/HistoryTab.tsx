@@ -77,7 +77,7 @@ export function HistoryTab({ connectionId }: { connectionId: string }) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border bg-surface px-2">
+      <div className="flex app-toolbar shrink-0 items-center gap-2 border-b border-border bg-surface ">
         <Segmented label="History filter" value={filter} onChange={setFilter} options={[{ value: "all", label: "All" }, { value: "system", label: "System" }, { value: "user", label: "User" }]} />
         <IconButton icon="trash" label="Clear history" onPress={() => void clear()} />
         <IconButton icon="refresh" label="Refresh" onPress={() => setRefresh((r) => r + 1)} />

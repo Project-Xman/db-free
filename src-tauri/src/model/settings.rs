@@ -70,6 +70,14 @@ pub struct AppSettings {
     pub ui_font_size: u8,
     pub editor_font_size: u8,
     pub grid_density: String,
+    /// Zebra striping in every grid.
+    pub alternating_rows: bool,
+    /// Reopen a table with the sort and filters it was last closed with.
+    pub remember_table_state: bool,
+    /// Expandable column list under each table in the sidebar.
+    pub column_preview: bool,
+    /// Ceiling on rows an editor query returns before the result is trimmed.
+    pub max_query_rows: u32,
     pub null_display: String,
     pub show_results_pane: bool,
     pub condense_sql_when_formatting: bool,
@@ -91,6 +99,10 @@ impl Default for AppSettings {
             ui_font_size: 13,
             editor_font_size: 13,
             grid_density: "cozy".to_string(),
+            alternating_rows: true,
+            remember_table_state: true,
+            column_preview: true,
+            max_query_rows: 10_000,
             null_display: "NULL".to_string(),
             show_results_pane: true,
             condense_sql_when_formatting: false,

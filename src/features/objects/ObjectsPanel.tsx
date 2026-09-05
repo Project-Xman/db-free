@@ -48,7 +48,7 @@ export function ObjectsPanel() {
 
   return (
     <aside className="flex h-full w-full min-w-0 flex-col glass-sidebar select-none">
-      <div className="drag-region flex h-11 shrink-0 items-center gap-1.5 border-b border-border/40 px-3" data-tauri-drag-region>
+      <div className="drag-region flex h-11 app-pad-x shrink-0 items-center gap-1.5 border-b border-border/40 " data-tauri-drag-region>
         <ConnectionSwitcher caption="Objects" />
         {connection.readOnly ? <EnvBadge environment="none" readOnly /> : null}
         <div className="drag-region h-full min-w-4 flex-1" data-tauri-drag-region />

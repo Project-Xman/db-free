@@ -1,15 +1,15 @@
 // SOT: table-tab, table-toolbar, page-based-browsing, sort-state, export-copy, row-inspector, inspector-collapse, insert-row-flow, delete-rows-flow, cell-edit-staging, foreign-key-traversal, staged-row-mapping
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button, Chip, CloseButton, Dropdown, Label, Modal, ScrollShadow, Separator, Tooltip } from "@heroui/react";
-import type { CellValue, ColumnInfo, FilterRule, ForeignKey, SortRule, StagedChange, TablePage, TableRef, Value } from "@/lib/bindings";
+import { Button, Chip, CloseButton, Dropdown, Label, Modal, Popover, ScrollShadow, SearchField, Separator, Tooltip } from "@heroui/react";
+import type { CellValue, ColumnInfo, FilterOp, FilterRule, ForeignKey, SortRule, StagedChange, TablePage, TableRef, Value } from "@/lib/bindings";
 import type { JsonValue } from "@/lib/bindings/serde_json/JsonValue";
 import { ipc, normalizeError } from "@/lib/ipc";
 import { DENSITIES, formatCell, formatCount } from "@/lib/format";
 import { engineMeta } from "@/lib/engines";
 import { tableKey, useWorkspace } from "@/stores/workspace";
 import { DataGrid, type GridColumn, type StagedCell } from "./DataGrid";
-import { FilterPopover } from "./FilterPopover";
-import { AppSelect } from "@/components/global/Field";
+import { FILTER_OPS, FilterPopover } from "./FilterPopover";
+import { AppSelect, Check } from "@/components/global/Field";
 import { FormValueField } from "@/components/global/ValueEditor";
 import { JsonViewer } from "@/components/global/JsonViewer";
 import { IconButton } from "@/components/global/Button";
@@ -54,6 +54,11 @@ const INSPECTOR_DEFAULT = 384;
 /// Dragging the splitter narrower than this folds the inspector into its rail.
 const INSPECTOR_FOLD_AT = 200;
 
+/// Separators for the stored table view state: group, entry, field.
+const GROUP_SEP = "\u0003";
+const ENTRY_SEP = "\u0002";
+const FIELD_SEP = "\u0001";
+
 // localStorage can throw (blocked site data); a missing value just means "default".
 function readStored(key: string): string | null {
   try {
@@ -61,6 +66,43 @@ function readStored(key: string): string | null {
   } catch {
     return null;
   }
+}
+
+interface TableViewState {
+  sort: SortRule[];
+  filters: FilterRule[];
+}
+
+/// Restores the sort and filters a table was last closed with.
+///
+/// Stored as delimited, URI-encoded fields rather than JSON: JSON would have to
+/// be narrowed from an untyped value, which only the IPC boundary may do
+/// (scripts/guardrail.py). Every field arrives as a string and is validated.
+function readTableState(key: string): TableViewState | null {
+  const raw = readStored(key);
+  if (raw === null) return null;
+  const [sortPart = "", filterPart = ""] = raw.split(GROUP_SEP);
+  const sort: SortRule[] = [];
+  for (const entry of sortPart.split(ENTRY_SEP).filter((e) => e.length > 0)) {
+    const [column = "", desc = ""] = entry.split(FIELD_SEP);
+    if (column.length > 0) sort.push({ column: decodeURIComponent(column), desc: desc === "1" });
+  }
+  const filters: FilterRule[] = [];
+  for (const entry of filterPart.split(ENTRY_SEP).filter((e) => e.length > 0)) {
+    const [column = "", op = "", value = ""] = entry.split(FIELD_SEP);
+    if (column.length > 0 && isFilterOp(op)) filters.push({ column: decodeURIComponent(column), op, value: decodeURIComponent(value) });
+  }
+  return { sort, filters };
+}
+
+function writeTableState(key: string, state: TableViewState): void {
+  const sort = state.sort.map((s) => [encodeURIComponent(s.column), s.desc ? "1" : "0"].join(FIELD_SEP)).join(ENTRY_SEP);
+  const filters = state.filters.map((f) => [encodeURIComponent(f.column), f.op, encodeURIComponent(f.value)].join(FIELD_SEP)).join(ENTRY_SEP);
+  writeStored(key, [sort, filters].join(GROUP_SEP));
+}
+
+function isFilterOp(value: string): value is FilterOp {
+  return value in FILTER_OPS;
 }
 
 function writeStored(key: string, value: string): void {
@@ -92,8 +134,16 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
   const showError = useWorkspace((s) => s.showError);
   const [pageIndex, setPageIndex] = useState(0);
   const [pageSize, setPageSize] = useState<PageSize>("50");
-  const [sort, setSort] = useState<SortRule[]>([]);
-  const [filters, setFilters] = useState<FilterRule[]>(initialFilters ?? []);
+  // WHAT:  Sort and filters restored per table when the setting is on.
+  // WHY:   Reopening the table you were working in should not throw away the
+  //        view you built; the key is the connection + table so two tables never
+  //        share state.
+  const stateKey = `db-free:table-state:${connectionId}:${tableKey(table)}`;
+  const restored = useMemo(() => readTableState(stateKey), [stateKey]);
+  const [sort, setSort] = useState<SortRule[]>(restored?.sort ?? []);
+  const [filters, setFilters] = useState<FilterRule[]>(initialFilters ?? restored?.filters ?? []);
+  const [hiddenColumns, setHiddenColumns] = useState<ReadonlySet<string>>(new Set());
+  const [autoRefresh, setAutoRefresh] = useState(0);
   /// Right-click "Filter: col = value" builds a rule from the clicked cell. The
   /// rule travels with the page request, so it works on every engine — SQL
   /// adapters compile it into WHERE, the others filter the fetched rows.
@@ -138,6 +188,18 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
     return () => window.removeEventListener("db-free:refresh-tables", onRefresh);
   }, []);
 
+  useEffect(() => {
+    if (settings?.rememberTableState === false) return;
+    writeTableState(stateKey, { sort, filters });
+  }, [settings?.rememberTableState, stateKey, sort, filters]);
+
+  // Auto-refresh: 0 is off, anything else is the interval in seconds.
+  useEffect(() => {
+    if (autoRefresh === 0) return;
+    const id = window.setInterval(() => setRefresh((r) => r + 1), autoRefresh * 1000);
+    return () => window.clearInterval(id);
+  }, [autoRefresh]);
+
   const loading = loaded.key !== requestKey;
   const page = loaded.page;
   const rows = useMemo(() => page?.rows ?? [], [page]);
@@ -160,12 +222,17 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
 
   const gridColumns: GridColumn[] = useMemo(
     () =>
-      columns.map((c) => {
-        const link = fkByColumn.get(c.name);
-        return { name: c.name, typeName: c.dataType, primaryKey: c.primaryKey, ...(link ? { linkTo: tableKey(link.table) } : {}) };
-      }),
-    [columns, fkByColumn],
+      columns
+        .filter((c) => !hiddenColumns.has(c.name))
+        .map((c) => {
+          const link = fkByColumn.get(c.name);
+          return { name: c.name, typeName: c.dataType, primaryKey: c.primaryKey, ...(link ? { linkTo: tableKey(link.table) } : {}) };
+        }),
+    [columns, fkByColumn, hiddenColumns],
   );
+  /// Grid column index -> page column index, so hiding a column does not shift
+  /// the values under the ones still shown.
+  const columnIndexes = useMemo(() => columns.map((c, i) => ({ c, i })).filter(({ c }) => !hiddenColumns.has(c.name)).map(({ i }) => i), [columns, hiddenColumns]);
 
   // WHAT:  FK traversal: open the referenced table filtered to the clicked value.
   const openLinked = (rowIndex: number, colIndex: number) => {
@@ -202,7 +269,16 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
     () => [...rows, ...inserts.map((c) => columns.map((col) => c.values.find((v) => v.column === col.name)?.value ?? NULL_VALUE))],
     [rows, inserts, columns],
   );
-  const getRow = useCallback((i: number): readonly Value[] | undefined => allRows[i], [allRows]);
+  /// The grid only knows the visible columns, so rows are projected onto them
+  /// and every column index coming back is mapped to the page's own.
+  const getGridRow = useCallback(
+    (i: number): readonly Value[] | undefined => {
+      const row = allRows[i];
+      return row === undefined ? undefined : columnIndexes.map((c) => row[c] ?? NULL_VALUE);
+    },
+    [allRows, columnIndexes],
+  );
+  const pageColumn = useCallback((gridColumn: number) => columnIndexes[gridColumn] ?? gridColumn, [columnIndexes]);
 
   const keyOf = useCallback(
     (row: readonly Value[]): CellValue[] => pkColumns.map((c) => ({ column: c.name, value: row[columns.findIndex((col) => col.name === c.name)] ?? { t: "null" } })),
@@ -283,6 +359,43 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
     void applyChanges(changes);
   };
 
+  // WHAT:  Row actions from the cell menu, expressed as staged changes like every
+  //        other edit so review mode and the Changes panel still see them.
+  const deleteRow = (rowIndex: number) => {
+    const insert = rowIndex >= rows.length ? inserts[rowIndex - rows.length] : undefined;
+    if (insert) {
+      unstageChange(connectionId, insert.id);
+      return;
+    }
+    const row = rows[rowIndex];
+    if (!row) return;
+    if (pkColumns.length === 0) {
+      showError("This table has no primary key, so rows cannot be deleted safely.");
+      return;
+    }
+    if (settings?.executionMode === "direct" && !window.confirm("Delete this row now?")) return;
+    void applyChanges([{ kind: "delete", id: nextChangeId(), table, key: keyOf(row) }]);
+  };
+
+  const duplicateRow = (rowIndex: number) => {
+    const row = allRows[rowIndex];
+    if (!row) return;
+    // A duplicate is an insert of every column except generated keys, which the
+    // database fills in again.
+    const values: CellValue[] = columns
+      .map((c, i) => ({ column: c.name, value: row[i] ?? NULL_VALUE }))
+      .filter(({ column }) => !pkColumns.some((pk) => pk.name === column && /serial|identity|auto/i.test(pk.dataType)));
+    void applyChanges([{ kind: "insert", id: nextChangeId(), table, values }]);
+  };
+
+  const copyRowsFrom = async (rowIndex: number, format: "json" | "csv" | "sql") => {
+    if (!page) return;
+    const chosen = selectedRows.size > 0 ? rows.filter((_, i) => selectedRows.has(i)) : [rows[rowIndex]].filter((r): r is Value[] => r !== undefined);
+    const text = format === "json" ? toJson(page, chosen) : format === "csv" ? toCsv(page, chosen) : toInserts(table, page, chosen);
+    await navigator.clipboard.writeText(text);
+    showInfo(`Copied ${chosen.length} row(s) as ${format.toUpperCase()}.`);
+  };
+
   const toggleSort = (column: string) => {
     setPageIndex(0);
     setSort((current) => {
@@ -307,7 +420,7 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <ScrollShadow orientation="horizontal" hideScrollBar className="flex h-11 shrink-0 items-center gap-1.5 border-b border-border/40 glass-header px-3">
+      <ScrollShadow orientation="horizontal" hideScrollBar className="flex app-toolbar shrink-0 items-center gap-1.5 border-b border-border/40 glass-header">
         <Tooltip delay={300}>
           <Button size="sm" isDisabled={!editable || columns.length === 0} onPress={() => setInsertOpen(true)} className="glass-pill text-foreground liquid-hover">
             <Icon name="plus" size={13} className="text-accent" />
@@ -320,6 +433,25 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
           Refresh
         </Button>
         <FilterPopover columns={columns} filters={filters} onApply={(next) => { setPageIndex(0); setFilters(next); }} />
+        <ColumnsPopover columns={columns} hidden={hiddenColumns} onChange={setHiddenColumns} />
+        <Dropdown>
+          <Button size="sm" variant={autoRefresh > 0 ? "primary" : "ghost"} className={cn("rounded-lg liquid-hover", autoRefresh > 0 ? "glass-pill text-accent" : "text-muted hover:bg-surface-secondary/70 hover:text-foreground")}>
+            <Icon name="clock" size={13} />
+            {autoRefresh > 0 ? REFRESH_LABEL[autoRefresh] : "Auto"}
+          </Button>
+          <Dropdown.Popover className="min-w-44 glass-modal rounded-xl">
+            <Dropdown.Menu onAction={(key) => setAutoRefresh(Number(key))}>
+              <Dropdown.Section>
+                {REFRESH_INTERVALS.map((seconds) => (
+                  <Dropdown.Item key={seconds} id={String(seconds)} textValue={REFRESH_LABEL[seconds] ?? ""}>
+                    <Label className="flex-1">{REFRESH_LABEL[seconds]}</Label>
+                    {autoRefresh === seconds ? <Icon name="check" size={13} className="ml-2 text-accent" /> : null}
+                  </Dropdown.Item>
+                ))}
+              </Dropdown.Section>
+            </Dropdown.Menu>
+          </Dropdown.Popover>
+        </Dropdown>
         <Button size="sm" variant={sort.length > 0 ? "primary" : "ghost"} className={cn("rounded-lg liquid-hover", sort.length > 0 ? "glass-pill text-accent" : "text-muted hover:bg-surface-secondary/70 hover:text-foreground")} onPress={() => setSort([])} isDisabled={sort.length === 0}>
           <Icon name="sort" size={13} />
           {sort.length > 0 ? `Sorted by ${sort.length} rule` : "Sort"}
@@ -374,7 +506,7 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
             <DataGrid
               columns={gridColumns}
               rowCount={allRows.length}
-              getRow={getRow}
+              getRow={getGridRow}
               rowHeight={DENSITIES[density].rowHeight}
               sort={sort}
               onSortToggle={toggleSort}
@@ -388,18 +520,22 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
                 })
               }
               onToggleAll={() => setSelectedRows((s) => (s.size === allRows.length ? new Set() : new Set(allRows.map((_, i) => i))))}
-              onCellSelect={(row, col) => setCell({ row, col })}
+              onCellSelect={(row, col) => setCell({ row, col: pageColumn(col) })}
               selected={cell}
-              {...(editable ? { onCellEdit } : {})}
+              {...(editable ? { onCellEdit: (row: number, col: number, next: Value) => onCellEdit(row, pageColumn(col), next) } : {})}
               staged={staged}
               deletedRows={deletedRows}
               insertedFrom={rows.length}
               nullDisplay={settings?.nullDisplay ?? "NULL"}
-              onLinkOpen={openLinked}
+              onLinkOpen={(row, col) => openLinked(row, pageColumn(col))}
               onFilter={addFilter}
               onSortSet={(rule) => { setPageIndex(0); setSort([rule]); }}
               onClearSort={() => setSort([])}
               onCopied={(what) => showInfo(`${what} copied to the clipboard.`)}
+              alternatingRows={settings?.alternatingRows ?? true}
+              onInspect={(row, col) => { setCell({ row, col: pageColumn(col) }); setInspectorCollapsed(false); }}
+              onCopyRows={(row, format) => void copyRowsFrom(row, format)}
+              {...(editable ? { onInsertRow: () => setInsertOpen(true), onDuplicateRow: duplicateRow, onDeleteRow: deleteRow } : {})}
             />
           )}
         </div>
@@ -524,7 +660,7 @@ function RecordInspector({ columns, row, column, value, table, tabs, activeTab, 
   return (
     <aside className="relative flex shrink-0 flex-col border-l border-border/40 glass-sidebar select-none" style={{ width }}>
       <Resizer direction="horizontal" onResize={handleResize} className="absolute -left-1 top-0 bottom-0" />
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border/40 glass-header px-3 text-xs">
+      <div className="flex app-toolbar shrink-0 items-center gap-2 border-b border-border/40 glass-header text-xs">
         <span className="truncate font-semibold text-foreground tracking-tight">{column.name}</span>
         <Chip size="sm" variant="soft" className="font-mono text-[10px]">
           {column.dataType}
@@ -594,6 +730,64 @@ function hexDump(base64: string): string {
   return lines.join("\n");
 }
 
+/// Auto-refresh choices, in seconds; 0 is off.
+const REFRESH_INTERVALS = [0, 5, 10, 30, 60, 300] as const;
+const REFRESH_LABEL: Record<number, string> = { 0: "Off", 5: "5 seconds", 10: "10 seconds", 30: "30 seconds", 60: "1 minute", 300: "5 minutes" };
+
+// WHAT:  Column visibility: a searchable checklist over the page's columns.
+// WHY:   Wide tables are read one slice at a time; hiding the rest beats
+//        scrolling past it. Hiding is per open tab, not persisted, because it
+//        answers "what am I looking at right now".
+function ColumnsPopover({ columns, hidden, onChange }: { columns: readonly ColumnInfo[]; hidden: ReadonlySet<string>; onChange: (next: ReadonlySet<string>) => void }) {
+  const [search, setSearch] = useState("");
+  const needle = search.trim().toLowerCase();
+  const shown = columns.filter((c) => needle.length === 0 || c.name.toLowerCase().includes(needle));
+  const toggle = (name: string) => {
+    const next = new Set(hidden);
+    if (next.has(name)) next.delete(name);
+    else next.add(name);
+    onChange(next);
+  };
+  return (
+    <Popover>
+      <Button size="sm" variant={hidden.size > 0 ? "primary" : "ghost"} className={cn("rounded-lg liquid-hover", hidden.size > 0 ? "glass-pill text-accent" : "text-muted hover:bg-surface-secondary/70 hover:text-foreground")}>
+        <Icon name="columns" size={13} />
+        {hidden.size > 0 ? `${columns.length - hidden.size}/${columns.length}` : "Columns"}
+      </Button>
+      <Popover.Content className="w-[260px]">
+        <Popover.Dialog className="p-2">
+          <SearchField value={search} onChange={setSearch} aria-label="Search columns" autoFocus>
+            <SearchField.Group className="glass-input h-7 rounded-lg px-2">
+              <SearchField.SearchIcon />
+              <SearchField.Input placeholder="Search…" className="w-full text-xs" />
+              <SearchField.ClearButton />
+            </SearchField.Group>
+          </SearchField>
+          <ScrollShadow hideScrollBar className="mt-2 max-h-64">
+            <ul className="flex flex-col gap-0.5">
+              {shown.map((c) => (
+                <li key={c.name}>
+                  <span className="flex w-full items-center gap-2 rounded-md px-1 py-0.5 text-[12px] hover:bg-surface-secondary/60">
+                    <Check label={c.name} checked={!hidden.has(c.name)} onChange={() => toggle(c.name)} />
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </ScrollShadow>
+          <div className="mt-2 flex justify-end gap-1.5 border-t border-border/40 pt-2">
+            <Button size="sm" variant="tertiary" className="h-6 min-h-6 px-2 text-[11px]" onPress={() => onChange(new Set(columns.map((c) => c.name)))}>
+              Hide all
+            </Button>
+            <Button size="sm" variant="tertiary" className="h-6 min-h-6 px-2 text-[11px]" onPress={() => onChange(new Set())}>
+              Show all
+            </Button>
+          </div>
+        </Popover.Dialog>
+      </Popover.Content>
+    </Popover>
+  );
+}
+
 function cellText(value: Value | undefined): string {
   if (value === undefined) return "";
   return value.t === "json" ? JSON.stringify(value.v) : value.t === "null" ? "NULL" : formatCell(value).text;
@@ -624,6 +818,15 @@ function toCsv(page: TablePage, rows: readonly (readonly Value[])[]): string {
   const header = page.columns.map((c) => escape(c.name)).join(",");
   const body = rows.map((r) => r.map((v) => escape(v.t === "null" ? "" : cellText(v))).join(","));
   return [header, ...body].join("\n");
+}
+
+// WHAT:  Rows as INSERT statements, ready to paste into a query tab.
+// WHY:   Copying a row to another environment is the usual reason to copy one;
+//        JSON and CSV both lose the types the target has to be told about.
+function toInserts(table: TableRef, page: TablePage, rows: readonly (readonly Value[])[]): string {
+  const target = table.schema === null ? table.name : `${table.schema}.${table.name}`;
+  const columns = page.columns.map((c) => c.name).join(", ");
+  return rows.map((row) => `INSERT INTO ${target} (${columns}) VALUES (${row.map(sqlLiteral).join(", ")});`).join("\n");
 }
 
 function toJson(page: TablePage, rows: readonly (readonly Value[])[]): string {

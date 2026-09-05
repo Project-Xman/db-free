@@ -11,4 +11,20 @@ uiFont: string,
 /**
  * Font family key for code, grids and values (monospace faces).
  */
-editorFont: string, uiFontSize: number, editorFontSize: number, gridDensity: string, nullDisplay: string, showResultsPane: boolean, condenseSqlWhenFormatting: boolean, runScope: RunScope, executionMode: ExecutionMode, commandMenuSections: Array<string>, inspectorTabs: Array<string>, confirmDestructive: boolean, crashReportsOptIn: boolean, ai: AiSettings, };
+editorFont: string, uiFontSize: number, editorFontSize: number, gridDensity: string, 
+/**
+ * Zebra striping in every grid.
+ */
+alternatingRows: boolean, 
+/**
+ * Reopen a table with the sort and filters it was last closed with.
+ */
+rememberTableState: boolean, 
+/**
+ * Expandable column list under each table in the sidebar.
+ */
+columnPreview: boolean, 
+/**
+ * Ceiling on rows an editor query returns before the result is trimmed.
+ */
+maxQueryRows: number, nullDisplay: string, showResultsPane: boolean, condenseSqlWhenFormatting: boolean, runScope: RunScope, executionMode: ExecutionMode, commandMenuSections: Array<string>, inspectorTabs: Array<string>, confirmDestructive: boolean, crashReportsOptIn: boolean, ai: AiSettings, };

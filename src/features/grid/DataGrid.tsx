@@ -59,12 +59,31 @@ interface DataGridProps {
   onClearSort?: () => void;
   /// Feedback for the copy actions.
   onCopied?: (what: string) => void;
+  /// Zebra striping; off gives every row the same ground.
+  alternatingRows?: boolean;
+  /// Row actions offered by the cell menu when the owner supports them.
+  onInsertRow?: () => void;
+  onDuplicateRow?: (rowIndex: number) => void;
+  onDeleteRow?: (rowIndex: number) => void;
+  /// Opens the owner's record inspector on the clicked cell.
+  onInspect?: (rowIndex: number, colIndex: number) => void;
+  /// Copies whole rows in a format the owner knows how to build (JSON, CSV, SQL).
+  onCopyRows?: (rowIndex: number, format: "json" | "csv" | "sql") => void;
 }
 
 const HEADER_HEIGHT = 32;
 const CHECK_WIDTH = 40;
 const MIN_COL_WIDTH = 56;
+/// A dragged column may still go wide; only the automatic sizing is capped.
 const MAX_COL_WIDTH = 1600;
+/// Ceiling for a column the app sizes itself: past this, long values are for
+/// the inspector, not the grid.
+const MAX_FIT_WIDTH = 450;
+/// Room a fitted column leaves around its text: cell padding, the sort icon and
+/// enough gap that neighbouring values never read as one string.
+const FIT_GAP = 50;
+/// Rough advance width of the 12px monospace grid face, in px per character.
+const CHAR_WIDTH = 7.2;
 /// Grab area straddling a column's right edge. Wide enough to hit without
 /// aiming: the visible line inside it stays 1px.
 const HANDLE_WIDTH = 12;
@@ -106,6 +125,12 @@ export function DataGrid({
   onSortSet,
   onClearSort,
   onCopied,
+  alternatingRows = true,
+  onInsertRow,
+  onDuplicateRow,
+  onDeleteRow,
+  onInspect,
+  onCopyRows,
 }: DataGridProps) {
   const parentRef = useRef<HTMLDivElement | null>(null);
   const rangeRef = useRef(onRangeChange);
@@ -158,6 +183,40 @@ export function DataGrid({
     colVirtualizer.measure();
   }, [columns, colVirtualizer]);
 
+  // WHAT:  Sizes every column the user has not dragged to the widest value on
+  //        the loaded page, once per page.
+  // WHY:   "Fit the content" is what a grid is expected to do on open; the cap
+  //        keeps one 4 KB cell from owning the viewport.
+  const fitted = useRef<readonly GridColumn[] | null>(null);
+  useEffect(() => {
+    if (rowCount === 0 || fitted.current === columns) return;
+    fitted.current = columns;
+    const sample = Math.min(rowCount, 60);
+    columns.forEach((column, index) => {
+      if (column.name in widthsRef.current) return;
+      const texts: string[] = [];
+      for (let row = 0; row < sample; row += 1) {
+        const value = getRow(row)?.[index];
+        if (value !== undefined) texts.push(formatCell(value).text);
+      }
+      if (texts.length === 0) return;
+      const width = fitWidth(column, texts);
+      widthsRef.current[column.name] = width;
+      colVirtualizer.resizeItem(index, width);
+    });
+  }, [columns, rowCount, getRow, colVirtualizer]);
+
+  const fitColumn = (column: GridColumn, index: number) => {
+    const texts: string[] = [];
+    for (const item of rowVirtualizer.getVirtualItems()) {
+      const value = getRow(item.index)?.[index];
+      if (value !== undefined) texts.push(formatCell(value).text);
+    }
+    const width = fitWidth(column, texts);
+    widthsRef.current[column.name] = width;
+    colVirtualizer.resizeItem(index, width);
+  };
+
   const resizeColumn = (column: GridColumn, index: number, current: number, delta: number) => {
     const raw = (dragWidth.current ?? current) + delta;
     dragWidth.current = raw;
@@ -200,6 +259,7 @@ export function DataGrid({
         ] satisfies MenuEntry[])
       : []),
     { id: "copy-column", label: "Copy column name", icon: "copy", group: "copy" },
+    { id: "fit-width", label: "Fit column to content", icon: "columns", group: "copy" },
     { id: "reset-width", label: "Reset column width", icon: "columns", group: "copy" },
   ];
 
@@ -211,6 +271,7 @@ export function DataGrid({
       else if (id === "filter-null") onFilter?.({ column: column.name, op: "is_null", value: "" });
       else if (id === "filter-not-null") onFilter?.({ column: column.name, op: "is_not_null", value: "" });
       else if (id === "copy-column") copy(column.name, "Column name");
+      else if (id === "fit-width") fitColumn(column, index);
       else if (id === "reset-width") resetColumn(column, index);
     });
 
@@ -247,6 +308,17 @@ export function DataGrid({
       ...(column.linkTo !== undefined && onLinkOpen !== undefined
         ? ([{ id: "open-link", label: `Open ${column.linkTo} rows`, icon: "link", group: "link" }] satisfies MenuEntry[])
         : []),
+      ...(onInspect ? ([{ id: "inspect", label: "Open inspector", icon: "expand", group: "row" }] satisfies MenuEntry[]) : []),
+      ...(onCopyRows
+        ? ([
+            { id: "rows-json", label: "Copy rows as JSON", icon: "braces", group: "rows" },
+            { id: "rows-csv", label: "Copy rows as CSV", icon: "rows", group: "rows" },
+            { id: "rows-sql", label: "Copy rows as SQL INSERT", icon: "terminal", group: "rows" },
+          ] satisfies MenuEntry[])
+        : []),
+      ...(onInsertRow ? ([{ id: "insert-row", label: "Insert row", icon: "plus", group: "write" }] satisfies MenuEntry[]) : []),
+      ...(onDuplicateRow ? ([{ id: "duplicate-row", label: "Duplicate row", icon: "copy", group: "write" }] satisfies MenuEntry[]) : []),
+      ...(onDeleteRow ? ([{ id: "delete-row", label: "Delete row", icon: "trash", danger: true, group: "write" }] satisfies MenuEntry[]) : []),
     ];
 
     onCellSelect?.(rowIndex, colIndex);
@@ -264,6 +336,13 @@ export function DataGrid({
       else if (id === "edit") setEditing({ row: rowIndex, col: colIndex });
       else if (id === "set-null") onCellEdit?.(rowIndex, colIndex, { t: "null" });
       else if (id === "open-link") onLinkOpen?.(rowIndex, colIndex);
+      else if (id === "inspect") onInspect?.(rowIndex, colIndex);
+      else if (id === "rows-json") onCopyRows?.(rowIndex, "json");
+      else if (id === "rows-csv") onCopyRows?.(rowIndex, "csv");
+      else if (id === "rows-sql") onCopyRows?.(rowIndex, "sql");
+      else if (id === "insert-row") onInsertRow?.();
+      else if (id === "duplicate-row") onDuplicateRow?.(rowIndex);
+      else if (id === "delete-row") onDeleteRow?.(rowIndex);
     });
   };
 
@@ -315,8 +394,8 @@ export function DataGrid({
                   key={`${vc.key}-resize`}
                   className="absolute top-0 z-30 h-full cursor-col-resize"
                   style={{ left: vc.end - HANDLE_WIDTH / 2, width: HANDLE_WIDTH }}
-                  title="Drag to resize · double-click to reset"
-                  onDoubleClick={() => resetColumn(column, vc.index)}
+                  title="Drag to resize · double-click to fit the content"
+                  onDoubleClick={() => fitColumn(column, vc.index)}
                 >
                   <Resizer
                     direction="horizontal"
@@ -351,7 +430,7 @@ export function DataGrid({
                       ? "bg-success-soft/40"
                       : isSelectedRow
                         ? "bg-surface-secondary/80"
-                        : vr.index % 2 === 1
+                        : alternatingRows && vr.index % 2 === 1
                           ? "bg-surface/20 hover:bg-surface-secondary/40"
                           : "hover:bg-surface-secondary/40",
               )}
@@ -452,14 +531,32 @@ export function DataGrid({
   );
 }
 
+// WHAT:  Width for a column nobody has dragged: the type's usual shape, never
+//        past MAX_FIT_WIDTH.
+// WHY:   A `text` column holding a 4 KB token would otherwise push every other
+//        column off-screen; 450px shows enough to recognise the value, and the
+//        inspector shows the rest.
 function estimateWidth(column: GridColumn): number {
   const t = column.typeName.toLowerCase();
-  if (t.includes("bool")) return 120;
-  if (/int|serial|numeric|decimal|real|float|double/.test(t)) return 110;
-  if (/timestamp|date|time/.test(t)) return 220;
-  if (t.includes("uuid")) return 300;
-  if (/json|text|blob|bytea/.test(t)) return 260;
-  return Math.min(320, Math.max(140, column.name.length * 9 + 60));
+  const header = column.name.length * CHAR_WIDTH + FIT_GAP;
+  if (t.includes("bool")) return clampFit(Math.max(120, header));
+  if (/int|serial|numeric|decimal|real|float|double/.test(t)) return clampFit(Math.max(110, header));
+  if (/timestamp|date|time/.test(t)) return clampFit(Math.max(220, header));
+  if (t.includes("uuid")) return clampFit(Math.max(300, header));
+  if (/json|text|blob|bytea/.test(t)) return clampFit(Math.max(260, header));
+  return clampFit(Math.max(140, header));
+}
+
+// WHAT:  Width that fits the widest value currently loaded, plus the gap.
+// HOW:   Measured from the rows the grid can see rather than the whole table:
+//        the page is what the user is looking at, and it costs nothing.
+function fitWidth(column: GridColumn, values: readonly string[]): number {
+  const longest = values.reduce((max, text) => Math.max(max, text.length), column.name.length);
+  return clampFit(longest * CHAR_WIDTH + FIT_GAP);
+}
+
+function clampFit(width: number): number {
+  return Math.min(MAX_FIT_WIDTH, Math.max(MIN_COL_WIDTH, Math.round(width)));
 }
 
 /// One CSV field: quoted when it holds a comma, quote or newline.
