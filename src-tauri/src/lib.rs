@@ -26,6 +26,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
@@ -75,6 +76,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::objects::search_documents,
             commands::objects::query_range,
             commands::objects::load_history,
+            commands::updates::check_update,
+            commands::updates::install_update,
         ])
         .run(tauri::generate_context!())?;
     Ok(())
@@ -117,6 +120,7 @@ mod export_bindings {
             crate::model::EditorBuffer::export_all(&cfg),
             crate::commands::query::ClearHistoryRequest::export_all(&cfg),
             crate::commands::settings::SaveSettingsRequest::export_all(&cfg),
+            crate::model::UpdateStatus::export_all(&cfg),
             crate::commands::library::SaveQueryRequest::export_all(&cfg),
             crate::commands::library::IdRequest::export_all(&cfg),
             crate::commands::library::ListDocumentsRequest::export_all(&cfg),

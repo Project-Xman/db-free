@@ -104,6 +104,7 @@ export type * from "./TablePageRequest";
 export type * from "./TableRef";
 export type * from "./Tool";
 export type * from "./TransferFormat";
+export type * from "./UpdateStatus";
 export type * from "./Value";
 export type * from "./VectorSearchCommand";
 export type * from "./VectorSearchRequest";

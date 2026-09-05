@@ -1,15 +1,15 @@
 // SOT: settings-page, preferences-ui, ai-settings-ui, shortcuts-list
 import { useState } from "react";
 import { Button, Card, ScrollShadow, Separator } from "@heroui/react";
-import type { AiProvider, AppSettings, ExecutionMode, RunScope } from "@/lib/bindings";
-import { normalizeError } from "@/lib/ipc";
+import type { AiProvider, AppSettings, ExecutionMode, RunScope, UpdateStatus } from "@/lib/bindings";
+import { ipc, normalizeError } from "@/lib/ipc";
 import { useWorkspace } from "@/stores/workspace";
 import { AppSelect, Field, Toggle } from "@/components/global/Field";
 import { Icon, type IconName } from "@/lib/icons";
 import { cn } from "@/lib/cn";
 import { EDITOR_FONT_OPTIONS, UI_FONT_OPTIONS } from "@/lib/fonts";
 
-type Section = "general" | "themes" | "fonts" | "grid" | "editor" | "shortcuts" | "ai" | "security" | "advanced";
+type Section = "general" | "themes" | "fonts" | "grid" | "editor" | "shortcuts" | "ai" | "security" | "updates" | "advanced";
 
 const SECTIONS: readonly { id: Section; label: string; icon: IconName }[] = [
   { id: "general", label: "General", icon: "settings" },
@@ -20,6 +20,7 @@ const SECTIONS: readonly { id: Section; label: string; icon: IconName }[] = [
   { id: "shortcuts", label: "Shortcuts", icon: "hash" },
   { id: "ai", label: "AI", icon: "braces" },
   { id: "security", label: "Security & Privacy", icon: "lock" },
+  { id: "updates", label: "Updates", icon: "download" },
   { id: "advanced", label: "Advanced", icon: "columns" },
 ];
 
@@ -263,6 +264,7 @@ function SettingsBody({ initial }: { initial: AppSettings }) {
                 </Row>
               </>
             ) : null}
+            {section === "updates" ? <UpdatesSection /> : null}
             {section === "advanced" ? (
               <>
                 <h2 className="text-sm font-semibold text-foreground">Advanced</h2>
@@ -324,6 +326,64 @@ function move<T>(list: readonly T[], from: number, to: number): T[] {
   const [item] = copy.splice(from, 1);
   if (item !== undefined) copy.splice(to, 0, item);
   return copy;
+}
+
+// WHAT:  Self-update panel: the running version, what the release feed offers,
+//        and one button that installs it and restarts.
+// WHY:   Installers were download-by-hand; the feed is the signed latest.json
+//        published with each GitHub release.
+// WHERE: src-tauri/src/services/updates.rs, .github/workflows/release.yml
+function UpdatesSection() {
+  const showError = useWorkspace((s) => s.showError);
+  const [status, setStatus] = useState<UpdateStatus | null>(null);
+  const [busy, setBusy] = useState<"check" | "install" | null>(null);
+
+  const check = async () => {
+    setBusy("check");
+    try {
+      setStatus(await ipc("check_update"));
+    } catch (raw) {
+      showError(normalizeError(raw));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const install = async () => {
+    setBusy("install");
+    try {
+      // The app restarts into the new version, so nothing after this runs.
+      await ipc("install_update");
+    } catch (raw) {
+      showError(normalizeError(raw));
+      setBusy(null);
+    }
+  };
+
+  return (
+    <>
+      <h2 className="text-sm font-semibold text-foreground">Updates</h2>
+      <p className="text-xs text-muted">Signed builds are published for every commit on main; the app verifies the signature before installing.</p>
+      <Row title="Version" body={status ? `Running ${status.current}` : "Check to compare this build against the latest release."}>
+        <Button size="sm" variant="secondary" isPending={busy === "check"} onPress={() => void check()}>
+          <Icon name="refresh" size={13} />
+          Check for updates
+        </Button>
+      </Row>
+      {status?.available ? (
+        <Row title={`Version ${status.available} is available`} body={status.notes ?? status.published ?? "Installs and restarts the app."}>
+          <Button size="sm" isPending={busy === "install"} onPress={() => void install()}>
+            <Icon name="download" size={13} />
+            Install and restart
+          </Button>
+        </Row>
+      ) : status ? (
+        <Row title="Up to date" body={`No release newer than ${status.current}.`}>
+          <Icon name="check" size={15} className="text-success" />
+        </Row>
+      ) : null}
+    </>
+  );
 }
 
 function defaultSettings(): AppSettings {

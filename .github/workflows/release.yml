@@ -1,11 +1,17 @@
 # SOT: release-pipeline, cross-platform-bundles, ci-cd
 # WHAT:  Runs code checks (guardrail, tsc, eslint, clippy, cargo test) on PRs/pushes,
-#        builds installers for macOS (universal: arm64 + x86_64), Linux (x86_64 and
-#        aarch64) and Windows (x64 and arm64) on every commit to main (uploaded as
-#        artifacts), and attaches installers to a draft GitHub release on tags (v*).
+#        then on every green commit to main bumps the version, tags it, and
+#        publishes installers for macOS (universal: arm64 + x86_64), Linux
+#        (x86_64 and aarch64) and Windows (x64 and arm64) to a GitHub release,
+#        together with the signed latest.json the in-app updater reads.
 # WHY:   Guarantees continuous integration quality, provides downloadable main/nightly
 #        installers, and automates cross-platform release delivery (PRD §6).
-# HOW:   Fast Ubuntu check job gates a matrix build. Every architecture builds on a
+# HOW:   Fast Ubuntu check job gates a version job, which derives the next semver
+#        from the Conventional Commit subjects since the last tag and pushes both
+#        the bump commit and the tag; the matrix then builds that tag. Tags pushed
+#        with GITHUB_TOKEN do not start another run (GitHub blocks the recursion),
+#        which is why the build reads the tag from the version job rather than
+#        waiting to be triggered by it. Every architecture builds on a
 #        native runner rather than cross-compiling: webkit2gtk and the bundled C
 #        dependencies (librocksdb-sys via bindgen, aws-lc-sys via cmake) are painful
 #        to cross-build, and GitHub now publishes arm64 runners for Linux and Windows.
@@ -53,10 +59,35 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
 
+  version:
+    name: Version & tag
+    needs: check
+    # Skips the bump commit itself, so the job cannot chase its own tail.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !startsWith(github.event.head_commit.message, 'chore(release):')
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Bump version and tag
+        id: bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          next=$(bash scripts/next-version.sh)
+          bash scripts/set-version.sh "$next"
+          git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+          git commit -m "chore(release): v$next"
+          git tag "v$next"
+          git push origin HEAD:main --follow-tags
+          echo "tag=v$next" >> "$GITHUB_OUTPUT"
+
   bundle:
     name: Build (${{ matrix.artifact-name }})
-    needs: check
-    if: github.event_name != 'pull_request'
+    needs: [check, version]
+    # `version` is skipped for tag pushes and manual runs; the build still runs.
+    if: always() && needs.check.result == 'success' && needs.version.result != 'failure' && github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -84,7 +115,11 @@ jobs:
             args: ""
     runs-on: ${{ matrix.platform }}
     steps:
+      # The bump commit is what carries the new version, so build the tag rather
+      # than the commit that triggered the run.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag || github.ref }}
       - uses: pnpm/action-setup@v4
         with: { version: 11 }
       - uses: actions/setup-node@v4
@@ -129,25 +164,39 @@ jobs:
           key: ${{ matrix.artifact-name }}
       - run: pnpm install --frozen-lockfile
 
-      - name: Build and draft release (tags)
-        if: startsWith(github.ref, 'refs/tags/v')
+      # The tag comes from the version job on main, or from the ref on a tag push.
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: echo "name=${{ needs.version.outputs.tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || '' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish release
+        if: steps.tag.outputs.name != ''
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signs the bundles and latest.json; without these the updater refuses
+          # every build, so a missing secret must fail the release, not skip it.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "DB Free ${{ github.ref_name }}"
+          tagName: ${{ steps.tag.outputs.name }}
+          releaseName: "DB Free ${{ steps.tag.outputs.name }}"
           # Published straight away: the first matrix job to finish creates the
           # release, the rest attach their installers to it as they land.
           releaseDraft: false
           prerelease: false
+          # latest.json: the feed src-tauri/tauri.conf.json points the updater at.
+          includeUpdaterJson: true
           args: ${{ matrix.args }}
 
-      - name: Build desktop app (main branch or manual dispatch)
-        if: "!startsWith(github.ref, 'refs/tags/v')"
+      - name: Build desktop app (manual dispatch)
+        if: steps.tag.outputs.name == ''
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           args: ${{ matrix.args }}
 
