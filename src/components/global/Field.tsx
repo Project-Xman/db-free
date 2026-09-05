@@ -43,13 +43,16 @@ interface FieldProps {
   className?: string;
   suffix?: ReactNode;
   mono?: boolean;
+  /// Row-height control for dense surfaces (filter builder, toolbars): 28px
+  /// input, 12px text, no label gap.
+  compact?: boolean;
 }
 
-export function Field({ label, value, onChange, placeholder, type = "text", description, optional = false, isDisabled = false, autoFocus = false, className, suffix, mono = false }: FieldProps) {
-  const inputClass = cn("w-full", mono ? "font-mono" : "");
+export function Field({ label, value, onChange, placeholder, type = "text", description, optional = false, isDisabled = false, autoFocus = false, className, suffix, mono = false, compact = false }: FieldProps) {
+  const inputClass = cn("w-full", mono ? "font-mono" : "", compact ? "h-7 min-h-7 px-2 text-xs" : "");
   const placeholderProps = placeholder !== undefined ? { placeholder } : {};
   return (
-    <TextField value={value} onChange={onChange} type={type} isDisabled={isDisabled} className={cn("w-full", className)} autoFocus={autoFocus}>
+    <TextField value={value} onChange={onChange} type={type} isDisabled={isDisabled} className={cn("w-full", compact ? "gap-0" : "", className)} autoFocus={autoFocus}>
       <Label>
         {label}
         {optional ? <span className="ml-1 text-muted">(optional)</span> : null}

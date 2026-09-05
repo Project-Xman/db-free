@@ -55,28 +55,28 @@ export function FilterPopover({ columns, filters, onApply }: FilterPopoverProps)
         <Icon name="filter" size={13} />
         {filters.length > 0 ? `Filter (${filters.length})` : "Filter"}
       </Button>
-      <Popover.Content className="w-[560px] max-w-[90vw]">
-        <Popover.Dialog>
-          <Popover.Heading className="text-sm">Filters</Popover.Heading>
-          <div className="mt-3 flex flex-col gap-2">
+      <Popover.Content className="w-[440px] max-w-[92vw]">
+        <Popover.Dialog className="p-3">
+          <Popover.Heading className="text-[11px] font-semibold uppercase tracking-wider text-muted">Filters</Popover.Heading>
+          <div className="mt-2 flex flex-col gap-1.5">
             {draft.map((rule, index) => (
-              <div key={index} className="grid grid-cols-[1fr_150px_1fr_28px] items-end gap-2">
+              <div key={index} className="grid grid-cols-[minmax(0,1fr)_124px_minmax(0,1fr)_22px] items-center gap-1.5">
                 <AppSelect ariaLabel="Column" value={rule.column} options={columns.map((c) => ({ value: c.name, label: c.name }))} onChange={(column) => update(index, { column })} size="sm" />
                 <AppSelect ariaLabel="Operator" value={rule.op} options={OP_OPTIONS} onChange={(op) => update(index, { op })} size="sm" />
-                <Field label="" value={rule.value} onChange={(value) => update(index, { value })} isDisabled={!FILTER_OPS[rule.op].needsValue} placeholder="value" mono className="[&_label]:hidden" />
-                <IconButton icon="x" label="Remove filter" onPress={() => remove(index)} />
+                <Field label="" value={rule.value} onChange={(value) => update(index, { value })} isDisabled={!FILTER_OPS[rule.op].needsValue} placeholder="value" mono compact className="[&_label]:hidden" />
+                <IconButton icon="x" label="Remove filter" size={12} className="size-5.5 min-w-5.5" onPress={() => remove(index)} />
               </div>
             ))}
-            <Button size="sm" variant="ghost" className="self-start text-muted" onPress={() => setDraft((d) => [...d, { column: firstColumn, op: "eq", value: "" }])}>
-              <Icon name="plus" size={13} />
+            <Button size="sm" variant="ghost" className="h-6 min-h-6 self-start px-1.5 text-[11px] text-muted" onPress={() => setDraft((d) => [...d, { column: firstColumn, op: "eq", value: "" }])}>
+              <Icon name="plus" size={12} />
               Add filter
             </Button>
           </div>
-          <div className="mt-4 flex justify-end gap-2">
-            <Button size="sm" variant="tertiary" onPress={() => { onApply([]); setOpen(false); }}>
+          <div className="mt-3 flex justify-end gap-1.5">
+            <Button size="sm" variant="tertiary" className="h-7 min-h-7 px-2.5 text-xs" onPress={() => { onApply([]); setOpen(false); }}>
               Clear
             </Button>
-            <Button size="sm" onPress={apply}>
+            <Button size="sm" className="h-7 min-h-7 px-3 text-xs" onPress={apply}>
               Apply
             </Button>
           </div>
