@@ -76,11 +76,20 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           next=$(bash scripts/next-version.sh)
+          # A tag already on the remote means that version shipped (or a run died
+          # after tagging), so walk the patch until the name is free.
+          while git ls-remote --exit-code --tags origin "refs/tags/v$next" >/dev/null 2>&1; do
+            next=$(python3 -c "import sys; p=sys.argv[1].split('.'); p[2]=str(int(p[2])+1); print('.'.join(p))" "$next")
+          done
           bash scripts/set-version.sh "$next"
           git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
-          git commit -m "chore(release): v$next"
-          git tag "v$next"
-          git push origin HEAD:main --follow-tags
+          # Re-running after a failed build finds the files already bumped.
+          git diff --cached --quiet || git commit -m "chore(release): v$next"
+          # Annotated, and pushed by name: `--follow-tags` ignores lightweight
+          # tags, which is how v0.2.0 was created and then never left the runner.
+          git tag -a "v$next" -m "DB Free v$next"
+          git push origin HEAD:main
+          git push origin "refs/tags/v$next"
           echo "tag=v$next" >> "$GITHUB_OUTPUT"
 
   bundle:
