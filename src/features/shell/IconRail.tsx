@@ -16,8 +16,10 @@ const SIDEBARS: readonly { mode: SidebarMode; icon: IconName; label: string }[] 
 ];
 
 // On macOS the rail is as wide as the traffic-light cluster: tauri.conf.json
-// places the close button at x=9, the three 12px buttons sit 20px apart
-// (right edge 61px), and the same 9px margin on the right gives 70px.
+// insets the close button by the system-standard 20px, the three 12px buttons
+// sit 20px apart (right edge 72px), and an 8px margin on the right gives 80px.
+// The 44px drag strip below matches the header height, so y=16 centres the
+// 12px buttons in it.
 const RAIL_WIDTH_MAC = "w-[80px]";
 
 // WHAT:  Left rail: connections home, one entry per sidebar, history/transfer
