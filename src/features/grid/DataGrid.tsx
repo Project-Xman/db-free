@@ -431,7 +431,7 @@ export function DataGrid({
                       : isSelectedRow
                         ? "bg-surface-secondary/80"
                         : alternatingRows && vr.index % 2 === 1
-                          ? "bg-surface/20 hover:bg-surface-secondary/40"
+                          ? "row-stripe hover:bg-surface-secondary/40"
                           : "hover:bg-surface-secondary/40",
               )}
               style={{ top: vr.start + HEADER_HEIGHT, height: vr.size, width: totalWidth + gutter }}

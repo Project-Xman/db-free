@@ -141,6 +141,12 @@
   }
 }
 
+/* Zebra striping for grids. A tint of white, not a surface colour: the surfaces
+   are translucent, so `bg-surface/20` over a black ground rendered as nothing. */
+@utility row-stripe {
+  background-color: oklch(1 0 0 / 0.035);
+}
+
 @utility app-toolbar {
   height: var(--toolbar-h);
   padding-inline: var(--panel-pad-x);
