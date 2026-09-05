@@ -20,7 +20,8 @@ interface CellEditorProps {
 // WHAT:  Inline editor for one grid cell, picked by field kind:
 //          text / decimal        → Input (typing `NULL` stages a null)
 //          int / float           → NumberInput
-//          date / time / datetime → DateTimeField (calendar + segments)
+//          date / time / datetime → DateTimeField (calendar + segments; the
+//                                   calendar/clock popover opens on entry)
 //          json                  → JsonEditorModal (tree + raw)
 //        Enter commits, Escape cancels. Text and number editors also cancel on
 //        blur; the date editors keep focus in their popover, so they carry
@@ -82,6 +83,7 @@ export function CellEditor({ typeName, value, onCommit, onCancel }: CellEditorPr
             <DateTimeField
               compact
               autoFocus
+              autoOpen
               kind={kind}
               ariaLabel={`Edit ${kind}`}
               value={text}

@@ -55,8 +55,9 @@ const HEADER_HEIGHT = 32;
 const CHECK_WIDTH = 40;
 const MIN_COL_WIDTH = 56;
 const MAX_COL_WIDTH = 1600;
-/// Grab area straddling a column's right edge.
-const HANDLE_WIDTH = 6;
+/// Grab area straddling a column's right edge. Wide enough to hit without
+/// aiming: the visible line inside it stays 1px.
+const HANDLE_WIDTH = 12;
 
 // WHAT:  Two-axis virtualized grid: only visible rows AND columns are mounted.
 // WHY:   PRD §4.2 — 10^6 rows at 60 FPS. Row data is pulled through `getRow`
@@ -189,7 +190,7 @@ export function DataGrid({
               return (
                 <div
                   key={`${vc.key}-resize`}
-                  className="absolute top-0 z-10 h-full"
+                  className="absolute top-0 z-30 h-full cursor-col-resize"
                   style={{ left: vc.end - HANDLE_WIDTH / 2, width: HANDLE_WIDTH }}
                   title="Drag to resize · double-click to reset"
                   onDoubleClick={() => resetColumn(column)}
@@ -200,7 +201,7 @@ export function DataGrid({
                     onDragEnd={() => {
                       dragWidth.current = null;
                     }}
-                    className="absolute inset-0 rounded-none"
+                    className="absolute inset-0 w-full rounded-none"
                   />
                 </div>
               );
