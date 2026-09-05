@@ -1,6 +1,6 @@
 // SOT: capability-matrix, engine-feature-matrix, capabilities-page
 import { useMemo, useState } from "react";
-import { Button, Chip, SearchField } from "@heroui/react";
+import { Button, Chip, ScrollShadow, SearchField } from "@heroui/react";
 import type { Capabilities, Engine, EngineKind } from "@/lib/bindings";
 import { CATEGORIES, ENGINE_ORDER, engineMeta } from "@/lib/engines";
 import { OBJECT_KINDS, SECTIONS, TOOL_ORDER, kindMeta, profileOf, toolMeta } from "@/lib/objects";
@@ -85,7 +85,7 @@ export function CapabilityMatrixPage() {
         </SearchField>
         <Check label="Hide empty rows" checked={hideEmpty} onChange={setHideEmpty} />
       </div>
-      <div className="min-h-0 flex-1 overflow-auto">
+      <ScrollShadow className="min-h-0 flex-1 overflow-x-auto">
         <table className="min-w-max border-separate border-spacing-0 text-xs">
           <thead className="sticky top-0 z-20">
             <tr>
@@ -110,7 +110,7 @@ export function CapabilityMatrixPage() {
             })}
           </tbody>
         </table>
-      </div>
+      </ScrollShadow>
     </div>
   );
 }

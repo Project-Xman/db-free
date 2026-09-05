@@ -1,5 +1,5 @@
 // SOT: tab-bar, workspace-tabs, window-drag-region
-import { Button, Chip, CloseButton } from "@heroui/react";
+import { Button, Chip, CloseButton, ScrollShadow } from "@heroui/react";
 import { usePendingCount, useWorkspace, type Tab } from "@/stores/workspace";
 import { Icon, type IconName } from "@/lib/icons";
 import { OBJECT_KINDS, TOOLS } from "@/lib/objects";
@@ -19,11 +19,11 @@ export function TabBar() {
 
   return (
     <div className="drag-region flex h-11 shrink-0 items-center border-b border-border/40 glass-header px-2" data-tauri-drag-region role="tablist" aria-label="Open tabs">
-      <div className="flex h-full items-center gap-1 overflow-x-auto [scrollbar-width:none] py-1">
+      <ScrollShadow orientation="horizontal" hideScrollBar className="flex h-full items-center gap-1 py-1">
         {tabs.map((tab) => (
           <TabItem key={tab.id} tab={tab} active={tab.id === activeTabId} onActivate={() => activateTab(tab.id)} onClose={() => closeTab(tab.id)} />
         ))}
-      </div>
+      </ScrollShadow>
       {activeId ? (
         <Button
           isIconOnly

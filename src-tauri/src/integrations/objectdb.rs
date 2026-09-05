@@ -512,7 +512,7 @@ impl Integration for ObjectDbIntegration {
             return Ok(vec![StatementResult::Affected { rows_affected: 0 }]);
         }
         let mut rs = if rows.iter().all(Json::is_object) || rows.iter().all(Json::is_array) || rows.iter().all(|r| !r.is_object() && !r.is_array()) {
-            rows_to_result_set(&rows, Some("id").filter(|_| rows.iter().any(|r| r.get("id").is_some())), max)
+            rows_to_result_set(&rows, rows.iter().any(|r| r.get("id").is_some()).then_some("id"), max)
         } else {
             json_result(Json::Array(rows))
         };

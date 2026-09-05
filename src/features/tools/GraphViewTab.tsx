@@ -471,7 +471,7 @@ function Legend({
   const typeCounts = new Map<string, number>();
   for (const e of graph.edges) typeCounts.set(e.type, (typeCounts.get(e.type) ?? 0) + 1);
   return (
-    <div className="max-h-56 overflow-y-auto p-3 text-[11px]">
+    <ScrollShadow hideScrollBar className="max-h-56 p-3 text-[11px]">
       <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted">Labels</div>
       <ul className="mb-2 flex flex-wrap gap-1">
         {[...labelCounts.entries()].map(([label, count]) => {
@@ -513,7 +513,7 @@ function Legend({
           );
         })}
       </ul>
-    </div>
+    </ScrollShadow>
   );
 }
 

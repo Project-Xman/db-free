@@ -206,7 +206,7 @@ export function DashboardTab({ document: doc, connectionId: initialConnectionId 
   return (
     <div className="flex h-full min-h-0">
       <div className="flex min-w-0 flex-1 flex-col">
-        <div className="flex h-11 shrink-0 items-center gap-1 overflow-x-auto border-b border-border bg-surface px-2 whitespace-nowrap [scrollbar-width:none]">
+        <ScrollShadow orientation="horizontal" hideScrollBar className="flex h-11 shrink-0 items-center gap-1 border-b border-border bg-surface px-2 whitespace-nowrap">
           <Input
             value={name}
             onChange={(e) => {
@@ -235,7 +235,7 @@ export function DashboardTab({ document: doc, connectionId: initialConnectionId 
               Save{dirty ? " *" : ""}
             </Button>
           </div>
-        </div>
+        </ScrollShadow>
         {showVariables ? (
           <div className="flex flex-wrap items-end gap-2 border-b border-border bg-surface px-3 py-2">
             {body.variables.map((v, i) => (
@@ -284,12 +284,13 @@ export function DashboardTab({ document: doc, connectionId: initialConnectionId 
       </div>
 
       {selected ? (
-        <aside className="relative flex shrink-0 flex-col overflow-y-auto border-l border-border/40 glass-sidebar select-none" style={{ width: panelWidth }}>
+        <aside className="relative flex shrink-0 flex-col border-l border-border/40 glass-sidebar select-none" style={{ width: panelWidth }}>
           <Resizer direction="horizontal" onResize={handlePanelResize} className="absolute -left-1 top-0 bottom-0" />
           <div className="flex items-center gap-2 border-b border-border/40 px-3 py-2">
             <Field label="" value={selected.title} onChange={(title) => patchWidget(selected.id, { title })} placeholder="Widget title" className="[&_label]:hidden" />
             <AppSelect ariaLabel="Widget type" value={selected.kind} options={KINDS} onChange={(kind) => patchWidget(selected.id, { kind })} className="w-40 shrink-0" />
           </div>
+          <ScrollShadow className="flex min-h-0 flex-1 flex-col">
           <div className="h-48 shrink-0 border-b border-border p-2" style={{ borderTopWidth: 2, borderTopColor: tintCss(selected.tint) }}>
             <div className="px-1 pb-1 text-xs text-muted">{selected.title.length > 0 ? selected.title : "Preview"}</div>
             <div className="h-[calc(100%-20px)]">
@@ -358,7 +359,8 @@ export function DashboardTab({ document: doc, connectionId: initialConnectionId 
             <ConditionsEditor widget={selected} onChange={(conditions) => patchWidget(selected.id, { conditions })} />
           ) : null}
 
-          <div className="mt-auto flex items-center border-t border-border px-3 py-2">
+          </ScrollShadow>
+          <div className="flex shrink-0 items-center border-t border-border px-3 py-2">
             <Button size="sm" variant="danger-soft" className="ml-auto" onPress={() => { patchBody({ widgets: body.widgets.filter((w) => w.id !== selected.id) }); setSelectedId(null); }}>
               <Icon name="trash" size={12} />
               Delete widget

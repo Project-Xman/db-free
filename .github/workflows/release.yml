@@ -11,7 +11,8 @@
 #        to cross-build, and GitHub now publishes arm64 runners for Linux and Windows.
 #        Every platform exports LIBCLANG_PATH here rather than in src-tauri/.cargo/
 #        config.toml: a cargo [env] entry is host-agnostic and would point Linux at
-#        a macOS path.
+#        a macOS path. libclang must match the runner's architecture, so the arm64
+#        Windows runner installs LLVM's woa64 build instead of the x86-64 one.
 #        macOS stays a single universal bundle because one .dmg then runs on both
 #        Apple Silicon and Intel — two separate mac bundles would be strictly worse
 #        for users and double the mac build time.
@@ -100,8 +101,21 @@ jobs:
           lib=$(ls /usr/lib/llvm-*/lib/libclang.so* /usr/lib/*/libclang*.so* 2>/dev/null | head -n1)
           test -n "$lib" || { echo "libclang not found after install"; exit 1; }
           echo "LIBCLANG_PATH=$(dirname "$lib")" >> "$GITHUB_ENV"
-      - if: matrix.family == 'windows'
+      # windows-x64: chocolatey's llvm is x86-64 and matches the runner.
+      - if: matrix.artifact-name == 'windows-x64'
         run: choco install -y llvm cmake --installargs 'ADD_CMAKE_TO_PATH=System'
+      # windows-arm64: chocolatey ships only the x86-64 libclang.dll, which bindgen
+      # rejects ("invalid DLL (x86-64)") because the build script itself is arm64.
+      # LLVM publishes a native Windows-on-ARM build; cmake stays on chocolatey.
+      - if: matrix.artifact-name == 'windows-arm64'
+        shell: pwsh
+        run: |
+          choco install -y cmake --installargs 'ADD_CMAKE_TO_PATH=System'
+          $version = '20.1.8'
+          $installer = Join-Path $env:RUNNER_TEMP 'llvm-woa64.exe'
+          Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-woa64.exe" -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList '/S' -Wait
+          if (-not (Test-Path 'C:\Program Files\LLVM\bin\libclang.dll')) { throw 'arm64 libclang.dll missing after install' }
       - if: matrix.family == 'macos'
         run: echo "LIBCLANG_PATH=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
       - if: matrix.family == 'windows'
@@ -123,7 +137,9 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "DB Free ${{ github.ref_name }}"
-          releaseDraft: true
+          # Published straight away: the first matrix job to finish creates the
+          # release, the rest attach their installers to it as they land.
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
 

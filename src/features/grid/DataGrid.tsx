@@ -1,6 +1,6 @@
 // SOT: data-grid, virtualized-grid, grid-cell-rendering, column-sort-header, column-resize, row-selection, inline-cell-edit, foreign-key-link, change-highlighting
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Button } from "@heroui/react";
+import { Button, ScrollShadow } from "@heroui/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { SortRule, Value } from "@/lib/bindings";
 import { cellClass, formatCell } from "@/lib/format";
@@ -55,8 +55,9 @@ const HEADER_HEIGHT = 32;
 const CHECK_WIDTH = 40;
 const MIN_COL_WIDTH = 56;
 const MAX_COL_WIDTH = 1600;
-/// Grab area straddling a column's right edge.
-const HANDLE_WIDTH = 6;
+/// Grab area straddling a column's right edge. Wide enough to hit without
+/// aiming: the visible line inside it stays 1px.
+const HANDLE_WIDTH = 12;
 
 // WHAT:  Two-axis virtualized grid: only visible rows AND columns are mounted.
 // WHY:   PRD §4.2 — 10^6 rows at 60 FPS. Row data is pulled through `getRow`
@@ -154,7 +155,7 @@ export function DataGrid({
   const someSelected = selectable && selectedRows.size > 0 && !allSelected;
 
   return (
-    <div ref={parentRef} className="relative h-full w-full overflow-auto bg-background/60 font-mono text-[12px] select-none">
+    <ScrollShadow ref={parentRef} orientation="horizontal" className="h-full w-full overflow-y-auto bg-background/60 font-mono text-[12px] select-none">
       <div style={{ width: totalWidth + gutter, height: totalHeight + HEADER_HEIGHT, position: "relative" }}>
         <div className="sticky top-0 z-20 flex border-b border-border/50 glass-header" style={{ height: HEADER_HEIGHT, width: totalWidth + gutter }}>
           {selectable ? (
@@ -189,7 +190,7 @@ export function DataGrid({
               return (
                 <div
                   key={`${vc.key}-resize`}
-                  className="absolute top-0 z-10 h-full"
+                  className="absolute top-0 z-30 h-full cursor-col-resize"
                   style={{ left: vc.end - HANDLE_WIDTH / 2, width: HANDLE_WIDTH }}
                   title="Drag to resize · double-click to reset"
                   onDoubleClick={() => resetColumn(column)}
@@ -200,7 +201,7 @@ export function DataGrid({
                     onDragEnd={() => {
                       dragWidth.current = null;
                     }}
-                    className="absolute inset-0 rounded-none"
+                    className="absolute inset-0 w-full rounded-none"
                   />
                 </div>
               );
@@ -322,7 +323,7 @@ export function DataGrid({
           );
         })}
       </div>
-    </div>
+    </ScrollShadow>
   );
 }
 

@@ -1,6 +1,6 @@
 // SOT: metrics-tab, range-query-playground, time-range-presets, series-chart
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Button, Spinner, TextArea } from "@heroui/react";
+import { Button, ScrollShadow, Spinner, TextArea } from "@heroui/react";
 import type { RangeResult, Series } from "@/lib/bindings";
 import { ipc, normalizeError } from "@/lib/ipc";
 import { engineMeta } from "@/lib/engines";
@@ -132,7 +132,8 @@ export function MetricsTab({ connectionId }: { connectionId: string }) {
             <div className="min-h-0 flex-1 p-3">
               <SeriesChart series={visible} />
             </div>
-            <ul className="flex max-h-40 shrink-0 flex-wrap gap-x-4 gap-y-1 overflow-y-auto border-t border-border/40 px-3 py-2 text-[11px]">
+            <ScrollShadow hideScrollBar className="max-h-40 shrink-0 border-t border-border/40 px-3 py-2">
+            <ul className="flex flex-wrap gap-x-4 gap-y-1 text-[11px]">
               {result.series.map((s, i) => (
                 <li key={s.name}>
                   <Button
@@ -155,6 +156,7 @@ export function MetricsTab({ connectionId }: { connectionId: string }) {
                 </li>
               ))}
             </ul>
+            </ScrollShadow>
           </div>
         )}
       </ToolBody>

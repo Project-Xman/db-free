@@ -1,6 +1,6 @@
 // SOT: query-pane, run-query-flow, destructive-confirm-flow, buffer-autosave, save-query-flow, ai-assist-flow, explain-flow, format-sql
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Button, CloseButton, Modal, Popover, Spinner, TextArea, TextField } from "@heroui/react";
+import { Alert, Button, CloseButton, Modal, Popover, ScrollShadow, Spinner, TextArea, TextField } from "@heroui/react";
 import { format as formatSql } from "sql-formatter";
 import type { AppError, ConnectionSummary, PlanReport, QueryOutcome } from "@/lib/bindings";
 import type { SQLNamespace } from "@codemirror/lang-sql";
@@ -415,13 +415,15 @@ export function QueryPane({ connection, tabId, seedSql }: QueryPaneProps) {
                           </Button>
                         </div>
                       </div>
-                      <pre className="selectable max-h-32 overflow-auto font-mono text-[11px] text-foreground whitespace-pre-wrap">{aiGeneratedSql}</pre>
+                      <ScrollShadow className="max-h-32">
+                        <pre className="selectable font-mono text-[11px] text-foreground whitespace-pre-wrap">{aiGeneratedSql}</pre>
+                      </ScrollShadow>
                     </div>
                   ) : null}
                   {aiText !== null ? (
-                    <div className="selectable mt-2 max-h-36 overflow-y-auto rounded-lg border border-border/40 bg-surface/60 p-2 text-xs whitespace-pre-wrap text-muted">
+                    <ScrollShadow className="selectable mt-2 max-h-36 rounded-lg border border-border/40 bg-surface/60 p-2 text-xs whitespace-pre-wrap text-muted">
                       {aiText}
-                    </div>
+                    </ScrollShadow>
                   ) : null}
                 </>
               ) : (
@@ -451,8 +453,10 @@ export function QueryPane({ connection, tabId, seedSql }: QueryPaneProps) {
                   </span>
                 </div>
                 <div className="grid min-h-0 flex-1 grid-cols-2 gap-0">
-                  <pre className="selectable overflow-auto border-r border-border/40 p-3 font-mono text-[11px] text-foreground">{plan.plan}</pre>
-                  <div className="selectable overflow-auto p-3 text-xs whitespace-pre-wrap text-muted">{plan.explanation ?? "Enable an AI provider in Settings to get a plain-language explanation of this plan."}</div>
+                  <ScrollShadow className="overflow-x-auto border-r border-border/40 p-3">
+                    <pre className="selectable font-mono text-[11px] text-foreground">{plan.plan}</pre>
+                  </ScrollShadow>
+                  <ScrollShadow className="selectable p-3 text-xs whitespace-pre-wrap text-muted">{plan.explanation ?? "Enable an AI provider in Settings to get a plain-language explanation of this plan."}</ScrollShadow>
                 </div>
               </div>
             ) : (

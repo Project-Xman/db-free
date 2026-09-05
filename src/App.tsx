@@ -2,6 +2,7 @@
 import { useEffect } from "react";
 import { useActiveConnection, useActiveTab, useWorkspace } from "@/stores/workspace";
 import { isKeyValueEngine } from "@/lib/engines";
+import { fontStack } from "@/lib/fonts";
 import { IconRail } from "@/features/shell/IconRail";
 import { Sidebar } from "@/features/shell/Sidebar";
 import { TabBar } from "@/features/shell/TabBar";
@@ -27,12 +28,18 @@ import { Toaster } from "@/components/global/Toaster";
 import { EmptyState } from "@/components/global/EmptyState";
 import { RunShortcut } from "@/components/global/Kbd";
 
-const ACCENTS: Record<string, string> = {
-  blue: "oklch(0.6 0.2 258)",
-  violet: "oklch(0.62 0.2 295)",
-  green: "oklch(0.68 0.17 150)",
-  orange: "oklch(0.7 0.17 55)",
-  rose: "oklch(0.64 0.2 10)",
+/// Stacks used until the settings load (they match globals.css).
+const UI_FONT_FALLBACK = '"JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+const EDITOR_FONT_FALLBACK = UI_FONT_FALLBACK;
+
+/// Accent colour plus its oklch hue: the hue also drives every tinted surface
+/// (window gradient, glass panels, selection) through the --accent-hue variable.
+const ACCENTS: Record<string, { color: string; hue: number }> = {
+  blue: { color: "oklch(0.6 0.2 258)", hue: 258 },
+  violet: { color: "oklch(0.62 0.2 295)", hue: 295 },
+  green: { color: "oklch(0.68 0.17 150)", hue: 150 },
+  orange: { color: "oklch(0.7 0.17 55)", hue: 55 },
+  rose: { color: "oklch(0.64 0.2 10)", hue: 10 },
 };
 
 export function App() {
@@ -53,7 +60,13 @@ export function App() {
   useEffect(() => {
     if (!settings) return;
     const root = document.documentElement.style;
-    root.setProperty("--accent", ACCENTS[settings.accent] ?? ACCENTS.blue ?? "");
+    const accent = ACCENTS[settings.accent] ?? ACCENTS.blue;
+    if (accent) {
+      root.setProperty("--accent", accent.color);
+      root.setProperty("--accent-hue", String(accent.hue));
+    }
+    root.setProperty("--font-sans", fontStack(settings.uiFont, UI_FONT_FALLBACK));
+    root.setProperty("--font-mono", fontStack(settings.editorFont, EDITOR_FONT_FALLBACK));
     root.setProperty("--ui-font-size", `${settings.uiFontSize}px`);
     root.setProperty("--editor-font-size", `${settings.editorFontSize}px`);
     document.body.style.fontSize = `${settings.uiFontSize}px`;

@@ -1,6 +1,6 @@
 // SOT: value-editor, typed-cell-editor, insert-form-field, json-editor-modal
 import { useMemo, useRef, useState, type KeyboardEvent } from "react";
-import { Button, Input, Modal, TextArea, ToggleButton } from "@heroui/react";
+import { Button, Input, Modal, ScrollShadow, TextArea, ToggleButton } from "@heroui/react";
 import type { ColumnInfo, Value } from "@/lib/bindings";
 import type { JsonValue } from "@/lib/bindings/serde_json/JsonValue";
 import { parseJson } from "@/lib/json";
@@ -20,7 +20,8 @@ interface CellEditorProps {
 // WHAT:  Inline editor for one grid cell, picked by field kind:
 //          text / decimal        → Input (typing `NULL` stages a null)
 //          int / float           → NumberInput
-//          date / time / datetime → DateTimeField (calendar + segments)
+//          date / time / datetime → DateTimeField (calendar + segments; the
+//                                   calendar/clock popover opens on entry)
 //          json                  → JsonEditorModal (tree + raw)
 //        Enter commits, Escape cancels. Text and number editors also cancel on
 //        blur; the date editors keep focus in their popover, so they carry
@@ -82,6 +83,7 @@ export function CellEditor({ typeName, value, onCommit, onCancel }: CellEditorPr
             <DateTimeField
               compact
               autoFocus
+              autoOpen
               kind={kind}
               ariaLabel={`Edit ${kind}`}
               value={text}
@@ -290,9 +292,9 @@ function JsonEditorBody({ initial, onSave, onClose, secondaryAction }: Omit<Json
           </div>
           <div className="flex min-h-0 min-w-0 flex-col gap-1.5">
             <div className="flex h-6 items-center text-xs text-muted">Tree</div>
-            <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-border/40 bg-background/60 p-2">
+            <ScrollShadow className="min-h-0 flex-1 overflow-x-auto rounded-lg border border-border/40 bg-background/60 p-2">
               {parsed !== undefined ? <JsonViewer value={parsed} defaultDepth={3} /> : <span className="text-xs text-muted">Fix the JSON on the left to preview it here.</span>}
-            </div>
+            </ScrollShadow>
           </div>
         </div>
       </Modal.Body>
