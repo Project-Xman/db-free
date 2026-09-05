@@ -4,6 +4,7 @@ import { engineMeta } from "@/lib/engines";
 import { cn } from "@/lib/cn";
 import { useWorkspace } from "@/stores/workspace";
 import { IconButton } from "@/components/global/Button";
+import { useContextMenu } from "@/components/global/ContextMenu";
 import { EnvBadge, EnvDot } from "@/components/global/Badge";
 import { EmptyState } from "@/components/global/EmptyState";
 import { Icon } from "@/lib/icons";
@@ -17,6 +18,9 @@ export function ConnectionsPage() {
   const select = useWorkspace((s) => s.selectConnection);
   const openForm = useWorkspace((s) => s.openForm);
   const disconnect = useWorkspace((s) => s.disconnect);
+  const deleteConnection = useWorkspace((s) => s.deleteConnection);
+  const showInfo = useWorkspace((s) => s.showInfo);
+  const menu = useContextMenu();
 
   return (
     <div className="grid-bg flex h-full min-h-0 flex-1 flex-col">
@@ -67,6 +71,25 @@ export function ConnectionsPage() {
                 <Card
                   key={c.id}
                   className="group relative flex flex-row items-center gap-3.5 rounded-xl glass-card px-4 py-3.5 glass-card-hover border-border/40"
+                  onContextMenu={(e) =>
+                    menu.open(
+                      e,
+                      [
+                        { id: "open", label: live ? "Open" : "Connect", icon: "plug" },
+                        { id: "disconnect", label: "Disconnect", icon: "x", disabled: !live },
+                        { id: "edit", label: "Edit connection…", icon: "pencil", group: "edit" },
+                        { id: "copy-target", label: "Copy host / file", icon: "copy", group: "edit", disabled: target.length === 0 },
+                        { id: "delete", label: "Delete connection", icon: "trash", danger: true, group: "danger" },
+                      ],
+                      (action) => {
+                        if (action === "open") select(c.id);
+                        else if (action === "disconnect") void disconnect(c.id);
+                        else if (action === "edit") openForm(c.id);
+                        else if (action === "copy-target") { void navigator.clipboard.writeText(target); showInfo("Connection target copied."); }
+                        else if (action === "delete") void deleteConnection(c.id);
+                      },
+                    )
+                  }
                 >
                   <Card.Content className="flex flex-row items-center gap-3.5 w-full p-0">
                     <span className="flex size-10 items-center justify-center overflow-hidden rounded-xl bg-surface-tertiary/70 text-accent shadow-xs border border-border/40 shrink-0">
@@ -105,6 +128,7 @@ export function ConnectionsPage() {
                 </Card>
               );
             })}
+            {menu.node}
           </div>
         )}
         </div>

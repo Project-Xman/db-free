@@ -5,6 +5,7 @@ import type { HistoryEntry } from "@/lib/bindings";
 import { ipc } from "@/lib/ipc";
 import { useActiveConnection, useWorkspace } from "@/stores/workspace";
 import { IconButton } from "@/components/global/Button";
+import { useContextMenu } from "@/components/global/ContextMenu";
 import { Segmented } from "@/components/global/Field";
 import { Icon } from "@/lib/icons";
 import { ConnectionSwitcher } from "@/features/shell/ConnectionSwitcher";
@@ -17,6 +18,8 @@ export function QueriesPanel() {
   const loadSavedQueries = useWorkspace((s) => s.loadSavedQueries);
   const deleteSavedQuery = useWorkspace((s) => s.deleteSavedQuery);
   const openQuery = useWorkspace((s) => s.openQuery);
+  const showInfo = useWorkspace((s) => s.showInfo);
+  const menu = useContextMenu();
   const [order, setOrder] = useState<"az" | "za">("az");
   const [recent, setRecent] = useState<HistoryEntry[]>([]);
 
@@ -71,7 +74,28 @@ export function QueriesPanel() {
       <ScrollShadow className="min-h-0 flex-1 px-1.5 py-1">
         {sorted.length === 0 ? <p className="px-3 py-2 text-xs text-muted">No saved queries yet. Use Save in a query tab.</p> : null}
         {sorted.map((q) => (
-          <div key={q.id} title={q.sql} className="group flex h-8 items-center gap-2 rounded-lg px-2 text-[12.5px] text-muted hover:bg-surface-secondary/70 hover:text-foreground liquid-hover">
+          <div
+            key={q.id}
+            title={q.sql}
+            className="group flex h-8 items-center gap-2 rounded-lg px-2 text-[12.5px] text-muted hover:bg-surface-secondary/70 hover:text-foreground liquid-hover"
+            onContextMenu={(e) =>
+              menu.open(
+                e,
+                [
+                  { id: "open", label: "Open in a query tab", icon: "terminal" },
+                  { id: "copy-sql", label: "Copy SQL", icon: "copy", group: "copy" },
+                  { id: "copy-name", label: "Copy name", icon: "copy", group: "copy" },
+                  { id: "delete", label: "Delete saved query", icon: "trash", danger: true, group: "danger" },
+                ],
+                (action) => {
+                  if (action === "open") openQuery(cid, q.sql, q.name);
+                  else if (action === "copy-sql") { void navigator.clipboard.writeText(q.sql); showInfo("Query copied."); }
+                  else if (action === "copy-name") void navigator.clipboard.writeText(q.name);
+                  else if (action === "delete") void deleteSavedQuery(q.id);
+                },
+              )
+            }
+          >
             <Button
               variant="ghost"
               size="sm"
@@ -98,7 +122,24 @@ export function QueriesPanel() {
         <div className="mt-3 px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted/80">Recent</div>
         {recent.length === 0 ? <p className="px-3 py-1 text-xs text-muted">Nothing run yet.</p> : null}
         {recent.map((r) => (
-          <div key={r.id} title={r.sql} className="w-full">
+          <div
+            key={r.id}
+            title={r.sql}
+            className="w-full"
+            onContextMenu={(e) =>
+              menu.open(
+                e,
+                [
+                  { id: "open", label: "Open in a query tab", icon: "terminal" },
+                  { id: "copy", label: "Copy SQL", icon: "copy" },
+                ],
+                (action) => {
+                  if (action === "open") openQuery(cid, r.sql);
+                  else { void navigator.clipboard.writeText(r.sql); showInfo("Query copied."); }
+                },
+              )
+            }
+          >
             <Button
               variant="ghost"
               size="sm"
@@ -111,6 +152,7 @@ export function QueriesPanel() {
           </div>
         ))}
       </ScrollShadow>
+      {menu.node}
     </aside>
   );
 }

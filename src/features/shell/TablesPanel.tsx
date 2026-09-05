@@ -1,14 +1,15 @@
 // SOT: tables-panel, sidebar-tables, database-switcher, schema-switcher, table-tree
-import { useState } from "react";
+import { useState, type MouseEvent as ReactMouseEvent } from "react";
 import { Button, Chip, ScrollShadow, SearchField, Separator, Skeleton, Spinner } from "@heroui/react";
-import type { ColumnInfo, TableInfo, TableRef } from "@/lib/bindings";
+import type { ColumnInfo, Engine, TableInfo, TableRef } from "@/lib/bindings";
 import { formatCount } from "@/lib/format";
-import { collectionNoun, isKeyValueEngine, supportsErd } from "@/lib/engines";
+import { collectionNoun, engineMeta, isKeyValueEngine, supportsErd } from "@/lib/engines";
 import { Icon, typeIcon } from "@/lib/icons";
 import { normalizeError } from "@/lib/ipc";
 import { tableKey, useActiveConnection, useWorkspace } from "@/stores/workspace";
 import { IconButton } from "@/components/global/Button";
 import { AppSelect, Segmented } from "@/components/global/Field";
+import { useContextMenu, type ContextMenu, type MenuEntry } from "@/components/global/ContextMenu";
 import { EnvBadge } from "@/components/global/Badge";
 import { ConnectionSwitcher } from "./ConnectionSwitcher";
 import { KeyTree } from "./KeyTree";
@@ -30,6 +31,7 @@ export function TablesPanel() {
   const openQuery = useWorkspace((s) => s.openQuery);
   const openErd = useWorkspace((s) => s.openErd);
   const connecting = useWorkspace((s) => s.connecting);
+  const menu = useContextMenu();
   const [mode, setMode] = useState<"az" | "tags">("az");
   const [search, setSearch] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -105,7 +107,28 @@ export function TablesPanel() {
           visible.map((schema) => (
             <div key={schema.name} className="mb-1">
               {schemaFilter === null && schemas.length > 1 ? (
-                <div className="flex items-center gap-1.5 px-2.5 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted/80">
+                <div
+                  className="flex items-center gap-1.5 px-2.5 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted/80"
+                  onContextMenu={(e) =>
+                    menu.open(
+                      e,
+                      [
+                        { id: "only", label: `Show only ${schema.name}`, icon: "folder" },
+                        { id: "erd", label: "ER diagram of this schema", icon: "view", group: "open", disabled: !supportsErd(connection.engine) },
+                        { id: "copy", label: "Copy schema name", icon: "copy", group: "copy" },
+                        { id: "refresh", label: "Refresh schema", icon: "refresh", group: "copy" },
+                      ],
+                      (action) => {
+                        // The header only renders while every schema is shown, so
+                        // "show all" would be a no-op here; the picker above does it.
+                        if (action === "only") setSchemaFilter(id, schema.name);
+                        else if (action === "erd") openErd(id, schema.name);
+                        else if (action === "copy") void navigator.clipboard.writeText(schema.name);
+                        else if (action === "refresh") void loadCatalog(id);
+                      },
+                    )
+                  }
+                >
                   <Icon name="folder" size={11} />
                   {schema.name}
                   <Chip size="sm" variant="soft" className="ml-auto font-mono text-[9px]">
@@ -114,7 +137,7 @@ export function TablesPanel() {
                 </div>
               ) : null}
               {schema.tables.map((t) => (
-                <TableRow key={tableKey({ schema: t.schema, name: t.name })} connectionId={id} table={t} />
+                <TableRow key={tableKey({ schema: t.schema, name: t.name })} connectionId={id} table={t} menu={menu} engine={connection.engine} />
               ))}
             </div>
           ))
@@ -122,19 +145,49 @@ export function TablesPanel() {
       </ScrollShadow>
 
       {info?.serverVersion ? <div className="truncate border-t border-border/40 px-3 py-1.5 text-[10px] font-mono text-muted/70">{info.serverVersion}</div> : null}
+      {menu.node}
     </aside>
   );
 }
 
-function TableRow({ connectionId, table }: { connectionId: string; table: TableInfo }) {
+function TableRow({ connectionId, table, menu, engine }: { connectionId: string; table: TableInfo; menu: ContextMenu; engine: Engine }) {
   const ref: TableRef = { schema: table.schema, name: table.name };
   const key = tableKey(ref);
   const isActive = useWorkspace((s) => s.activeTabId === `table:${connectionId}:${key}`);
   const columns = useWorkspace((s) => s.columnsCache[`${connectionId}:${key}`]);
   const loadColumns = useWorkspace((s) => s.loadColumns);
   const openTable = useWorkspace((s) => s.openTable);
+  const openQuery = useWorkspace((s) => s.openQuery);
+  const openTransfer = useWorkspace((s) => s.openTransfer);
+  const loadCatalog = useWorkspace((s) => s.loadCatalog);
   const showError = useWorkspace((s) => s.showError);
+  const showInfo = useWorkspace((s) => s.showInfo);
   const [expanded, setExpanded] = useState(false);
+  const qualified = table.schema === null ? table.name : `${table.schema}.${table.name}`;
+  const speaksSql = engineMeta(engine).commandLanguage === "SQL";
+
+  const entries: MenuEntry[] = [
+    { id: "open", label: `Open ${table.kind === "view" ? "view" : "table"}`, icon: "table" },
+    { id: "columns", label: expanded ? "Collapse columns" : "Show columns", icon: "columns" },
+    { id: "select", label: "Query this table", icon: "terminal", group: "query", disabled: !speaksSql },
+    { id: "count", label: "Count rows", icon: "hash", group: "query", disabled: !speaksSql },
+    { id: "export", label: "Export / import…", icon: "download", group: "query" },
+    { id: "copy-name", label: "Copy name", icon: "copy", group: "copy" },
+    { id: "copy-qualified", label: "Copy qualified name", icon: "copy", group: "copy", disabled: table.schema === null },
+    { id: "refresh", label: "Refresh schema", icon: "refresh", group: "copy" },
+  ];
+
+  const onMenu = (event: ReactMouseEvent) =>
+    menu.open(event, entries, (action) => {
+      if (action === "open") openTable(connectionId, ref);
+      else if (action === "columns") toggle();
+      else if (action === "select") openQuery(connectionId, `SELECT *\nFROM ${qualified}\nLIMIT 100;`, table.name);
+      else if (action === "count") openQuery(connectionId, `SELECT count(*) FROM ${qualified};`, `count ${table.name}`);
+      else if (action === "export") openTransfer(connectionId);
+      else if (action === "copy-name") { void navigator.clipboard.writeText(table.name); showInfo("Table name copied."); }
+      else if (action === "copy-qualified") { void navigator.clipboard.writeText(qualified); showInfo("Qualified name copied."); }
+      else if (action === "refresh") void loadCatalog(connectionId);
+    });
 
   const toggle = () => {
     const next = !expanded;
@@ -158,6 +211,7 @@ function TableRow({ connectionId, table }: { connectionId: string; table: TableI
           isActive ? "glass-pill text-accent font-medium shadow-xs" : "text-muted hover:bg-surface-secondary/70 hover:text-foreground",
         )}
         title={table.kind === "view" ? "view" : "table"}
+        onContextMenu={onMenu}
       >
         <Button isIconOnly variant="ghost" size="sm" aria-label={expanded ? "Collapse columns" : "Expand columns"} onPress={toggle} className="size-4.5 min-w-4.5 rounded-sm text-muted">
           <Icon name={expanded ? "chevron-down" : "chevron-right"} size={11} />
@@ -177,12 +231,12 @@ function TableRow({ connectionId, table }: { connectionId: string; table: TableI
           ) : null}
         </Button>
       </div>
-      {expanded ? <ColumnList columns={columns} /> : null}
+      {expanded ? <ColumnList columns={columns} menu={menu} /> : null}
     </div>
   );
 }
 
-function ColumnList({ columns }: { columns: ColumnInfo[] | undefined }) {
+function ColumnList({ columns, menu }: { columns: ColumnInfo[] | undefined; menu: ContextMenu }) {
   if (!columns) {
     return (
       <div className="flex items-center gap-2 py-1 pl-8 text-[11px] text-muted">
@@ -193,7 +247,21 @@ function ColumnList({ columns }: { columns: ColumnInfo[] | undefined }) {
   return (
     <ul className="py-0.5 pl-6 pr-1 space-y-0.5">
       {columns.map((c) => (
-        <li key={c.name} className="flex h-5.5 items-center gap-1.5 rounded-md px-1.5 text-[11.5px] text-muted hover:bg-surface-secondary/40 hover:text-foreground transition-colors" title={c.dataType}>
+        <li
+          key={c.name}
+          className="flex h-5.5 items-center gap-1.5 rounded-md px-1.5 text-[11.5px] text-muted hover:bg-surface-secondary/40 hover:text-foreground transition-colors"
+          title={c.dataType}
+          onContextMenu={(e) =>
+            menu.open(
+              e,
+              [
+                { id: "name", label: "Copy column name", icon: "copy" },
+                { id: "type", label: `Copy type (${c.dataType})`, icon: "copy" },
+              ],
+              (action) => void navigator.clipboard.writeText(action === "name" ? c.name : c.dataType),
+            )
+          }
+        >
           <Icon name={typeIcon(c.dataType, c.primaryKey)} size={11} className={c.primaryKey ? "text-warning" : "opacity-60"} />
           <span className="truncate font-sans">{c.name}</span>
           <span className="ml-auto truncate font-mono text-[9.5px] text-muted/60">{c.dataType}</span>

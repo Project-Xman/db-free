@@ -6,6 +6,7 @@ import { kindMeta } from "@/lib/objects";
 import { Icon } from "@/lib/icons";
 import { normalizeError } from "@/lib/ipc";
 import { objectKey, useWorkspace } from "@/stores/workspace";
+import { useContextMenu } from "@/components/global/ContextMenu";
 import { cn } from "@/lib/cn";
 
 // WHAT:  One object row: kind icon, name, muted detail, optional badge chip.
@@ -14,6 +15,9 @@ import { cn } from "@/lib/cn";
 //        `onSelect` replaces that default (pickers such as the XML viewer).
 export function ObjectRow({ connectionId, object, dense = false, onSelect }: { connectionId: string; object: ObjectSummary; dense?: boolean; onSelect?: (reference: ObjectRef) => void }) {
   const openObject = useWorkspace((s) => s.openObject);
+  const invalidateObjects = useWorkspace((s) => s.invalidateObjects);
+  const showInfo = useWorkspace((s) => s.showInfo);
+  const menu = useContextMenu();
   const tabId = `object:${connectionId}:${objectKey(object.reference)}`;
   const isActive = useWorkspace((s) => s.activeTabId === tabId);
   const meta = kindMeta(object.reference.kind);
@@ -22,6 +26,21 @@ export function ObjectRow({ connectionId, object, dense = false, onSelect }: { c
       variant="ghost"
       size="sm"
       onPress={() => (onSelect ? onSelect(object.reference) : openObject(connectionId, object.reference))}
+      onContextMenu={(e) =>
+        menu.open(
+          e,
+          [
+            { id: "open", label: `Open ${meta.label.toLowerCase()}`, icon: meta.icon },
+            { id: "copy", label: "Copy name", icon: "copy", group: "copy" },
+            { id: "refresh", label: "Refresh list", icon: "refresh", group: "copy" },
+          ],
+          (action) => {
+            if (action === "open") openObject(connectionId, object.reference);
+            else if (action === "copy") { void navigator.clipboard.writeText(object.reference.name); showInfo("Name copied."); }
+            else invalidateObjects(connectionId);
+          },
+        )
+      }
       className={cn(
         "flex w-full min-w-0 items-center justify-start gap-2 rounded-lg px-2 text-left text-[12.5px] liquid-hover",
         dense ? "h-7 min-h-7" : "h-7.5 min-h-7.5",
@@ -36,6 +55,7 @@ export function ObjectRow({ connectionId, object, dense = false, onSelect }: { c
         </Chip>
       ) : null}
       {object.detail ? <span className="ml-auto truncate pl-2 font-mono text-[10px] text-muted/70">{object.detail}</span> : null}
+      {menu.node}
     </Button>
   );
 }
