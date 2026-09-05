@@ -66,7 +66,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/Project-Xman/db-free/releases/latest/download/latest.json"
+        "https://github.com/farzanshibu/db-free/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERCQUI5RTlEMDYwQ0ZBNTcKUldSWCtnd0duWjZyMi9OR1VEYW9BL3I4a0ZpQmpUM2VwQXRpV0JJS2tlYVpUKzlkeUpwc3Z3eG0K"
     }
