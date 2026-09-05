@@ -225,6 +225,31 @@ pub trait Integration: Send + Sync {
     async fn ddl(&self, _table: &TableRef) -> AppResult<Option<String>> {
         Ok(None)
     }
+    // WHAT:  A statement that creates a table / collection / class, in this
+    //        engine's own language, for the "New …" button to seed a query tab.
+    // WHY:   Creation is where engines differ most — CREATE TABLE, createCollection,
+    //        a PUT with a mapping, DEFINE TABLE — so the adapter writes it and the
+    //        UI stays engine-agnostic. Seeding an editor rather than executing
+    //        means the user reads the statement first and the guard still applies
+    //        when they run it.
+    // HOW:   The default covers every SQL family from the column list; engines
+    //        with another language override it. None means "this engine has no
+    //        statement for that", and the button says so.
+    fn create_template(&self, table: &TableRef, columns: &[ColumnInfo]) -> Option<String> {
+        if !self.capabilities().sql {
+            return None;
+        }
+        let target = match table.schema.as_deref() {
+            Some(schema) if !schema.is_empty() => format!("{schema}.{}", table.name),
+            _ => table.name.clone(),
+        };
+        let body = columns
+            .iter()
+            .map(|c| format!("  {} {}{}{}", c.name, c.data_type, if c.nullable { "" } else { " NOT NULL" }, if c.primary_key { " PRIMARY KEY" } else { "" }))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        Some(format!("CREATE TABLE {target} (\n{body}\n);"))
+    }
 
     // ---- object explorer / administration ------------------------------------
     // WHAT:  Lists objects of one kind. `parent` is the namespace for scoped kinds

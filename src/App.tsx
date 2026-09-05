@@ -1,6 +1,7 @@
 // SOT: app-shell, layout, page-routing, tab-routing, settings-css-vars
 import { useEffect } from "react";
 import { useActiveConnection, useActiveTab, useWorkspace } from "@/stores/workspace";
+import { ipc } from "@/lib/ipc";
 import { isKeyValueEngine } from "@/lib/engines";
 import { fontStack } from "@/lib/fonts";
 import { IconRail } from "@/features/shell/IconRail";
@@ -48,6 +49,7 @@ export function App() {
   const page = useWorkspace((s) => s.page);
   const settings = useWorkspace((s) => s.settings);
   const density = useWorkspace((s) => s.density);
+  const showInfo = useWorkspace((s) => s.showInfo);
   const connection = useActiveConnection();
   const connected = useWorkspace((s) => (connection ? s.sessions.includes(connection.id) : false));
   const tab = useActiveTab();
@@ -63,6 +65,21 @@ export function App() {
   //        honour and hides the app's own context menus behind a second click.
   // HOW:   Capture phase, preventDefault only — propagation continues, so the
   //        React handlers that open the app's menus still run.
+  // WHAT:  One update check at startup, announced quietly.
+  // WHY:   Nobody opens Settings to look for updates; the app should say when
+  //        one exists. It only tells — installing stays a decision in
+  //        Settings -> Updates, because it restarts the app.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const status = await ipc("check_update");
+        if (status.available !== null) showInfo(`DB Free ${status.available} is available — install it in Settings → Updates.`);
+      } catch {
+        // Offline, or no release feed: an update check is not worth an error toast.
+      }
+    })();
+  }, [showInfo]);
+
   // Density drives the chrome's spacing tokens (globals.css), not just row height.
   useEffect(() => {
     document.documentElement.setAttribute("data-density", density);

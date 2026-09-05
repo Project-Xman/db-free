@@ -32,4 +32,12 @@ transactions: boolean,
 /**
  * `row_estimate` is an exact count, not a statistics guess.
  */
-exactEstimate: boolean, };
+exactEstimate: boolean, 
+/**
+ * `columns` describes the object it is asked about. False when it returns a
+ * fixed pseudo-schema that is the same for every object (an S3 bucket's
+ * key/size/etag, a Kafka topic's partition/offset/value, a Pinecone index's
+ * id/values/metadata): listing those as an object's "fields" would show the
+ * same uninformative rows everywhere.
+ */
+describesFields: boolean, };

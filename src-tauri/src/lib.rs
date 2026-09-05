@@ -78,6 +78,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::objects::load_history,
             commands::updates::check_update,
             commands::updates::install_update,
+            commands::schema::create_template,
         ])
         .run(tauri::generate_context!())?;
     Ok(())
@@ -103,6 +104,7 @@ mod export_bindings {
             crate::commands::connections::SessionRequest::export_all(&cfg),
             crate::commands::schema::CatalogRequest::export_all(&cfg),
             crate::commands::schema::ColumnsRequest::export_all(&cfg),
+            crate::commands::schema::CreateTemplateRequest::export_all(&cfg),
             crate::commands::data::TablePageRequest::export_all(&cfg),
             crate::commands::query::ExecuteQueryRequest::export_all(&cfg),
             crate::commands::query::HistoryRequest::export_all(&cfg),
@@ -121,6 +123,7 @@ mod export_bindings {
             crate::commands::query::ClearHistoryRequest::export_all(&cfg),
             crate::commands::settings::SaveSettingsRequest::export_all(&cfg),
             crate::model::UpdateStatus::export_all(&cfg),
+            crate::model::UpdateProgress::export_all(&cfg),
             crate::commands::library::SaveQueryRequest::export_all(&cfg),
             crate::commands::library::IdRequest::export_all(&cfg),
             crate::commands::library::ListDocumentsRequest::export_all(&cfg),

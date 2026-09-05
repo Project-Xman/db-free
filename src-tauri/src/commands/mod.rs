@@ -69,10 +69,11 @@ pub enum CommandName {
     LoadHistory,
     CheckUpdate,
     InstallUpdate,
+    CreateTemplate,
 }
 
 impl CommandName {
-    pub const ALL: [CommandName; 43] = [
+    pub const ALL: [CommandName; 44] = [
         CommandName::ListConnections,
         CommandName::SaveConnection,
         CommandName::DeleteConnection,
@@ -116,6 +117,7 @@ impl CommandName {
         CommandName::LoadHistory,
         CommandName::CheckUpdate,
         CommandName::InstallUpdate,
+        CommandName::CreateTemplate,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -163,6 +165,7 @@ impl CommandName {
             CommandName::LoadHistory => "load_history",
             CommandName::CheckUpdate => "check_update",
             CommandName::InstallUpdate => "install_update",
+            CommandName::CreateTemplate => "create_template",
         }
     }
 }
@@ -198,7 +201,7 @@ mod tests {
             | CommandName::Disconnect
             | CommandName::ActiveSessions
             | CommandName::DescribeSession => "connections",
-            CommandName::LoadCatalog | CommandName::LoadColumns | CommandName::LoadForeignKeys | CommandName::LoadDdl => "schema",
+            CommandName::LoadCatalog | CommandName::LoadColumns | CommandName::LoadForeignKeys | CommandName::LoadDdl | CommandName::CreateTemplate => "schema",
             CommandName::FetchTablePage => "data",
             CommandName::ExecuteQuery
             | CommandName::ListHistory
