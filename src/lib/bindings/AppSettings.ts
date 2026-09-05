@@ -3,4 +3,12 @@ import type { AiSettings } from "./AiSettings";
 import type { ExecutionMode } from "./ExecutionMode";
 import type { RunScope } from "./RunScope";
 
-export type AppSettings = { accent: string, uiFontSize: number, editorFontSize: number, gridDensity: string, nullDisplay: string, showResultsPane: boolean, condenseSqlWhenFormatting: boolean, runScope: RunScope, executionMode: ExecutionMode, commandMenuSections: Array<string>, inspectorTabs: Array<string>, confirmDestructive: boolean, crashReportsOptIn: boolean, ai: AiSettings, };
+export type AppSettings = { accent: string, 
+/**
+ * Font family key for the app chrome; `src/lib/fonts.ts` maps it to a stack.
+ */
+uiFont: string, 
+/**
+ * Font family key for code, grids and values (monospace faces).
+ */
+editorFont: string, uiFontSize: number, editorFontSize: number, gridDensity: string, nullDisplay: string, showResultsPane: boolean, condenseSqlWhenFormatting: boolean, runScope: RunScope, executionMode: ExecutionMode, commandMenuSections: Array<string>, inspectorTabs: Array<string>, confirmDestructive: boolean, crashReportsOptIn: boolean, ai: AiSettings, };
