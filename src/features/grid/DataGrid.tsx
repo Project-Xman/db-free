@@ -1,14 +1,15 @@
 // SOT: data-grid, virtualized-grid, grid-cell-rendering, column-sort-header, column-resize, row-selection, inline-cell-edit, foreign-key-link, change-highlighting
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { Button, ScrollShadow } from "@heroui/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import type { SortRule, Value } from "@/lib/bindings";
+import type { FilterRule, SortRule, Value } from "@/lib/bindings";
 import { cellClass, formatCell } from "@/lib/format";
 import { fieldKind } from "@/lib/fields";
 import { Icon, typeIcon } from "@/lib/icons";
 import { Check } from "@/components/global/Field";
 import { CellEditor } from "@/components/global/ValueEditor";
 import { Resizer } from "@/components/global/Resizer";
+import { useContextMenu, type MenuEntry } from "@/components/global/ContextMenu";
 import { cn } from "@/lib/cn";
 
 export interface GridColumn {
@@ -49,6 +50,15 @@ interface DataGridProps {
   nullDisplay?: string;
   /// Foreign-key traversal: called from the link button in a linked column's cell.
   onLinkOpen?: (rowIndex: number, colIndex: number) => void;
+  /// Right-click menus build filter rules from the clicked value. The owner
+  /// sends them with the page request, so every engine honours them: SQL
+  /// adapters push them into WHERE, the rest filter the fetched page.
+  onFilter?: (rule: FilterRule) => void;
+  /// Right-click menu on a header sets an explicit direction (onSortToggle cycles).
+  onSortSet?: (rule: SortRule) => void;
+  onClearSort?: () => void;
+  /// Feedback for the copy actions.
+  onCopied?: (what: string) => void;
 }
 
 const HEADER_HEIGHT = 32;
@@ -92,6 +102,10 @@ export function DataGrid({
   insertedFrom,
   nullDisplay = "NULL",
   onLinkOpen,
+  onFilter,
+  onSortSet,
+  onClearSort,
+  onCopied,
 }: DataGridProps) {
   const parentRef = useRef<HTMLDivElement | null>(null);
   const rangeRef = useRef(onRangeChange);
@@ -156,6 +170,97 @@ export function DataGrid({
     colVirtualizer.resizeItem(index, estimateWidth(column));
   };
 
+  const menu = useContextMenu();
+
+  const copy = (text: string, what: string) => {
+    void navigator.clipboard.writeText(text);
+    onCopied?.(what);
+  };
+
+  /// Filter/sort entries are the same for a header and a cell; the cell adds the
+  /// value-bound ones because it knows which value was clicked.
+  const headerEntries = (column: GridColumn): MenuEntry[] => [
+    ...(onSortToggle || onSortSet
+      ? ([
+          { id: "sort-asc", label: "Sort ascending", icon: "arrow-up" },
+          { id: "sort-desc", label: "Sort descending", icon: "arrow-down" },
+          { id: "sort-clear", label: "Clear sort", icon: "x", disabled: sort.length === 0 },
+        ] satisfies MenuEntry[])
+      : []),
+    ...(onFilter
+      ? ([
+          { id: "filter-null", label: `${column.name} is NULL`, icon: "filter", group: "filter" },
+          { id: "filter-not-null", label: `${column.name} is not NULL`, icon: "filter", group: "filter" },
+        ] satisfies MenuEntry[])
+      : []),
+    { id: "copy-column", label: "Copy column name", icon: "copy", group: "copy" },
+    { id: "reset-width", label: "Reset column width", icon: "columns", group: "copy" },
+  ];
+
+  const onHeaderMenu = (event: ReactMouseEvent, column: GridColumn, index: number) =>
+    menu.open(event, headerEntries(column), (id) => {
+      if (id === "sort-asc") (onSortSet ?? (() => onSortToggle?.(column.name)))({ column: column.name, desc: false });
+      else if (id === "sort-desc") (onSortSet ?? (() => onSortToggle?.(column.name)))({ column: column.name, desc: true });
+      else if (id === "sort-clear") onClearSort?.();
+      else if (id === "filter-null") onFilter?.({ column: column.name, op: "is_null", value: "" });
+      else if (id === "filter-not-null") onFilter?.({ column: column.name, op: "is_not_null", value: "" });
+      else if (id === "copy-column") copy(column.name, "Column name");
+      else if (id === "reset-width") resetColumn(column, index);
+    });
+
+  const onCellMenu = (event: ReactMouseEvent, column: GridColumn | undefined, rowIndex: number, colIndex: number, value: Value | undefined) => {
+    if (!column) return;
+    const text = value === undefined ? "" : formatCell(value).text;
+    const isNull = value?.t === "null";
+    const short = text.length > 24 ? `${text.slice(0, 24)}…` : text;
+    const filterable = onFilter !== undefined && !isNull;
+    const entries: MenuEntry[] = [
+      { id: "copy-value", label: "Copy value", icon: "copy" },
+      { id: "copy-row-json", label: "Copy row as JSON", icon: "braces" },
+      { id: "copy-row-csv", label: "Copy row as CSV", icon: "rows" },
+      ...(filterable
+        ? ([
+            { id: "filter-eq", label: `Filter: ${column.name} = ${short}`, icon: "filter", group: "filter" },
+            { id: "filter-ne", label: `Filter: ${column.name} ≠ ${short}`, icon: "filter", group: "filter" },
+            { id: "filter-contains", label: `Filter: ${column.name} contains ${short}`, icon: "search", group: "filter" },
+          ] satisfies MenuEntry[])
+        : []),
+      ...(onFilter && isNull ? ([{ id: "filter-null", label: `Filter: ${column.name} is NULL`, icon: "filter", group: "filter" }] satisfies MenuEntry[]) : []),
+      ...(onSortSet || onSortToggle
+        ? ([
+            { id: "sort-asc", label: `Sort by ${column.name} ascending`, icon: "arrow-up", group: "sort" },
+            { id: "sort-desc", label: `Sort by ${column.name} descending`, icon: "arrow-down", group: "sort" },
+          ] satisfies MenuEntry[])
+        : []),
+      ...(onCellEdit !== undefined && value !== undefined
+        ? ([
+            { id: "edit", label: "Edit cell", icon: "pencil", group: "edit" },
+            { id: "set-null", label: "Set NULL", icon: "minus", group: "edit", disabled: isNull },
+          ] satisfies MenuEntry[])
+        : []),
+      ...(column.linkTo !== undefined && onLinkOpen !== undefined
+        ? ([{ id: "open-link", label: `Open ${column.linkTo} rows`, icon: "link", group: "link" }] satisfies MenuEntry[])
+        : []),
+    ];
+
+    onCellSelect?.(rowIndex, colIndex);
+    menu.open(event, entries, (id) => {
+      const row = getRow(rowIndex);
+      if (id === "copy-value") copy(text, "Value");
+      else if (id === "copy-row-json") copy(JSON.stringify(Object.fromEntries(columns.map((c, i) => [c.name, row?.[i] === undefined ? null : formatCell(row[i]).text])), null, 2), "Row");
+      else if (id === "copy-row-csv") copy(columns.map((_, i) => csvCell(row?.[i])).join(","), "Row");
+      else if (id === "filter-eq") onFilter?.({ column: column.name, op: "eq", value: text });
+      else if (id === "filter-ne") onFilter?.({ column: column.name, op: "ne", value: text });
+      else if (id === "filter-contains") onFilter?.({ column: column.name, op: "contains", value: text });
+      else if (id === "filter-null") onFilter?.({ column: column.name, op: "is_null", value: "" });
+      else if (id === "sort-asc") (onSortSet ?? (() => onSortToggle?.(column.name)))({ column: column.name, desc: false });
+      else if (id === "sort-desc") (onSortSet ?? (() => onSortToggle?.(column.name)))({ column: column.name, desc: true });
+      else if (id === "edit") setEditing({ row: rowIndex, col: colIndex });
+      else if (id === "set-null") onCellEdit?.(rowIndex, colIndex, { t: "null" });
+      else if (id === "open-link") onLinkOpen?.(rowIndex, colIndex);
+    });
+  };
+
   const totalWidth = colVirtualizer.getTotalSize();
   const totalHeight = rowVirtualizer.getTotalSize();
   const virtualRows = rowVirtualizer.getVirtualItems();
@@ -185,6 +290,7 @@ export function DataGrid({
                   key={vc.key}
                   isDisabled={onSortToggle === undefined}
                   onPress={() => onSortToggle?.(column.name)}
+                  onContextMenu={(e) => onHeaderMenu(e, column, vc.index)}
                   className={cn("absolute top-0 flex h-full items-center justify-start gap-1.5 truncate border-r border-border/40 px-2.5 text-left font-sans liquid-hover rounded-none", onSortToggle ? "hover:bg-surface-secondary/70" : "cursor-default")}
                   style={{ left: vc.start, width: vc.size }}
                 >
@@ -277,6 +383,7 @@ export function DataGrid({
                         onDoubleClick={() => {
                           if (editable) setEditing({ row: vr.index, col: vc.index });
                         }}
+                        onContextMenu={(e) => onCellMenu(e, column, vr.index, vc.index, value)}
                         className={cn(
                           "absolute top-0 flex h-full cursor-default items-center truncate border-r border-separator/40 px-2",
                           tone,
@@ -334,6 +441,7 @@ export function DataGrid({
           );
         })}
       </div>
+      {menu.node}
     </ScrollShadow>
   );
 }
@@ -346,4 +454,10 @@ function estimateWidth(column: GridColumn): number {
   if (t.includes("uuid")) return 300;
   if (/json|text|blob|bytea/.test(t)) return 260;
   return Math.min(320, Math.max(140, column.name.length * 9 + 60));
+}
+
+/// One CSV field: quoted when it holds a comma, quote or newline.
+function csvCell(value: Value | undefined): string {
+  const text = value === undefined ? "" : formatCell(value).text;
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }

@@ -123,6 +123,11 @@ interface WorkspaceState {
   openTool: (connectionId: string, tool: Tool) => void;
   openDocument: (kind: DocumentKind, documentId: string, connectionId: string | null) => void;
   closeTab: (id: string) => void;
+  /// Tab-bar context menu: keep one tab, drop the rest.
+  closeOtherTabs: (id: string) => void;
+  /// Tab-bar context menu: drop every tab after this one.
+  closeTabsToRight: (id: string) => void;
+  closeAllTabs: () => void;
   activateTab: (id: string) => void;
   setDensity: (density: Density) => void;
   loadSavedQueries: () => Promise<void>;
@@ -426,6 +431,18 @@ export const useWorkspace = create<WorkspaceState>()((set, get) => ({
       const fallback = tabs[Math.max(0, index - 1)] ?? tabs[0];
       return { tabs, activeTabId: s.activeTabId === id ? (fallback?.id ?? null) : s.activeTabId };
     }),
+
+  closeOtherTabs: (id) => set((s) => ({ tabs: s.tabs.filter((t) => t.id === id), activeTabId: s.tabs.some((t) => t.id === id) ? id : null })),
+
+  closeTabsToRight: (id) =>
+    set((s) => {
+      const index = s.tabs.findIndex((t) => t.id === id);
+      if (index < 0) return {};
+      const tabs = s.tabs.slice(0, index + 1);
+      return { tabs, activeTabId: tabs.some((t) => t.id === s.activeTabId) ? s.activeTabId : id };
+    }),
+
+  closeAllTabs: () => set({ tabs: [], activeTabId: null }),
 
   activateTab: (id) => set({ activeTabId: id, page: { kind: "workspace" } }),
 

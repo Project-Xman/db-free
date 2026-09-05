@@ -94,6 +94,13 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
   const [pageSize, setPageSize] = useState<PageSize>("50");
   const [sort, setSort] = useState<SortRule[]>([]);
   const [filters, setFilters] = useState<FilterRule[]>(initialFilters ?? []);
+  /// Right-click "Filter: col = value" builds a rule from the clicked cell. The
+  /// rule travels with the page request, so it works on every engine — SQL
+  /// adapters compile it into WHERE, the others filter the fetched rows.
+  const addFilter = useCallback((rule: FilterRule) => {
+    setPageIndex(0);
+    setFilters((prev) => [...prev.filter((f) => !(f.column === rule.column && f.op === rule.op)), rule]);
+  }, []);
   const [refresh, setRefresh] = useState(0);
   const [loaded, setLoaded] = useState<Loaded>({ key: "", page: null, error: null });
   const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set());
@@ -389,6 +396,10 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
               insertedFrom={rows.length}
               nullDisplay={settings?.nullDisplay ?? "NULL"}
               onLinkOpen={openLinked}
+              onFilter={addFilter}
+              onSortSet={(rule) => { setPageIndex(0); setSort([rule]); }}
+              onClearSort={() => setSort([])}
+              onCopied={(what) => showInfo(`${what} copied to the clipboard.`)}
             />
           )}
         </div>

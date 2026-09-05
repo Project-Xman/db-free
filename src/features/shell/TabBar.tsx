@@ -1,6 +1,8 @@
 // SOT: tab-bar, workspace-tabs, window-drag-region
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { Button, Chip, CloseButton, ScrollShadow } from "@heroui/react";
 import { usePendingCount, useWorkspace, type Tab } from "@/stores/workspace";
+import { useContextMenu, type MenuEntry } from "@/components/global/ContextMenu";
 import { Icon, type IconName } from "@/lib/icons";
 import { OBJECT_KINDS, TOOLS } from "@/lib/objects";
 import { cn } from "@/lib/cn";
@@ -16,12 +18,39 @@ export function TabBar() {
   const pending = usePendingCount(activeId);
   const panelOpen = useWorkspace((s) => s.changesPanelOpen);
   const setPanelOpen = useWorkspace((s) => s.setChangesPanelOpen);
+  const closeOthers = useWorkspace((s) => s.closeOtherTabs);
+  const closeToRight = useWorkspace((s) => s.closeTabsToRight);
+  const closeAll = useWorkspace((s) => s.closeAllTabs);
+  const menu = useContextMenu();
+
+  const tabEntries = (tab: Tab, index: number): MenuEntry[] => [
+    { id: "close", label: "Close", icon: "x" },
+    { id: "close-others", label: "Close others", icon: "x", disabled: tabs.length < 2 },
+    { id: "close-right", label: "Close to the right", icon: "chevron-right", disabled: index >= tabs.length - 1 },
+    { id: "close-all", label: "Close all", icon: "trash", danger: true, group: "all" },
+    { id: "duplicate", label: "New query tab", icon: "plus", group: "new", disabled: tab.connectionId === null },
+  ];
 
   return (
     <div className="drag-region flex h-11 shrink-0 items-center border-b border-border/40 glass-header px-2" data-tauri-drag-region role="tablist" aria-label="Open tabs">
       <ScrollShadow orientation="horizontal" hideScrollBar className="flex h-full items-center gap-1 py-1">
-        {tabs.map((tab) => (
-          <TabItem key={tab.id} tab={tab} active={tab.id === activeTabId} onActivate={() => activateTab(tab.id)} onClose={() => closeTab(tab.id)} />
+        {tabs.map((tab, index) => (
+          <TabItem
+            key={tab.id}
+            tab={tab}
+            active={tab.id === activeTabId}
+            onActivate={() => activateTab(tab.id)}
+            onClose={() => closeTab(tab.id)}
+            onContextMenu={(e) =>
+              menu.open(e, tabEntries(tab, index), (id) => {
+                if (id === "close") closeTab(tab.id);
+                else if (id === "close-others") closeOthers(tab.id);
+                else if (id === "close-right") closeToRight(tab.id);
+                else if (id === "close-all") closeAll();
+                else if (id === "duplicate" && tab.connectionId !== null) openQuery(tab.connectionId);
+              })
+            }
+          />
         ))}
       </ScrollShadow>
       {activeId ? (
@@ -55,6 +84,7 @@ export function TabBar() {
           ) : null}
         </Button>
       ) : null}
+      {menu.node}
     </div>
   );
 }
@@ -84,7 +114,7 @@ function tabPresentation(tab: Tab): { label: string; icon: IconName } {
   }
 }
 
-function TabItem({ tab, active, onActivate, onClose }: { tab: Tab; active: boolean; onActivate: () => void; onClose: () => void }) {
+function TabItem({ tab, active, onActivate, onClose, onContextMenu }: { tab: Tab; active: boolean; onActivate: () => void; onClose: () => void; onContextMenu: (event: ReactMouseEvent) => void }) {
   const docName = useWorkspace((s) => (tab.kind === "document" ? s.documents[tab.documentKind].find((d) => d.id === tab.documentId)?.name : undefined));
   const base = tabPresentation(tab);
   const label = docName ?? base.label;
@@ -100,6 +130,7 @@ function TabItem({ tab, active, onActivate, onClose }: { tab: Tab; active: boole
       onAuxClick={(e) => {
         if (e.button === 1) onClose();
       }}
+      onContextMenu={onContextMenu}
       className={cn(
         "group relative flex h-7.5 max-w-[200px] min-w-[110px] cursor-default items-center gap-2 rounded-lg px-2.5 text-[12.5px] font-medium liquid-hover",
         active
