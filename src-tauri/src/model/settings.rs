@@ -63,6 +63,10 @@ impl Default for AiSettings {
 #[ts(export)]
 pub struct AppSettings {
     pub accent: String,
+    /// Font family key for the app chrome; `src/lib/fonts.ts` maps it to a stack.
+    pub ui_font: String,
+    /// Font family key for code, grids and values (monospace faces).
+    pub editor_font: String,
     pub ui_font_size: u8,
     pub editor_font_size: u8,
     pub grid_density: String,
@@ -82,6 +86,8 @@ impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
             accent: "blue".to_string(),
+            ui_font: "jetbrains-mono".to_string(),
+            editor_font: "jetbrains-mono".to_string(),
             ui_font_size: 13,
             editor_font_size: 13,
             grid_density: "cozy".to_string(),

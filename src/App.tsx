@@ -2,6 +2,7 @@
 import { useEffect } from "react";
 import { useActiveConnection, useActiveTab, useWorkspace } from "@/stores/workspace";
 import { isKeyValueEngine } from "@/lib/engines";
+import { fontStack } from "@/lib/fonts";
 import { IconRail } from "@/features/shell/IconRail";
 import { Sidebar } from "@/features/shell/Sidebar";
 import { TabBar } from "@/features/shell/TabBar";
@@ -26,6 +27,10 @@ import { CommandPalette } from "@/features/palette/CommandPalette";
 import { Toaster } from "@/components/global/Toaster";
 import { EmptyState } from "@/components/global/EmptyState";
 import { RunShortcut } from "@/components/global/Kbd";
+
+/// Stacks used until the settings load (they match globals.css).
+const UI_FONT_FALLBACK = '"JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+const EDITOR_FONT_FALLBACK = UI_FONT_FALLBACK;
 
 /// Accent colour plus its oklch hue: the hue also drives every tinted surface
 /// (window gradient, glass panels, selection) through the --accent-hue variable.
@@ -60,6 +65,8 @@ export function App() {
       root.setProperty("--accent", accent.color);
       root.setProperty("--accent-hue", String(accent.hue));
     }
+    root.setProperty("--font-sans", fontStack(settings.uiFont, UI_FONT_FALLBACK));
+    root.setProperty("--font-mono", fontStack(settings.editorFont, EDITOR_FONT_FALLBACK));
     root.setProperty("--ui-font-size", `${settings.uiFontSize}px`);
     root.setProperty("--editor-font-size", `${settings.editorFontSize}px`);
     document.body.style.fontSize = `${settings.uiFontSize}px`;

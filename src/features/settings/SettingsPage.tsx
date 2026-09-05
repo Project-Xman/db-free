@@ -7,6 +7,7 @@ import { useWorkspace } from "@/stores/workspace";
 import { AppSelect, Field, Toggle } from "@/components/global/Field";
 import { Icon, type IconName } from "@/lib/icons";
 import { cn } from "@/lib/cn";
+import { EDITOR_FONT_OPTIONS, UI_FONT_OPTIONS } from "@/lib/fonts";
 
 type Section = "general" | "themes" | "fonts" | "grid" | "editor" | "shortcuts" | "ai" | "security" | "advanced";
 
@@ -147,10 +148,17 @@ function SettingsBody({ initial }: { initial: AppSettings }) {
             {section === "fonts" ? (
               <>
                 <h2 className="text-sm font-semibold text-foreground">Fonts</h2>
-                <Row title="Interface font size" body="Inter, 11–16 px.">
+                <p className="text-xs text-muted">Every family is bundled with the app, so the picker works offline.</p>
+                <Row title="Interface font" body="Menus, panels, labels.">
+                  <AppSelect ariaLabel="Interface font" value={draft.uiFont} options={UI_FONT_OPTIONS} onChange={(v) => patch({ uiFont: v })} className="w-44" />
+                </Row>
+                <Row title="Interface font size" body="11–16 px.">
                   <Field label="" type="number" value={String(draft.uiFontSize)} onChange={(v) => patch({ uiFontSize: clamp(Number(v), 11, 16) })} className="w-24 [&_label]:hidden" />
                 </Row>
-                <Row title="Editor font size" body="JetBrains Mono, 11–20 px.">
+                <Row title="Editor font" body="Query editor, grids and values; monospace only.">
+                  <AppSelect ariaLabel="Editor font" value={draft.editorFont} options={EDITOR_FONT_OPTIONS} onChange={(v) => patch({ editorFont: v })} className="w-44" />
+                </Row>
+                <Row title="Editor font size" body="11–20 px.">
                   <Field label="" type="number" value={String(draft.editorFontSize)} onChange={(v) => patch({ editorFontSize: clamp(Number(v), 11, 20) })} className="w-24 [&_label]:hidden" />
                 </Row>
               </>
@@ -321,6 +329,8 @@ function move<T>(list: readonly T[], from: number, to: number): T[] {
 function defaultSettings(): AppSettings {
   return {
     accent: "blue",
+    uiFont: "jetbrains-mono",
+    editorFont: "jetbrains-mono",
     uiFontSize: 13,
     editorFontSize: 13,
     gridDensity: "cozy",
