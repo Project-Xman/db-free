@@ -1166,7 +1166,7 @@ fn kind_label(kind: ObjectKind) -> &'static str {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { sql: true, namespaces: true, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: false, exact_estimate: false },
+        capabilities: Capabilities { describes_fields: true, sql: true, namespaces: true, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: false, exact_estimate: false },
         object_kinds: vec![K::Database, K::Table, K::View, K::MaterializedView, K::Partition, K::Dictionary, K::Projection, K::Function, K::User, K::Role, K::Quota, K::Setting, K::Session, K::Replica, K::Node, K::SlowQuery],
         tools: vec![T::Stats],
     }

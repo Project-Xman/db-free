@@ -747,7 +747,7 @@ impl MemcachedIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { views: true, ..Capabilities::KEY_VALUE },
+        capabilities: Capabilities { describes_fields: true, views: true, ..Capabilities::KEY_VALUE },
         object_kinds: vec![K::Setting, K::Session],
         tools: vec![T::Stats, T::KeyBrowser],
     }

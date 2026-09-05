@@ -7,7 +7,7 @@ import { cellClass, formatCell } from "@/lib/format";
 import { fieldKind } from "@/lib/fields";
 import { Icon, typeIcon } from "@/lib/icons";
 import { Check } from "@/components/global/Field";
-import { CellEditor } from "@/components/global/ValueEditor";
+import { CellEditor, type LookupRow } from "@/components/global/ValueEditor";
 import { Resizer } from "@/components/global/Resizer";
 import { useContextMenu, type MenuEntry } from "@/components/global/ContextMenu";
 import { cn } from "@/lib/cn";
@@ -69,6 +69,9 @@ interface DataGridProps {
   onInspect?: (rowIndex: number, colIndex: number) => void;
   /// Copies whole rows in a format the owner knows how to build (JSON, CSV, SQL).
   onCopyRows?: (rowIndex: number, format: "json" | "csv" | "sql") => void;
+  /// Searches the table a foreign-key column points at, so the value is picked
+  /// from real rows instead of copied from another tab.
+  onLookup?: (colIndex: number, search: string) => Promise<LookupRow[]>;
 }
 
 const HEADER_HEIGHT = 32;
@@ -131,6 +134,7 @@ export function DataGrid({
   onDeleteRow,
   onInspect,
   onCopyRows,
+  onLookup,
 }: DataGridProps) {
   const parentRef = useRef<HTMLDivElement | null>(null);
   const rangeRef = useRef(onRangeChange);
@@ -431,7 +435,7 @@ export function DataGrid({
                       : isSelectedRow
                         ? "bg-surface-secondary/80"
                         : alternatingRows && vr.index % 2 === 1
-                          ? "bg-surface/20 hover:bg-surface-secondary/40"
+                          ? "row-stripe hover:bg-surface-secondary/40"
                           : "hover:bg-surface-secondary/40",
               )}
               style={{ top: vr.start + HEADER_HEIGHT, height: vr.size, width: totalWidth + gutter }}
@@ -482,6 +486,7 @@ export function DataGrid({
                       >
                         {isEditing && value !== undefined && onCellEdit ? (
                           <CellEditor
+                            {...(onLookup && column?.linkTo !== undefined ? { lookup: (search: string) => onLookup(vc.index, search) } : {})}
                             typeName={column?.typeName ?? ""}
                             value={value}
                             onCommit={(next) => {

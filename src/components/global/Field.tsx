@@ -243,6 +243,9 @@ interface DateTimeFieldProps {
   /// Opens the calendar (and, for timestamps, the clock) as soon as the field
   /// mounts: a grid cell edit goes straight to the picker, no trigger click.
   autoOpen?: boolean;
+  /// Fired when the picker closes: the caller treats that as "the user is done"
+  /// rather than asking them to confirm a second time.
+  onDone?: (() => void) | undefined;
   isDisabled?: boolean;
   className?: string | undefined;
 }
@@ -252,7 +255,7 @@ interface DateTimeFieldProps {
 //        calendar and, for timestamps, a clock so date and time are picked in
 //        one place. Times get clock segments only.
 // WHERE: https://heroui.com/docs/react/components/{date-picker,time-field,calendar}
-export function DateTimeField({ kind, value, onChange, label, ariaLabel, compact = false, autoFocus = false, autoOpen = false, isDisabled = false, className }: DateTimeFieldProps) {
+export function DateTimeField({ kind, value, onChange, label, ariaLabel, compact = false, autoFocus = false, autoOpen = false, onDone, isDisabled = false, className }: DateTimeFieldProps) {
   const groupClass = cn("font-mono", compact ? "h-full min-h-0 rounded-sm border-accent bg-background px-1 text-[12px] shadow-none" : "");
   const segmentClass = compact ? "py-0 text-[12px]" : "";
   const a11y = ariaLabel ?? label ?? kind;
@@ -285,6 +288,9 @@ export function DateTimeField({ kind, value, onChange, label, ariaLabel, compact
       value={parseDbDate(value)}
       onChange={(next) => onChange(next ? formatDbDate(next, separator) : "")}
       defaultOpen={autoOpen}
+      onOpenChange={(open) => {
+        if (!open) onDone?.();
+      }}
       granularity={kind === "date" ? "day" : "second"}
       hourCycle={24}
       shouldForceLeadingZeros

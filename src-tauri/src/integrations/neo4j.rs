@@ -1694,7 +1694,7 @@ impl Neo4jIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { namespaces: true, paging: true, fixed_columns: false, ..Capabilities::DOCUMENT },
+        capabilities: Capabilities { describes_fields: true, namespaces: true, paging: true, fixed_columns: false, ..Capabilities::DOCUMENT },
         object_kinds: vec![K::Database, K::Label, K::RelationshipType, K::Constraint, K::Index, K::Procedure, K::Function, K::User, K::Role, K::Transaction, K::Setting],
         tools: vec![T::Stats, T::GraphView],
     }
@@ -1825,6 +1825,14 @@ impl Integration for Neo4jIntegration {
 
     async fn objects(&self, kind: ObjectKind, parent: Option<&str>) -> AppResult<Vec<ObjectSummary>> {
         self.explorer_objects(kind, parent).await
+    }
+
+    // WHAT:  A Label's fields are node properties, a RelationshipType's are edge
+    //        properties. `schema` here is that discriminator, not a namespace —
+    //        the object's `parent` is the database and must not leak into it.
+    fn object_table(&self, reference: &ObjectRef) -> TableRef {
+        let schema = (reference.kind == ObjectKind::RelationshipType).then(|| RELATIONSHIPS_SCHEMA.to_string());
+        TableRef { schema, name: reference.name.clone() }
     }
 
     async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {

@@ -1316,7 +1316,7 @@ impl InfluxIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { sql: false, namespaces: true, fixed_columns: false, paging: true, row_estimate: false, views: false, transactions: false, exact_estimate: false },
+        capabilities: Capabilities { describes_fields: true, sql: false, namespaces: true, fixed_columns: false, paging: true, row_estimate: false, views: false, transactions: false, exact_estimate: false },
         object_kinds: vec![K::Database, K::Bucket, K::Measurement, K::Task, K::User, K::Setting],
         tools: vec![T::Stats, T::MetricsExplorer],
     }

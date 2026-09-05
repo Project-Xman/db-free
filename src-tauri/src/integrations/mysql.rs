@@ -1546,7 +1546,7 @@ impl MysqlIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { sql: true, namespaces: false, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: true, exact_estimate: false },
+        capabilities: Capabilities { describes_fields: true, sql: true, namespaces: false, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: true, exact_estimate: false },
         object_kinds: vec![K::Database, K::Table, K::View, K::Partition, K::Index, K::Constraint, K::Function, K::Procedure, K::Trigger, K::Event, K::User, K::Grant, K::Session, K::Lock, K::Replica, K::Setting, K::SlowQuery],
         tools: vec![T::Stats, T::Erd],
     }

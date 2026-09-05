@@ -24,6 +24,28 @@ pub struct ColumnsRequest {
     pub table: TableRef,
 }
 
+#[derive(Debug, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CreateTemplateRequest {
+    pub connection_id: String,
+    pub table: TableRef,
+    /// Columns the user described in the New-table dialog.
+    pub columns: Vec<ColumnInfo>,
+}
+
+// WHAT:  The statement that would create this table, in the engine's own
+//        language, for the editor to open pre-filled.
+// WHY:   Creating is where engines differ most, so the adapter writes it; the
+//        user reads it before running, and the guard applies when they do.
+#[tauri::command]
+pub async fn create_template(state: State<'_, AppState>, req: CreateTemplateRequest) -> AppResult<Option<String>> {
+    guard::session(&state, &req.connection_id, |ctx| async move {
+        Ok(ctx.integration.create_template(&req.table, &req.columns))
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn load_catalog(state: State<'_, AppState>, req: CatalogRequest) -> AppResult<SchemaCatalog> {
     guard::session(&state, &req.connection_id, |ctx| async move {

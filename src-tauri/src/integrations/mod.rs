@@ -113,11 +113,23 @@ pub struct Capabilities {
     /// `row_estimate` is an exact count, not a statistics guess.
     #[serde(default)]
     pub exact_estimate: bool,
+    /// `columns` describes the object it is asked about. False when it returns a
+    /// fixed pseudo-schema that is the same for every object (an S3 bucket's
+    /// key/size/etag, a Kafka topic's partition/offset/value, a Pinecone index's
+    /// id/values/metadata): listing those as an object's "fields" would show the
+    /// same uninformative rows everywhere.
+    #[serde(default = "yes")]
+    pub describes_fields: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Capabilities {
     /// A relational SQL engine with schemas, views, paging and transactions.
     pub const SQL: Capabilities = Capabilities {
+        describes_fields: true,
         sql: true,
         namespaces: true,
         fixed_columns: true,
@@ -129,6 +141,7 @@ impl Capabilities {
     };
     /// A schemaless document / key-value store driven by its own command language.
     pub const DOCUMENT: Capabilities = Capabilities {
+        describes_fields: true,
         sql: false,
         namespaces: true,
         fixed_columns: false,
@@ -140,6 +153,8 @@ impl Capabilities {
     };
     /// A key-value store: one namespace, whole-key loads, client-side paging.
     pub const KEY_VALUE: Capabilities = Capabilities {
+        // A key-value store answers `columns` with a fixed key/value shape.
+        describes_fields: false,
         sql: false,
         namespaces: false,
         fixed_columns: true,
@@ -210,6 +225,31 @@ pub trait Integration: Send + Sync {
     async fn ddl(&self, _table: &TableRef) -> AppResult<Option<String>> {
         Ok(None)
     }
+    // WHAT:  A statement that creates a table / collection / class, in this
+    //        engine's own language, for the "New …" button to seed a query tab.
+    // WHY:   Creation is where engines differ most — CREATE TABLE, createCollection,
+    //        a PUT with a mapping, DEFINE TABLE — so the adapter writes it and the
+    //        UI stays engine-agnostic. Seeding an editor rather than executing
+    //        means the user reads the statement first and the guard still applies
+    //        when they run it.
+    // HOW:   The default covers every SQL family from the column list; engines
+    //        with another language override it. None means "this engine has no
+    //        statement for that", and the button says so.
+    fn create_template(&self, table: &TableRef, columns: &[ColumnInfo]) -> Option<String> {
+        if !self.capabilities().sql {
+            return None;
+        }
+        let target = match table.schema.as_deref() {
+            Some(schema) if !schema.is_empty() => format!("{schema}.{}", table.name),
+            _ => table.name.clone(),
+        };
+        let body = columns
+            .iter()
+            .map(|c| format!("  {} {}{}{}", c.name, c.data_type, if c.nullable { "" } else { " NOT NULL" }, if c.primary_key { " PRIMARY KEY" } else { "" }))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        Some(format!("CREATE TABLE {target} (\n{body}\n);"))
+    }
 
     // ---- object explorer / administration ------------------------------------
     // WHAT:  Lists objects of one kind. `parent` is the namespace for scoped kinds
@@ -222,6 +262,15 @@ pub trait Integration: Send + Sync {
     /// Definition, properties, nested objects and actions for one object.
     async fn object_detail(&self, reference: &ObjectRef) -> AppResult<ObjectDetail> {
         Ok(ObjectDetail::empty(reference))
+    }
+    // WHAT:  The table this row-shaped object refers to, for listing its fields.
+    // WHY:   `parent` is a namespace in most families, so the default reads it as
+    //        one — but a few use `TableRef::schema` as a discriminator rather
+    //        than a namespace (Neo4j: nodes vs relationships), and those override
+    //        this instead of the core guessing per engine.
+    // WHERE: src-tauri/src/services/objects.rs (ObjectKind::Field)
+    fn object_table(&self, reference: &ObjectRef) -> TableRef {
+        TableRef { schema: reference.parent.clone().filter(|p| !p.is_empty()), name: reference.name.clone() }
     }
     /// Monitoring figures (connections, memory, cache, replication…), grouped.
     async fn server_stats(&self) -> AppResult<ServerStats> {
@@ -244,8 +293,37 @@ pub trait Integration: Send + Sync {
     }
 }
 
-// WHAT:  Static profile per adapter family (see `FamilyProfile`).
+// WHAT:  Static profile per adapter family (see `FamilyProfile`), plus the kinds
+//        the core serves for every family.
+// WHY:   `columns` is a required trait method, so fields exist wherever a family
+//        has something table-shaped to describe; declaring them per family would
+//        be 45 copies of the same line and 45 chances to forget one.
+// WHERE: src-tauri/src/services/objects.rs (serves ObjectKind::Field)
 pub fn profile(family: Family) -> FamilyProfile {
+    let mut profile = family_profile(family);
+    let describes = profile.capabilities.describes_fields;
+    if describes && profile.object_kinds.iter().any(|k| OWNS_FIELDS.contains(k)) && !profile.object_kinds.contains(&ObjectKind::Field) {
+        profile.object_kinds.push(ObjectKind::Field);
+    }
+    profile
+}
+
+/// Kinds whose members are rows with a describable shape.
+const OWNS_FIELDS: &[ObjectKind] = &[
+    ObjectKind::Table,
+    ObjectKind::View,
+    ObjectKind::MaterializedView,
+    ObjectKind::ForeignTable,
+    ObjectKind::VirtualTable,
+    ObjectKind::Collection,
+    ObjectKind::EdgeCollection,
+    ObjectKind::Class,
+    ObjectKind::Label,
+    ObjectKind::RelationshipType,
+    ObjectKind::Measurement,
+];
+
+fn family_profile(family: Family) -> FamilyProfile {
     match family {
         Family::Postgres => postgres::profile(),
         Family::Mysql => mysql::profile(),

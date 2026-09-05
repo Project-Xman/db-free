@@ -1,8 +1,8 @@
 // SOT: settings-page, preferences-ui, ai-settings-ui, shortcuts-list
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button, Card, ScrollShadow, Separator } from "@heroui/react";
-import type { AiProvider, AppSettings, ExecutionMode, RunScope, UpdateStatus } from "@/lib/bindings";
-import { ipc, normalizeError } from "@/lib/ipc";
+import type { AiProvider, AppSettings, ExecutionMode, RunScope, UpdateProgress, UpdateStatus } from "@/lib/bindings";
+import { ipc, normalizeError, onUpdateProgress } from "@/lib/ipc";
 import { useWorkspace } from "@/stores/workspace";
 import { AppSelect, Field, Toggle } from "@/components/global/Field";
 import { Icon, type IconName } from "@/lib/icons";
@@ -361,6 +361,15 @@ function UpdatesSection() {
   const showError = useWorkspace((s) => s.showError);
   const [status, setStatus] = useState<UpdateStatus | null>(null);
   const [busy, setBusy] = useState<"check" | "install" | null>(null);
+  const [progress, setProgress] = useState<UpdateProgress | null>(null);
+
+  // Subscribed while the panel is open: the download reports bytes as they land.
+  useEffect(() => {
+    const pending = onUpdateProgress(setProgress);
+    return () => {
+      void pending.then((unlisten) => unlisten());
+    };
+  }, []);
 
   const check = async () => {
     setBusy("check");
@@ -395,7 +404,7 @@ function UpdatesSection() {
         </Button>
       </Row>
       {status?.available ? (
-        <Row title={`Version ${status.available} is available`} body={status.notes ?? status.published ?? "Installs and restarts the app."}>
+        <Row title={`Version ${status.available} is available`} body={progress ? downloadLabel(progress) : (status.notes ?? status.published ?? "Installs and restarts the app.")}>
           <Button size="sm" isPending={busy === "install"} onPress={() => void install()}>
             <Icon name="download" size={13} />
             Install and restart
@@ -406,8 +415,23 @@ function UpdatesSection() {
           <Icon name="check" size={15} className="text-success" />
         </Row>
       ) : null}
+      {progress ? (
+        <div className="h-1 w-full overflow-hidden rounded-full bg-surface-secondary">
+          <div
+            className="h-full rounded-full bg-accent transition-[width] duration-200"
+            style={{ width: progress.total ? `${Math.min(100, Math.round((progress.downloaded / progress.total) * 100))}%` : "100%" }}
+          />
+        </div>
+      ) : null}
     </>
   );
+}
+
+/// "18.4 MB of 41.5 MB" while downloading, then what happens next.
+function downloadLabel(progress: UpdateProgress): string {
+  if (progress.done) return "Downloaded. Installing, then the app restarts.";
+  const mb = (bytes: number) => `${(bytes / 1_048_576).toFixed(1)} MB`;
+  return progress.total ? `Downloading ${mb(progress.downloaded)} of ${mb(progress.total)}…` : `Downloading ${mb(progress.downloaded)}…`;
 }
 
 function defaultSettings(): AppSettings {

@@ -1,5 +1,6 @@
 // SOT: ipc-client, invoke-wrapper, command-map, app-error-normalization, client-block
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AiGenerateRequest,
   AiReply,
@@ -16,6 +17,7 @@ import type {
   ConnectRequest,
   ConnectionIdRequest,
   ConnectionSummary,
+  CreateTemplateRequest,
   Document,
   EditorBuffer,
   ExecuteQueryRequest,
@@ -53,6 +55,7 @@ import type {
   SessionRequest,
   TablePage,
   TablePageRequest,
+  UpdateProgress,
   UpdateStatus,
   VectorSearchCommand,
   WorkflowRunReport,
@@ -107,6 +110,7 @@ interface CommandMap {
   search_documents: { req: SearchCommand; res: SearchResult };
   query_range: { req: RangeQueryCommand; res: RangeResult };
   load_history: { req: ObjectRequest; res: ResultSet };
+  create_template: { req: CreateTemplateRequest; res: string | null };
   check_update: { req: undefined; res: UpdateStatus };
   install_update: { req: undefined; res: null };
 }
@@ -173,4 +177,13 @@ export function errorMessage(error: AppError): string {
     case "internal":
       return error.message;
   }
+}
+
+// WHAT:  Download progress while an update installs.
+// WHY:   Events are the other half of this boundary: the Rust side pushes bytes
+//        as they arrive, and keeping the subscription here means components
+//        never reach for @tauri-apps directly.
+// WHERE: src-tauri/src/commands/updates.rs (emits "update:progress")
+export function onUpdateProgress(handler: (progress: UpdateProgress) => void): Promise<UnlistenFn> {
+  return listen<UpdateProgress>("update:progress", (event) => handler(event.payload));
 }

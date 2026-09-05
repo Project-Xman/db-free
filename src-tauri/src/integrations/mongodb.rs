@@ -1361,7 +1361,7 @@ impl MongoIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { sql: false, namespaces: true, fixed_columns: false, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: false },
+        capabilities: Capabilities { describes_fields: true, sql: false, namespaces: true, fixed_columns: false, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: false },
         object_kinds: vec![K::Database, K::Collection, K::View, K::Index, K::User, K::Role, K::Session, K::Replica, K::Shard, K::Setting, K::SlowQuery],
         tools: vec![T::Stats, T::PipelineBuilder],
     }

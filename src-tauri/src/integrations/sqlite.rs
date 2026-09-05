@@ -885,7 +885,7 @@ fn collect_stats(conn: &Connection, path: &str) -> AppResult<ServerStats> {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { sql: true, namespaces: false, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: true, exact_estimate: true },
+        capabilities: Capabilities { describes_fields: true, sql: true, namespaces: false, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: true, exact_estimate: true },
         object_kinds: vec![K::Database, K::Table, K::View, K::VirtualTable, K::Index, K::Trigger, K::Setting],
         tools: vec![T::Stats, T::Erd],
     }

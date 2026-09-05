@@ -414,7 +414,7 @@ impl ObjectDbIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { namespaces: false, fixed_columns: true, exact_estimate: true, views: false, ..Capabilities::DOCUMENT },
+        capabilities: Capabilities { describes_fields: true, namespaces: false, fixed_columns: true, exact_estimate: true, views: false, ..Capabilities::DOCUMENT },
         object_kinds: vec![K::Class],
         tools: vec![],
     }

@@ -971,7 +971,7 @@ impl OrientIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { sql: true, namespaces: false, exact_estimate: true, ..Capabilities::DOCUMENT },
+        capabilities: Capabilities { describes_fields: true, sql: true, namespaces: false, exact_estimate: true, ..Capabilities::DOCUMENT },
         object_kinds: vec![K::Database, K::Class, K::Index, K::Function, K::User, K::Role, K::Session],
         tools: vec![T::Stats, T::GraphView],
     }

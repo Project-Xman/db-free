@@ -1233,7 +1233,7 @@ impl QldbIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { sql: true, namespaces: false, fixed_columns: false, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: true },
+        capabilities: Capabilities { describes_fields: true, sql: true, namespaces: false, fixed_columns: false, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: true },
         object_kinds: vec![K::Database, K::Table, K::Index],
         tools: vec![T::LedgerHistory],
     }

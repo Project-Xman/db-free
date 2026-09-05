@@ -879,7 +879,7 @@ impl ImmudbIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { transactions: false, views: false, exact_estimate: true, ..Capabilities::SQL },
+        capabilities: Capabilities { describes_fields: true, transactions: false, views: false, exact_estimate: true, ..Capabilities::SQL },
         object_kinds: vec![K::Database, K::Table, K::Index, K::User],
         tools: vec![T::Stats, T::LedgerHistory],
     }

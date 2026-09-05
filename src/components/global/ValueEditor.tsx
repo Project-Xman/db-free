@@ -1,6 +1,6 @@
 // SOT: value-editor, typed-cell-editor, insert-form-field, json-editor-modal
-import { useMemo, useRef, useState, type KeyboardEvent } from "react";
-import { Button, Input, Modal, ScrollShadow, TextArea, ToggleButton } from "@heroui/react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { Button, Input, Modal, ScrollShadow, SearchField, TextArea, ToggleButton } from "@heroui/react";
 import type { ColumnInfo, Value } from "@/lib/bindings";
 import type { JsonValue } from "@/lib/bindings/serde_json/JsonValue";
 import { parseJson } from "@/lib/json";
@@ -10,11 +10,21 @@ import { JsonViewer } from "./JsonViewer";
 import { Icon } from "@/lib/icons";
 import { cn } from "@/lib/cn";
 
+/// One candidate row from the table a foreign key points at.
+export interface LookupRow {
+  /// The referenced column's value, as text — what the cell will hold.
+  value: string;
+  /// The rest of the row, so the choice is made on more than an opaque id.
+  detail: string;
+}
+
 interface CellEditorProps {
   typeName: string;
   value: Value;
   onCommit: (next: Value) => void;
   onCancel: () => void;
+  /// Present on a foreign-key column: searches the referenced table.
+  lookup?: ((search: string) => Promise<LookupRow[]>) | undefined;
 }
 
 // WHAT:  Inline editor for one grid cell, picked by field kind:
@@ -28,7 +38,7 @@ interface CellEditorProps {
 //        explicit ✓ / ✕ buttons. The latest draft lives in a ref so an Enter
 //        that also changes the value (calendar cell) commits the new value.
 // WHERE: src/features/grid/DataGrid.tsx
-export function CellEditor({ typeName, value, onCommit, onCancel }: CellEditorProps) {
+export function CellEditor({ typeName, value, onCommit, onCancel, lookup }: CellEditorProps) {
   const kind = fieldKind(typeName, value);
   const initialText = editText(value);
   const initialNumber = value.t === "int" || value.t === "float" ? value.v : null;
@@ -52,6 +62,11 @@ export function CellEditor({ typeName, value, onCommit, onCancel }: CellEditorPr
   const commitText = () => onCommit(parseEdited(draft.current, typeName, value));
   const commitNumber = () => onCommit(number.current === null ? { t: "null" } : { t: kind === "int" ? "int" : "float", v: number.current });
   const commitDate = () => onCommit(draft.current === "" ? { t: "null" } : { t: "date_time", v: draft.current });
+
+  // A foreign key is chosen from the rows it can point at, not typed from memory.
+  if (lookup) {
+    return <LookupPicker initial={initialText} load={lookup} onCommit={(next) => onCommit(parseEdited(next, typeName, value))} onNull={() => onCommit({ t: "null" })} onCancel={onCancel} />;
+  }
 
   switch (kind) {
     case "bool":
@@ -78,27 +93,23 @@ export function CellEditor({ typeName, value, onCommit, onCancel }: CellEditorPr
     case "time":
     case "datetime":
       return (
-        <div className="flex h-[calc(100%-4px)] w-full min-w-0 items-center gap-0.5" onKeyDown={(e) => onKey(e, commitDate)}>
-          <div className="h-full min-w-0 flex-1">
-            <DateTimeField
-              compact
-              autoFocus
-              autoOpen
-              kind={kind}
-              ariaLabel={`Edit ${kind}`}
-              value={text}
-              onChange={(next) => {
-                draft.current = next;
-                setText(next);
-              }}
-            />
-          </div>
-          <Button isIconOnly size="sm" variant="ghost" aria-label="Apply" onPress={commitDate} className="size-5 min-w-5 shrink-0 rounded-sm p-0 text-success">
-            <Icon name="check" size={12} />
-          </Button>
-          <Button isIconOnly size="sm" variant="ghost" aria-label="Cancel" onPress={onCancel} className="size-5 min-w-5 shrink-0 rounded-sm p-0 text-muted">
-            <Icon name="x" size={12} />
-          </Button>
+        // No confirm buttons: picking a date is the decision. The edit is staged
+        // like every other cell edit and reviewed once in Pending Changes, so a
+        // second ✓ here would be asking the same question twice. Escape cancels.
+        <div className="h-[calc(100%-4px)] w-full min-w-0" onKeyDown={(e) => onKey(e, commitDate)}>
+          <DateTimeField
+            compact
+            autoFocus
+            autoOpen
+            kind={kind}
+            ariaLabel={`Edit ${kind}`}
+            value={text}
+            onChange={(next) => {
+              draft.current = next;
+              setText(next);
+            }}
+            onDone={commitDate}
+          />
         </div>
       );
     case "json":
@@ -114,6 +125,21 @@ export function CellEditor({ typeName, value, onCommit, onCancel }: CellEditorPr
       );
     case "decimal":
     case "text":
+      // A row-height input shows the tail of a user agent string and nothing
+      // else, so anything long or multi-line is edited in a panel that shows all
+      // of it. The threshold is the point where a grid cell stops being a
+      // sensible place to read a value.
+      if (kind === "text" && (text.length > LONG_TEXT || text.includes("\n"))) {
+        return (
+          <TextAreaEditor
+            title={`Edit ${typeName}`}
+            initial={text}
+            onCommit={(next) => onCommit(parseEdited(next, typeName, value))}
+            onNull={() => onCommit({ t: "null" })}
+            onCancel={onCancel}
+          />
+        );
+      }
       return (
         <Input
           autoFocus
@@ -130,6 +156,161 @@ export function CellEditor({ typeName, value, onCommit, onCancel }: CellEditorPr
         />
       );
   }
+}
+
+// WHAT:  Picks a foreign-key value from the referenced table, with each row's
+//        own columns shown next to the id.
+// WHY:   Editing an FK meant opening the other table, copying an id and coming
+//        back; the id alone says nothing about which row it is.
+// HOW:   The search runs against the referenced table on every keystroke the
+//        caller allows, so it works on any engine that can filter a page.
+function LookupPicker({ initial, load, onCommit, onNull, onCancel }: { initial: string; load: (search: string) => Promise<LookupRow[]>; onCommit: (next: string) => void; onNull: () => void; onCancel: () => void }) {
+  // The field is both the search and the value: pick a row, or type a value the
+  // list does not offer (a row created elsewhere, an id not yet inserted) and
+  // press Enter. A foreign key the database has not seen yet is the database's
+  // to reject, not this dialog's.
+  const [search, setSearch] = useState(initial);
+  // One state for the whole request, so a keystroke cannot leave "loading" and
+  // "failed" describing different searches.
+  const [result, setResult] = useState<{ rows: LookupRow[]; failed: boolean } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void load(search)
+      .then((rows) => {
+        if (!cancelled) setResult({ rows, failed: false });
+      })
+      .catch(() => {
+        if (!cancelled) setResult({ rows: [], failed: true });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [search, load]);
+
+  const rows = result?.rows ?? null;
+  const failed = result?.failed ?? false;
+
+  return (
+    <Modal isOpen onOpenChange={(open) => !open && onCancel()}>
+      <Modal.Backdrop>
+        <Modal.Container>
+          <Modal.Dialog className="sm:max-w-[640px]">
+            <Modal.CloseTrigger />
+            <Modal.Header>
+              <Modal.Heading>Choose a referenced row</Modal.Heading>
+            </Modal.Header>
+            <Modal.Body>
+              <SearchField
+                value={search}
+                onChange={setSearch}
+                aria-label="Search or type a referenced value"
+                autoFocus
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && search.trim().length > 0) {
+                    e.preventDefault();
+                    onCommit(search.trim());
+                  }
+                }}
+              >
+                <SearchField.Group className="glass-input h-8 rounded-lg px-2">
+                  <SearchField.SearchIcon />
+                  <SearchField.Input placeholder="Search or type a value…" className="w-full font-mono text-xs" />
+                  <SearchField.ClearButton />
+                </SearchField.Group>
+              </SearchField>
+              <ScrollShadow hideScrollBar className="mt-2 max-h-72">
+                {rows === null ? (
+                  <p className="px-1 py-2 text-xs text-muted">Loading…</p>
+                ) : rows.length === 0 ? (
+                  <p className="px-1 py-2 text-xs text-muted">
+                    {failed ? "Could not read the referenced table — the typed value is still usable." : "No matching rows. Press Enter to use what you typed."}
+                  </p>
+                ) : (
+                  <ul className="flex flex-col gap-0.5">
+                    {rows.map((row) => (
+                      <li key={row.value}>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onPress={() => onCommit(row.value)}
+                          className={cn(
+                            "flex h-auto w-full min-w-0 flex-col items-start gap-0.5 rounded-md px-2 py-1.5 text-left",
+                            row.value === initial ? "glass-pill text-accent" : "text-foreground hover:bg-surface-secondary/60",
+                          )}
+                        >
+                          <span className="truncate font-mono text-[12px]">{row.value}</span>
+                          {row.detail.length > 0 ? <span className="truncate text-[11px] text-muted">{row.detail}</span> : null}
+                        </Button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </ScrollShadow>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button size="sm" variant="tertiary" onPress={onNull}>Set NULL</Button>
+              <Button size="sm" variant="tertiary" onPress={onCancel}>Cancel</Button>
+              <Button size="sm" isDisabled={search.trim().length === 0} onPress={() => onCommit(search.trim())}>
+                Use typed value
+              </Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal>
+  );
+}
+
+/// Length past which a value is edited in a panel rather than in the cell.
+const LONG_TEXT = 80;
+
+// WHAT:  Full-value editor for long or multi-line text: the whole value, wrapped,
+//        resizable, with the length shown.
+// WHY:   Tokens, user agents, URLs and JSON strings are common cell values and
+//        unreadable in a 28px row.
+// WHERE: CellEditor (text branch), src/features/grid/DataGrid.tsx
+function TextAreaEditor({ title, initial, onCommit, onNull, onCancel }: { title: string; initial: string; onCommit: (next: string) => void; onNull: () => void; onCancel: () => void }) {
+  const [text, setText] = useState(initial);
+  return (
+    <Modal isOpen onOpenChange={(open) => !open && onCancel()}>
+      <Modal.Backdrop>
+        <Modal.Container>
+          <Modal.Dialog className="sm:max-w-[720px]">
+            <Modal.CloseTrigger />
+            <Modal.Header>
+              <Modal.Heading>{title}</Modal.Heading>
+            </Modal.Header>
+            <Modal.Body>
+              <TextArea
+                autoFocus
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+                onKeyDown={(e) => {
+                  // Enter is a newline here; Cmd/Ctrl+Enter commits.
+                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                    e.preventDefault();
+                    onCommit(text);
+                  } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    onCancel();
+                  }
+                }}
+                className="selectable h-72 w-full resize-y rounded-lg border border-border/40 bg-background p-2 font-mono text-[12px] whitespace-pre-wrap text-foreground"
+                aria-label={title}
+              />
+              <p className="mt-1 text-[11px] text-muted">{text.length.toLocaleString()} characters · \u2318\u21b5 to save</p>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button size="sm" variant="tertiary" onPress={onNull}>Set NULL</Button>
+              <Button size="sm" variant="tertiary" onPress={onCancel}>Cancel</Button>
+              <Button size="sm" onPress={() => onCommit(text)}>Save</Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal>
+  );
 }
 
 interface FormValueFieldProps {

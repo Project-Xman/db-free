@@ -34,4 +34,4 @@ pub use settings::{AiProvider, AiSettings, AppSettings, ExecutionMode, RunScope}
 pub use transfer::{AiReply, ExportReport, ExportedFile, ImportReport, PlanReport, TransferFormat};
 pub use schema::{ColumnInfo, ForeignKey, SchemaCatalog, SchemaInfo, TableInfo, TableKind, TableRef};
 pub use value::Value;
-pub use update::UpdateStatus;
+pub use update::{UpdateProgress, UpdateStatus};

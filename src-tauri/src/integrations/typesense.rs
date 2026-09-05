@@ -993,7 +993,7 @@ impl TypesenseIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { sql: false, namespaces: false, fixed_columns: true, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: true },
+        capabilities: Capabilities { describes_fields: true, sql: false, namespaces: false, fixed_columns: true, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: true },
         object_kinds: vec![K::Collection, K::Alias, K::Synonym, K::Rule, K::ApiKey, K::Node],
         tools: vec![T::Stats, T::SearchPlayground],
     }

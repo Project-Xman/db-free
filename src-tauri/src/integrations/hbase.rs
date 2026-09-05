@@ -687,7 +687,7 @@ impl HbaseIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { namespaces: true, fixed_columns: true, row_estimate: false, ..Capabilities::KEY_VALUE },
+        capabilities: Capabilities { describes_fields: true, namespaces: true, fixed_columns: true, row_estimate: false, ..Capabilities::KEY_VALUE },
         object_kinds: vec![K::Namespace, K::Table, K::Node],
         tools: vec![T::Stats],
     }

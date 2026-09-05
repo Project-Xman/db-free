@@ -694,7 +694,7 @@ fn stats_groups(db: &DB, path: &str, read_only: bool, cf_names: &[String]) -> Ve
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { namespaces: true, exact_estimate: false, ..Capabilities::KEY_VALUE },
+        capabilities: Capabilities { describes_fields: true, namespaces: true, exact_estimate: false, ..Capabilities::KEY_VALUE },
         object_kinds: vec![K::ColumnFamily, K::Setting],
         tools: vec![T::Stats, T::KeyBrowser],
     }

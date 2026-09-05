@@ -1038,7 +1038,7 @@ impl PrometheusIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { sql: false, namespaces: false, fixed_columns: false, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: true },
+        capabilities: Capabilities { describes_fields: true, sql: false, namespaces: false, fixed_columns: false, paging: true, row_estimate: true, views: false, transactions: false, exact_estimate: true },
         object_kinds: vec![K::Metric, K::Target, K::RecordingRule, K::AlertRule, K::Alert, K::Setting],
         tools: vec![T::Stats, T::MetricsExplorer],
     }

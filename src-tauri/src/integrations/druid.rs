@@ -524,7 +524,7 @@ impl DruidIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { transactions: false, exact_estimate: false, ..Capabilities::SQL },
+        capabilities: Capabilities { describes_fields: true, transactions: false, exact_estimate: false, ..Capabilities::SQL },
         object_kinds: vec![K::Dataset, K::Partition, K::Task, K::Node],
         tools: vec![T::Stats],
     }

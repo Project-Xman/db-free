@@ -877,7 +877,8 @@ impl PineconeIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities {
+        capabilities: Capabilities { describes_fields: false, // every index reports the same id/values/metadata shape
+            
             sql: false,
             namespaces: false,
             fixed_columns: true,

@@ -1172,7 +1172,7 @@ impl TigerGraphIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { namespaces: true, fixed_columns: true, exact_estimate: true, ..Capabilities::DOCUMENT },
+        capabilities: Capabilities { describes_fields: true, namespaces: true, fixed_columns: true, exact_estimate: true, ..Capabilities::DOCUMENT },
         object_kinds: vec![K::Graph, K::Label, K::RelationshipType, K::Procedure, K::User, K::Role],
         tools: vec![T::Stats, T::GraphView],
     }

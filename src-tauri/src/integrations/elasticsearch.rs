@@ -1731,7 +1731,7 @@ impl ElasticsearchIntegration {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { sql: false, namespaces: false, fixed_columns: false, paging: true, row_estimate: true, views: true, transactions: false, exact_estimate: true },
+        capabilities: Capabilities { describes_fields: true, sql: false, namespaces: false, fixed_columns: false, paging: true, row_estimate: true, views: true, transactions: false, exact_estimate: true },
         object_kinds: vec![K::Index, K::Alias, K::Template, K::Pipeline, K::Policy, K::Node, K::Shard, K::Task, K::Snapshot, K::User, K::Role],
         tools: vec![T::Stats, T::SearchPlayground],
     }

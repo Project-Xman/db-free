@@ -1,14 +1,14 @@
 // SOT: tables-panel, sidebar-tables, database-switcher, schema-switcher, table-tree
 import { useState, type MouseEvent as ReactMouseEvent } from "react";
-import { Button, Chip, ScrollShadow, SearchField, Separator, Skeleton, Spinner } from "@heroui/react";
+import { Button, Chip, Modal, ScrollShadow, SearchField, Separator, Skeleton, Spinner } from "@heroui/react";
 import type { ColumnInfo, Engine, TableInfo, TableRef } from "@/lib/bindings";
 import { formatCount } from "@/lib/format";
 import { collectionNoun, engineMeta, isKeyValueEngine, supportsErd } from "@/lib/engines";
 import { Icon, typeIcon } from "@/lib/icons";
-import { normalizeError } from "@/lib/ipc";
+import { ipc, normalizeError } from "@/lib/ipc";
 import { tableKey, useActiveConnection, useWorkspace } from "@/stores/workspace";
 import { IconButton } from "@/components/global/Button";
-import { AppSelect, Segmented } from "@/components/global/Field";
+import { AppSelect, Field, Segmented, Toggle } from "@/components/global/Field";
 import { useContextMenu, type ContextMenu, type MenuEntry } from "@/components/global/ContextMenu";
 import { EnvBadge } from "@/components/global/Badge";
 import { ConnectionSwitcher } from "./ConnectionSwitcher";
@@ -32,6 +32,7 @@ export function TablesPanel() {
   const openErd = useWorkspace((s) => s.openErd);
   const connecting = useWorkspace((s) => s.connecting);
   const menu = useContextMenu();
+  const [creating, setCreating] = useState(false);
   const [mode, setMode] = useState<"az" | "tags">("az");
   const [search, setSearch] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -59,6 +60,7 @@ export function TablesPanel() {
           <IconButton icon="refresh" label="Refresh schema" onPress={() => void loadCatalog(id)} />
           <IconButton icon="plus" label="New query" onPress={() => openQuery(id)} />
           <IconButton icon="view" label="ER diagram" isDisabled={!supportsErd(connection.engine)} onPress={() => openErd(id, schemaFilter)} />
+          <IconButton icon="plus" label={`New ${collectionNoun(connection.engine).replace(/s$/, "").toLowerCase()}`} onPress={() => setCreating(true)} />
           <IconButton icon="search" label="Search tables" active={searchOpen} onPress={() => setSearchOpen((v) => !v)} />
         </span>
       </div>
@@ -146,7 +148,87 @@ export function TablesPanel() {
 
       {info?.serverVersion ? <div className="truncate border-t border-border/40 px-3 py-1.5 text-[10px] font-mono text-muted/70">{info.serverVersion}</div> : null}
       {menu.node}
+      {creating ? <CreateTableModal connectionId={id} schema={schemaFilter ?? schemas[0]?.name ?? null} noun={collectionNoun(connection.engine)} onClose={() => setCreating(false)} /> : null}
     </aside>
+  );
+}
+
+// WHAT:  Collects a name and columns, asks the adapter for the statement that
+//        would create it, and opens that statement in a query tab.
+// WHY:   Creation is where engines differ most, so the statement comes from the
+//        adapter (`Integration::create_template`) rather than being assembled
+//        here. Opening an editor rather than executing means the user reads it
+//        first, and the guard's read-only lock and history still apply when they
+//        run it.
+// WHERE: src-tauri/src/integrations/mod.rs (create_template)
+function CreateTableModal({ connectionId, schema, noun, onClose }: { connectionId: string; schema: string | null; noun: string; onClose: () => void }) {
+  const openQuery = useWorkspace((s) => s.openQuery);
+  const showError = useWorkspace((s) => s.showError);
+  const showInfo = useWorkspace((s) => s.showInfo);
+  const [name, setName] = useState("");
+  const [columns, setColumns] = useState<ColumnInfo[]>([{ name: "id", dataType: "text", nullable: false, primaryKey: true, ordinal: 0 }]);
+  const [busy, setBusy] = useState(false);
+  const singular = noun.replace(/s$/, "").toLowerCase();
+
+  const patch = (index: number, part: Partial<ColumnInfo>) => setColumns((cs) => cs.map((c, i) => (i === index ? { ...c, ...part } : c)));
+
+  const submit = async () => {
+    if (name.trim().length === 0) return;
+    setBusy(true);
+    try {
+      const table = { schema, name: name.trim() };
+      const statement = await ipc("create_template", { connectionId, table, columns });
+      if (statement === null) {
+        showError(`This engine has no create statement for a ${singular}; create it from its own command language.`);
+        return;
+      }
+      openQuery(connectionId, statement, `new ${name.trim()}`);
+      showInfo("Review the statement, then run it.");
+      onClose();
+    } catch (raw) {
+      showError(normalizeError(raw));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal isOpen onOpenChange={(open) => !open && onClose()}>
+      <Modal.Backdrop>
+        <Modal.Container>
+          <Modal.Dialog className="sm:max-w-[640px]">
+            <Modal.CloseTrigger />
+            <Modal.Header>
+              <Modal.Heading>New {singular}</Modal.Heading>
+            </Modal.Header>
+            <Modal.Body className="flex flex-col gap-3">
+              <Field label="Name" value={name} onChange={setName} mono autoFocus placeholder={`my_${singular}`} />
+              <div className="flex flex-col gap-1.5">
+                {columns.map((c, i) => (
+                  <div key={i} className="grid grid-cols-[1fr_1fr_auto_auto_28px] items-end gap-2">
+                    <Field label={i === 0 ? "Column" : ""} value={c.name} onChange={(v) => patch(i, { name: v })} mono compact className={i === 0 ? "" : "[&_label]:hidden"} />
+                    <Field label={i === 0 ? "Type" : ""} value={c.dataType} onChange={(v) => patch(i, { dataType: v })} mono compact className={i === 0 ? "" : "[&_label]:hidden"} />
+                    <Toggle checked={c.primaryKey} onChange={(v) => patch(i, { primaryKey: v, nullable: v ? false : c.nullable })} label="PK" />
+                    <Toggle checked={c.nullable} onChange={(v) => patch(i, { nullable: v })} label="Null" />
+                    <IconButton icon="x" label="Remove column" isDisabled={columns.length === 1} onPress={() => setColumns((cs) => cs.filter((_, j) => j !== i))} />
+                  </div>
+                ))}
+                <Button size="sm" variant="ghost" className="h-6 min-h-6 self-start px-1.5 text-[11px] text-muted" onPress={() => setColumns((cs) => [...cs, { name: `column_${cs.length + 1}`, dataType: "text", nullable: true, primaryKey: false, ordinal: cs.length }])}>
+                  <Icon name="plus" size={12} />
+                  Add column
+                </Button>
+              </div>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button size="sm" variant="tertiary" onPress={onClose}>Cancel</Button>
+              <Button size="sm" isPending={busy} isDisabled={name.trim().length === 0} onPress={() => void submit()}>
+                Open statement
+              </Button>
+            </Modal.Footer>
+          </Modal.Dialog>
+        </Modal.Container>
+      </Modal.Backdrop>
+    </Modal>
   );
 }
 

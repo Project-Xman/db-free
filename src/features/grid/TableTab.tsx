@@ -8,6 +8,7 @@ import { DENSITIES, formatCell, formatCount } from "@/lib/format";
 import { engineMeta } from "@/lib/engines";
 import { tableKey, useWorkspace } from "@/stores/workspace";
 import { DataGrid, type GridColumn, type StagedCell } from "./DataGrid";
+import type { LookupRow } from "@/components/global/ValueEditor";
 import { FILTER_OPS, FilterPopover } from "./FilterPopover";
 import { AppSelect, Check } from "@/components/global/Field";
 import { FormValueField } from "@/components/global/ValueEditor";
@@ -53,6 +54,11 @@ const INSPECTOR_MAX = 650;
 const INSPECTOR_DEFAULT = 384;
 /// Dragging the splitter narrower than this folds the inspector into its rail.
 const INSPECTOR_FOLD_AT = 200;
+
+/// Rows offered when picking a foreign-key value, and how many of the referenced
+/// row's own columns are shown beside the id.
+const LOOKUP_LIMIT = 50;
+const LOOKUP_DETAIL_COLUMNS = 3;
 
 /// Separators for the stored table view state: group, entry, field.
 const GROUP_SEP = "\u0003";
@@ -388,6 +394,32 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
     void applyChanges([{ kind: "insert", id: nextChangeId(), table, values }]);
   };
 
+  // WHAT:  Candidate rows for a foreign-key cell: the referenced table, filtered
+  //        by what the user typed, with each row's other columns as the detail.
+  // WHY:   An id says nothing about which row it is; picking one should not mean
+  //        opening the other table and copying a value back.
+  const lookupFk = useCallback(
+    async (gridColumn: number, search: string): Promise<LookupRow[]> => {
+      const column = columns[pageColumn(gridColumn)];
+      const link = column ? fkByColumn.get(column.name) : undefined;
+      if (!link) return [];
+      const filters: FilterRule[] = search.trim().length > 0 ? [{ column: link.column, op: "contains", value: search.trim() }] : [];
+      const page = await ipc("fetch_table_page", { connectionId, table: link.table, query: { sort: [], filters, offset: 0, limit: LOOKUP_LIMIT } });
+      const keyIndex = page.columns.findIndex((c) => c.name === link.column);
+      if (keyIndex < 0) return [];
+      return page.rows.map((row) => ({
+        value: cellText(row[keyIndex]),
+        detail: page.columns
+          .map((c, i) => ({ c, i }))
+          .filter(({ i }) => i !== keyIndex)
+          .slice(0, LOOKUP_DETAIL_COLUMNS)
+          .map(({ c, i }) => `${c.name}: ${cellText(row[i])}`)
+          .join(" · "),
+      }));
+    },
+    [columns, pageColumn, fkByColumn, connectionId],
+  );
+
   const copyRowsFrom = async (rowIndex: number, format: "json" | "csv" | "sql") => {
     if (!page) return;
     const chosen = selectedRows.size > 0 ? rows.filter((_, i) => selectedRows.has(i)) : [rows[rowIndex]].filter((r): r is Value[] => r !== undefined);
@@ -535,6 +567,7 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
               alternatingRows={settings?.alternatingRows ?? true}
               onInspect={(row, col) => { setCell({ row, col: pageColumn(col) }); setInspectorCollapsed(false); }}
               onCopyRows={(row, format) => void copyRowsFrom(row, format)}
+              onLookup={lookupFk}
               {...(editable ? { onInsertRow: () => setInsertOpen(true), onDuplicateRow: duplicateRow, onDeleteRow: deleteRow } : {})}
             />
           )}

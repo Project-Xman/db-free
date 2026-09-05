@@ -698,7 +698,8 @@ pub fn account_flag(xml: &str, element: &str) -> Option<bool> {
 pub fn profile() -> crate::integrations::FamilyProfile {
     use crate::model::{ObjectKind as K, Tool as T};
     crate::integrations::FamilyProfile {
-        capabilities: Capabilities { sql: false, namespaces: true, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: false, exact_estimate: true },
+        capabilities: Capabilities { describes_fields: false, // every collection reports the same resource listing
+             sql: false, namespaces: true, fixed_columns: true, paging: true, row_estimate: true, views: true, transactions: false, exact_estimate: true },
         object_kinds: vec![K::Collection, K::Document, K::Index, K::User],
         tools: vec![T::Stats, T::XmlViewer],
     }
