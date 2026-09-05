@@ -137,7 +137,9 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "DB Free ${{ github.ref_name }}"
-          releaseDraft: true
+          # Published straight away: the first matrix job to finish creates the
+          # release, the rest attach their installers to it as they land.
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
 
