@@ -1,5 +1,5 @@
 // SOT: data-grid, virtualized-grid, grid-cell-rendering, column-sort-header, column-resize, row-selection, inline-cell-edit, foreign-key-link, change-highlighting
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button, ScrollShadow } from "@heroui/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { SortRule, Value } from "@/lib/bindings";
@@ -99,13 +99,15 @@ export function DataGrid({
     rangeRef.current = onRangeChange;
   });
   const [editing, setEditing] = useState<{ row: number; col: number } | null>(null);
-  // User-dragged widths by column name; unset = estimateWidth().
-  const [widthOverrides, setWidthOverrides] = useState<Readonly<Record<string, number>>>({});
+  // Dragged widths by column name, in a ref rather than state: a drag must not
+  // wait for a state round-trip (setState -> memo -> measure()) to be visible,
+  // and at one event per pixel that round-trip is what made the handle look
+  // dead. The virtualizer owns the rendered width via resizeItem(); this map is
+  // only what a re-measure (new page, reset) reads back.
+  const widthsRef = useRef<Record<string, number>>({});
   // Unclamped width of the column being dragged, so dragging past the minimum
   // and back does not leave the handle lagging behind the pointer.
   const dragWidth = useRef<number | null>(null);
-
-  const widths = useMemo(() => columns.map((c) => widthOverrides[c.name] ?? estimateWidth(c)), [columns, widthOverrides]);
 
   const rowVirtualizer = useVirtualizer({
     count: rowCount,
@@ -122,28 +124,37 @@ export function DataGrid({
     horizontal: true,
     count: columns.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: (index) => widths[index] ?? 160,
+    estimateSize: (index) => {
+      const column = columns[index];
+      return column ? (widthsRef.current[column.name] ?? estimateWidth(column)) : 160;
+    },
     overscan: 4,
   });
 
   useEffect(() => {
     rowVirtualizer.measure();
   }, [rowHeight, rowVirtualizer]);
+  // A new page or a different table re-reads the widths map, so a column keeps
+  // the width it was dragged to and a new column starts from its estimate.
   useEffect(() => {
     colVirtualizer.measure();
-  }, [widths, colVirtualizer]);
+  }, [columns, colVirtualizer]);
 
-  const resizeColumn = (column: GridColumn, current: number, delta: number) => {
+  const resizeColumn = (column: GridColumn, index: number, current: number, delta: number) => {
     const raw = (dragWidth.current ?? current) + delta;
     dragWidth.current = raw;
     const next = Math.min(MAX_COL_WIDTH, Math.max(MIN_COL_WIDTH, raw));
-    setWidthOverrides((prev) => (prev[column.name] === next ? prev : { ...prev, [column.name]: next }));
+    if (widthsRef.current[column.name] === next) return;
+    widthsRef.current[column.name] = next;
+    // Writes the measurement and notifies: the header and every cell of that
+    // column reposition on this frame.
+    colVirtualizer.resizeItem(index, next);
   };
-  const resetColumn = (column: GridColumn) =>
-    setWidthOverrides((prev) => {
-      if (!(column.name in prev)) return prev;
-      return Object.fromEntries(Object.entries(prev).filter(([name]) => name !== column.name));
-    });
+  const resetColumn = (column: GridColumn, index: number) => {
+    if (!(column.name in widthsRef.current)) return;
+    widthsRef.current = Object.fromEntries(Object.entries(widthsRef.current).filter(([name]) => name !== column.name));
+    colVirtualizer.resizeItem(index, estimateWidth(column));
+  };
 
   const totalWidth = colVirtualizer.getTotalSize();
   const totalHeight = rowVirtualizer.getTotalSize();
@@ -193,11 +204,11 @@ export function DataGrid({
                   className="absolute top-0 z-30 h-full cursor-col-resize"
                   style={{ left: vc.end - HANDLE_WIDTH / 2, width: HANDLE_WIDTH }}
                   title="Drag to resize · double-click to reset"
-                  onDoubleClick={() => resetColumn(column)}
+                  onDoubleClick={() => resetColumn(column, vc.index)}
                 >
                   <Resizer
                     direction="horizontal"
-                    onResize={(delta) => resizeColumn(column, vc.size, delta)}
+                    onResize={(delta) => resizeColumn(column, vc.index, vc.size, delta)}
                     onDragEnd={() => {
                       dragWidth.current = null;
                     }}
