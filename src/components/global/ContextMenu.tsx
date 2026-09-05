@@ -58,7 +58,12 @@ export function useContextMenu(): ContextMenu {
           if (!next) setState(null);
         }}
       >
-        <Button aria-label="Context menu" excludeFromTabOrder className="pointer-events-none fixed size-px min-w-0 border-0 bg-transparent p-0 opacity-0" style={{ left: state.x, top: state.y }} />
+        {/* The anchor is positioned by a plain div: HeroUI's Button carries its
+            own position utility, which would win over a `fixed` class here and
+            leave the popover anchored wherever the button landed in flow. */}
+        <div className="pointer-events-none fixed z-50 size-px" style={{ left: state.x, top: state.y }}>
+          <Button aria-label="Context menu" excludeFromTabOrder className="size-px min-w-0 border-0 bg-transparent p-0 opacity-0" />
+        </div>
         <Dropdown.Popover placement="bottom start" className="min-w-52 glass-modal rounded-xl">
           <Dropdown.Menu
             onAction={(key) => {
