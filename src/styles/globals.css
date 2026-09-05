@@ -14,13 +14,14 @@
  WHERE: scripts/guardrail.py bans raw palette classes (bg-zinc-900, #hex) in JSX.
 */
 @theme static {
-  --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  /* The whole UI is JetBrains Mono; Inter stays loaded as the fallback face. */
+  --font-sans: "JetBrains Mono Variable", "Inter Variable", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --font-mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
   --color-env-local: oklch(0.72 0.19 150);
   --color-env-staging: oklch(0.78 0.16 72);
   --color-env-production: oklch(0.64 0.22 26);
-  --color-selection: oklch(0.62 0.19 255 / 0.35);
+  --color-selection: oklch(0.62 0.19 var(--accent-hue) / 0.35);
   --color-series-1: #3987e5;
   --color-series-2: #d95926;
   --color-series-3: #199e70;
@@ -43,27 +44,32 @@
     color-scheme: dark;
     --radius: 0.625rem;
     --field-radius: 0.5rem;
-    --background: oklch(0.12 0.006 255 / 0.85);
+    --background: oklch(0.12 0.006 var(--accent-hue) / 0.85);
     --foreground: oklch(0.94 0 0);
-    --surface: oklch(0.15 0.008 255 / 0.7);
+    --surface: oklch(0.15 0.008 var(--accent-hue) / 0.7);
     --surface-foreground: var(--foreground);
-    --surface-secondary: oklch(0.185 0.01 255 / 0.55);
+    --surface-secondary: oklch(0.185 0.01 var(--accent-hue) / 0.55);
     --surface-secondary-foreground: var(--foreground);
-    --surface-tertiary: oklch(0.23 0.012 255 / 0.6);
+    --surface-tertiary: oklch(0.23 0.012 var(--accent-hue) / 0.6);
     --surface-tertiary-foreground: var(--foreground);
-    --overlay: oklch(0.16 0.008 255 / 0.88);
+    --overlay: oklch(0.16 0.008 var(--accent-hue) / 0.88);
     --overlay-foreground: var(--foreground);
     --muted: oklch(0.65 0 0);
-    --default: oklch(0.22 0.008 255 / 0.6);
+    --default: oklch(0.22 0.008 var(--accent-hue) / 0.6);
     --default-foreground: var(--foreground);
-    --accent: oklch(0.6 0.2 258);
+    /* Hue of the selected accent, in oklch degrees. App.tsx rewrites it when the
+       accent setting changes; every tinted surface, the window gradient and the
+       glass panels read it, so the chrome follows the accent instead of staying
+       blue. */
+    --accent-hue: 258;
+    --accent: oklch(0.6 0.2 var(--accent-hue));
     --accent-foreground: oklch(0.99 0 0);
-    --field-background: oklch(0.15 0.008 255 / 0.45);
+    --field-background: oklch(0.15 0.008 var(--accent-hue) / 0.45);
     --field-foreground: var(--foreground);
     --field-placeholder: oklch(0.5 0 0);
     --field-border: oklch(1 0 0 / 0.1);
     --field-border-width: 1px;
-    --segment: oklch(0.22 0.01 255 / 0.45);
+    --segment: oklch(0.22 0.01 var(--accent-hue) / 0.45);
     --segment-foreground: var(--foreground);
     --border: oklch(1 0 0 / 0.08);
     --separator: oklch(1 0 0 / 0.06);
@@ -89,10 +95,10 @@
     margin: 0;
   }
   body {
-    background-color: oklch(0.08 0.008 260);
+    background-color: oklch(0.08 0.008 var(--accent-hue));
     background-image:
-      radial-gradient(ellipse 110% 65% at 50% -8%, oklch(0.36 0.05 255 / 0.45), transparent 75%),
-      linear-gradient(175deg, oklch(0.24 0.025 258) 0%, oklch(0.14 0.015 260) 45%, oklch(0.075 0.006 260) 100%);
+      radial-gradient(ellipse 110% 65% at 50% -8%, oklch(0.36 0.05 var(--accent-hue) / 0.45), transparent 75%),
+      linear-gradient(175deg, oklch(0.24 0.025 var(--accent-hue)) 0%, oklch(0.14 0.015 var(--accent-hue)) 45%, oklch(0.075 0.006 var(--accent-hue)) 100%);
     background-attachment: fixed;
     color: var(--foreground);
     font-family: var(--font-sans);
@@ -113,9 +119,9 @@
 @utility grid-bg {
   background-color: transparent;
   background-image:
-    radial-gradient(ellipse 120% 70% at 50% -10%, oklch(0.35 0.05 255 / 0.5), transparent 75%),
+    radial-gradient(ellipse 120% 70% at 50% -10%, oklch(0.35 0.05 var(--accent-hue) / 0.5), transparent 75%),
     radial-gradient(circle at 100% 100%, oklch(0.18 0.03 285 / 0.25), transparent 50%),
-    linear-gradient(175deg, oklch(0.23 0.025 258) 0%, oklch(0.13 0.012 260) 45%, oklch(0.075 0.005 260) 100%),
+    linear-gradient(175deg, oklch(0.23 0.025 var(--accent-hue)) 0%, oklch(0.13 0.012 var(--accent-hue)) 45%, oklch(0.075 0.005 var(--accent-hue)) 100%),
     linear-gradient(var(--color-grid-line) 1px, transparent 1px),
     linear-gradient(90deg, var(--color-grid-line) 1px, transparent 1px);
   background-size: 100% 100%, 100% 100%, 100% 100%, 36px 36px, 36px 36px;
@@ -127,7 +133,7 @@
 }
 
 @utility glass-dock {
-  background: oklch(0.12 0.008 255 / 0.75);
+  background: oklch(0.12 0.008 var(--accent-hue) / 0.75);
   backdrop-filter: blur(28px) saturate(190%);
   -webkit-backdrop-filter: blur(28px) saturate(190%);
   border-right: 1px solid oklch(1 0 0 / 0.08);
@@ -135,14 +141,14 @@
 }
 
 @utility glass-sidebar {
-  background: oklch(0.135 0.008 255 / 0.65);
+  background: oklch(0.135 0.008 var(--accent-hue) / 0.65);
   backdrop-filter: blur(24px) saturate(180%);
   -webkit-backdrop-filter: blur(24px) saturate(180%);
   border-right: 1px solid oklch(1 0 0 / 0.08);
 }
 
 @utility glass-header {
-  background: oklch(0.13 0.008 255 / 0.72);
+  background: oklch(0.13 0.008 var(--accent-hue) / 0.72);
   backdrop-filter: blur(24px) saturate(180%);
   -webkit-backdrop-filter: blur(24px) saturate(180%);
   border-bottom: 1px solid oklch(1 0 0 / 0.08);
@@ -150,7 +156,7 @@
 }
 
 @utility glass-card {
-  background: oklch(0.155 0.008 255 / 0.55);
+  background: oklch(0.155 0.008 var(--accent-hue) / 0.55);
   backdrop-filter: blur(20px) saturate(180%);
   -webkit-backdrop-filter: blur(20px) saturate(180%);
   border: 1px solid oklch(1 0 0 / 0.09);
@@ -161,7 +167,7 @@
   transition: all 180ms cubic-bezier(0.16, 1, 0.3, 1);
 
   &:hover {
-    background: oklch(0.175 0.01 255 / 0.65);
+    background: oklch(0.175 0.01 var(--accent-hue) / 0.65);
     border-color: oklch(1 0 0 / 0.16);
     box-shadow: inset 0 1px 0 0 oklch(1 0 0 / 0.15), 0 12px 36px -6px rgba(0, 0, 0, 0.55);
     transform: translateY(-1px);
@@ -169,7 +175,7 @@
 }
 
 @utility glass-pill {
-  background: oklch(0.2 0.01 255 / 0.45);
+  background: oklch(0.2 0.01 var(--accent-hue) / 0.45);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   border: 1px solid oklch(1 0 0 / 0.08);
@@ -177,7 +183,7 @@
 }
 
 @utility glass-input {
-  background: oklch(0.14 0.008 255 / 0.5);
+  background: oklch(0.14 0.008 var(--accent-hue) / 0.5);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   border: 1px solid oklch(1 0 0 / 0.1);
@@ -185,7 +191,7 @@
 }
 
 @utility glass-modal {
-  background: oklch(0.145 0.008 255 / 0.85);
+  background: oklch(0.145 0.008 var(--accent-hue) / 0.85);
   backdrop-filter: blur(32px) saturate(200%);
   -webkit-backdrop-filter: blur(32px) saturate(200%);
   border: 1px solid oklch(1 0 0 / 0.12);
