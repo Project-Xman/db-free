@@ -15,11 +15,11 @@ const SIDEBARS: readonly { mode: SidebarMode; icon: IconName; label: string }[] 
   { mode: "diagrams", icon: "view", label: "Schema diagrams" },
 ];
 
-// On macOS the rail is as wide as the traffic-light cluster: tauri.conf.json
-// insets the close button by the system-standard 20px, the three 12px buttons
-// sit 20px apart (right edge 72px), and an 8px margin on the right gives 80px.
-// The 44px drag strip below matches the header height, so y=16 centres the
-// 12px buttons in it.
+// On macOS the traffic lights sit inside this rail, so the two share a centre
+// line: the cluster is 52px wide (three 12px buttons 20px apart), and
+// tauri.conf.json insets it by 14px — (80 - 52) / 2 — so it is centred on the
+// 80px rail exactly like the icon column below it. y=16 centres the 12px
+// buttons in the 44px drag strip, which matches the header height.
 const RAIL_WIDTH_MAC = "w-[80px]";
 
 // WHAT:  Left rail: connections home, one entry per sidebar, history/transfer
