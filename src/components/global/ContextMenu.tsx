@@ -1,5 +1,6 @@
 // SOT: context-menu, right-click-menu, menu-at-pointer
 import { useCallback, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { Button, Dropdown, Label } from "@heroui/react";
 import { Icon, type IconName } from "@/lib/icons";
 import { cn } from "@/lib/cn";
@@ -50,8 +51,14 @@ export function useContextMenu(): ContextMenu {
     setState({ x: event.clientX, y: event.clientY, entries, onAction });
   }, []);
 
+  // Portalled to <body>: a `position: fixed` anchor is positioned against the
+  // nearest ancestor that has a mask, filter or transform — and the scroll
+  // shadows the grid and tab bar use are mask-image, which made the menu open
+  // an entire container away from the pointer.
   const node =
-    state === null ? null : (
+    state === null
+      ? null
+      : createPortal(
       <Dropdown
         isOpen
         onOpenChange={(next) => {
@@ -83,7 +90,8 @@ export function useContextMenu(): ContextMenu {
             ))}
           </Dropdown.Menu>
         </Dropdown.Popover>
-      </Dropdown>
+      </Dropdown>,
+      document.body,
     );
 
   return { open, node };

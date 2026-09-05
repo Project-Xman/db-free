@@ -56,6 +56,18 @@ export function App() {
     void bootstrap();
   }, [bootstrap]);
 
+  // WHAT:  Suppress the webview's own right-click menu (Cut/Copy/Paste, Speech,
+  //        Inspect Element) app-wide.
+  // WHY:   It is a browser menu in a desktop app: it offers nothing the app can
+  //        honour and hides the app's own context menus behind a second click.
+  // HOW:   Capture phase, preventDefault only — propagation continues, so the
+  //        React handlers that open the app's menus still run.
+  useEffect(() => {
+    const suppress = (event: MouseEvent) => event.preventDefault();
+    document.addEventListener("contextmenu", suppress, { capture: true });
+    return () => document.removeEventListener("contextmenu", suppress, { capture: true });
+  }, []);
+
   // WHAT:  Settings that are pure CSS (accent, font sizes) apply as root variables.
   useEffect(() => {
     if (!settings) return;
