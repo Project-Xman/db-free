@@ -24,6 +24,11 @@ export interface ResizerProps {
 //        the drag being torn down and the body cursor reset mid-drag.
 export function Resizer({ direction = "horizontal", onResize, onDragEnd, className }: ResizerProps) {
   const [dragging, setDragging] = useState(false);
+  // Gate the move handler on a ref, not on `dragging`: the state set in
+  // pointerdown has not necessarily been committed when the browser delivers
+  // the first pointermove of the same gesture, and a dropped first move is the
+  // difference between a drag that tracks the pointer and one that never starts.
+  const active = useRef(false);
   const startPos = useRef(0);
   const resizeRef = useRef(onResize);
   const endRef = useRef(onDragEnd);
@@ -48,6 +53,7 @@ export function Resizer({ direction = "horizontal", onResize, onDragEnd, classNa
       e.stopPropagation();
       e.currentTarget.setPointerCapture(e.pointerId);
       startPos.current = direction === "horizontal" ? e.clientX : e.clientY;
+      active.current = true;
       setDragging(true);
       document.body.style.cursor = direction === "horizontal" ? "col-resize" : "row-resize";
       document.body.style.userSelect = "none";
@@ -57,26 +63,27 @@ export function Resizer({ direction = "horizontal", onResize, onDragEnd, classNa
 
   const move = useCallback(
     (e: ReactPointerEvent<HTMLDivElement>) => {
-      if (!dragging) return;
+      if (!active.current) return;
       const pos = direction === "horizontal" ? e.clientX : e.clientY;
       const delta = pos - startPos.current;
       if (delta === 0) return;
       startPos.current = pos;
       resizeRef.current(delta);
     },
-    [dragging, direction],
+    [direction],
   );
 
   const end = useCallback(
     (e: ReactPointerEvent<HTMLDivElement>) => {
-      if (!dragging) return;
+      if (!active.current) return;
+      active.current = false;
       if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
       setDragging(false);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
       endRef.current?.();
     },
-    [dragging],
+    [],
   );
 
   return (
@@ -88,20 +95,27 @@ export function Resizer({ direction = "horizontal", onResize, onDragEnd, classNa
       onPointerMove={move}
       onPointerUp={end}
       onPointerCancel={end}
+      // No position utility here: cn() concatenates rather than merging, so a
+      // `relative` in this base would beat a caller's `absolute` (Tailwind emits
+      // .relative after .absolute) and leave the handle in flow with no height —
+      // a separator nothing can grab. Callers position it; the line inside gets
+      // its own positioned box.
       className={cn(
-        "group relative shrink-0 touch-none select-none transition-colors z-20",
+        "group shrink-0 touch-none select-none transition-colors z-20",
         direction === "horizontal" ? "w-1.5 cursor-col-resize" : "h-1.5 cursor-row-resize",
         dragging ? "bg-accent/40" : "hover:bg-accent/25",
         className,
       )}
     >
-      <div
-        className={cn(
-          "pointer-events-none absolute bg-border/60 transition-colors group-hover:bg-accent",
-          dragging && "bg-accent",
-          direction === "horizontal" ? "top-0 bottom-0 left-[2px] w-[1px]" : "left-0 right-0 top-[2px] h-[1px]",
-        )}
-      />
+      <div className="relative h-full w-full">
+        <div
+          className={cn(
+            "pointer-events-none absolute bg-border/60 transition-colors group-hover:bg-accent",
+            dragging && "bg-accent",
+            direction === "horizontal" ? "top-0 bottom-0 left-[2px] w-[1px]" : "left-0 right-0 top-[2px] h-[1px]",
+          )}
+        />
+      </div>
     </div>
   );
 }

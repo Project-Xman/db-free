@@ -1,5 +1,5 @@
 // SOT: data-grid, virtualized-grid, grid-cell-rendering, column-sort-header, column-resize, row-selection, inline-cell-edit, foreign-key-link, change-highlighting
-import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { useEffect, useReducer, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { Button, ScrollShadow } from "@heroui/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { FilterRule, SortRule, Value } from "@/lib/bindings";
@@ -119,6 +119,10 @@ export function DataGrid({
   // dead. The virtualizer owns the rendered width via resizeItem(); this map is
   // only what a re-measure (new page, reset) reads back.
   const widthsRef = useRef<Record<string, number>>({});
+  // resizeItem() notifies the virtualizer, which re-renders through its own
+  // subscription; this tick is the belt to that braces, so a width change can
+  // never be swallowed by a batched update mid-drag.
+  const [, bumpWidths] = useReducer((n: number) => n + 1, 0);
   // Unclamped width of the column being dragged, so dragging past the minimum
   // and back does not leave the handle lagging behind the pointer.
   const dragWidth = useRef<number | null>(null);
@@ -163,11 +167,13 @@ export function DataGrid({
     // Writes the measurement and notifies: the header and every cell of that
     // column reposition on this frame.
     colVirtualizer.resizeItem(index, next);
+    bumpWidths();
   };
   const resetColumn = (column: GridColumn, index: number) => {
     if (!(column.name in widthsRef.current)) return;
     widthsRef.current = Object.fromEntries(Object.entries(widthsRef.current).filter(([name]) => name !== column.name));
     colVirtualizer.resizeItem(index, estimateWidth(column));
+    bumpWidths();
   };
 
   const menu = useContextMenu();
@@ -318,7 +324,7 @@ export function DataGrid({
                     onDragEnd={() => {
                       dragWidth.current = null;
                     }}
-                    className="absolute inset-0 w-full rounded-none"
+                    className="absolute inset-0 h-full w-full rounded-none"
                   />
                 </div>
               );
