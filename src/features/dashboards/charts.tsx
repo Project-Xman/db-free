@@ -1,5 +1,6 @@
 // SOT: dashboard-charts, chart-data-extraction, line-chart, area-chart, bar-chart, pie-chart, sankey, map-chart, progress-meter, stat-tile, text-widget, image-widget, widget-conditions, chart-tooltip, chart-legend
 import { useMemo, useState } from "react";
+import { ScrollShadow } from "@heroui/react";
 import type { QueryOutcome, StatementResult, Value, Widget, WidgetCondition } from "@/lib/bindings";
 import { formatCell, formatCount } from "@/lib/format";
 import { cn } from "@/lib/cn";
@@ -562,7 +563,11 @@ export function ProgressMeter({ outcome, widget, tint }: { outcome: QueryOutcome
 export function TextWidget({ widget, outcome }: { widget: Widget; outcome: QueryOutcome | null }) {
   const text = matchedContent(widget, outcome, widget.text ?? "");
   if (text.trim().length === 0) return <Empty hint="Add content in the options. Use {{column}} to insert query values." />;
-  return <div className="selectable h-full overflow-auto p-3 text-sm whitespace-pre-wrap text-foreground">{text}</div>;
+  return (
+    <ScrollShadow className="h-full p-3">
+      <div className="selectable text-sm whitespace-pre-wrap text-foreground">{text}</div>
+    </ScrollShadow>
+  );
 }
 
 export function ImageWidget({ widget, outcome, gif }: { widget: Widget; outcome: QueryOutcome | null; gif: boolean }) {

@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Background, Controls, MiniMap, ReactFlow, addEdge, type Connection, type Edge, type Node, useEdgesState, useNodesState, MarkerType } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Button, Input, Modal } from "@heroui/react";
+import { Button, Input, Modal, ScrollShadow } from "@heroui/react";
 import type { DiagramBody, DiagramColumn, DiagramTable, Document } from "@/lib/bindings";
 import { normalizeError } from "@/lib/ipc";
 import { useWorkspace } from "@/stores/workspace";
@@ -160,7 +160,9 @@ export function DesignerTab({ document: doc }: { document: Document }) {
                 <Modal.Heading>Generated DDL</Modal.Heading>
               </Modal.Header>
               <Modal.Body>
-                <pre className="selectable max-h-[60vh] overflow-auto rounded-md bg-background p-3 font-mono text-[11px] whitespace-pre text-foreground">{ddl}</pre>
+                <ScrollShadow className="max-h-[60vh] overflow-x-auto rounded-md bg-background p-3">
+                  <pre className="selectable font-mono text-[11px] whitespace-pre text-foreground">{ddl}</pre>
+                </ScrollShadow>
               </Modal.Body>
               <Modal.Footer>
                 <Button variant="secondary" onPress={() => { void navigator.clipboard.writeText(ddl); showInfo("DDL copied."); }}>Copy</Button>
@@ -187,7 +189,8 @@ function TableEditor({ table, onClose, onSave }: { table: DiagramTable | null; o
             <Modal.Header>
               <Modal.Heading>Edit table</Modal.Heading>
             </Modal.Header>
-            <Modal.Body className="flex max-h-[60vh] flex-col gap-3 overflow-y-auto">
+            <Modal.Body className="max-h-[60vh] p-0">
+              <ScrollShadow className="flex max-h-[60vh] flex-col gap-3 px-4 py-3">
               <Field label="Table name" value={draft.name} onChange={(name) => setDraft({ ...draft, name })} mono autoFocus />
               <div className="flex flex-col gap-2">
                 {draft.columns.map((c, i) => (
@@ -204,6 +207,7 @@ function TableEditor({ table, onClose, onSave }: { table: DiagramTable | null; o
                   Add column
                 </Button>
               </div>
+              </ScrollShadow>
             </Modal.Body>
             <Modal.Footer>
               <Button variant="tertiary" onPress={onClose}>Cancel</Button>

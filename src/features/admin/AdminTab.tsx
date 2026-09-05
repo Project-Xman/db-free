@@ -50,9 +50,9 @@ export function AdminTab({ connectionId }: { connectionId: string }) {
         {info?.serverVersion ? <span className="truncate font-mono text-[10px] text-muted">{info.serverVersion}</span> : null}
       </div>
       {views.length > 1 ? (
-        <div className="shrink-0 overflow-x-auto px-3 py-2 [scrollbar-width:none]">
+        <ScrollShadow orientation="horizontal" hideScrollBar className="shrink-0 px-3 py-2">
           <Segmented label="Admin view" value={current} onChange={setView} options={views} />
-        </div>
+        </ScrollShadow>
       ) : null}
       <div className="min-h-0 flex-1">
         {views.length === 0 ? (

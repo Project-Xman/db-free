@@ -300,7 +300,7 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex h-11 shrink-0 items-center gap-1.5 overflow-x-auto border-b border-border/40 glass-header px-3 [scrollbar-width:none]">
+      <ScrollShadow orientation="horizontal" hideScrollBar className="flex h-11 shrink-0 items-center gap-1.5 border-b border-border/40 glass-header px-3">
         <Tooltip delay={300}>
           <Button size="sm" isDisabled={!editable || columns.length === 0} onPress={() => setInsertOpen(true)} className="glass-pill text-foreground liquid-hover">
             <Icon name="plus" size={13} className="text-accent" />
@@ -357,7 +357,7 @@ export function TableTab({ connectionId, table, initialFilters }: { connectionId
           <AppSelect ariaLabel="Rows per page" value={pageSize} options={PAGE_SIZES} size="sm" className="w-24 shrink-0" onChange={(v) => { setPageIndex(0); setPageSize(v); }} />
           <span className="min-w-16 text-right tabular-nums font-mono text-[11px] text-muted">{total !== null ? `${page?.totalExact ? "" : "≈ "}${formatCount(total)} rows` : `${formatCount(rows.length)} rows`}</span>
         </div>
-      </div>
+      </ScrollShadow>
 
       <div className="flex min-h-0 flex-1">
         <div className="min-w-0 flex-1">
@@ -437,12 +437,14 @@ function InsertRowModal({ open, onClose, columns, onSubmit }: { open: boolean; o
             <Modal.Header>
               <Modal.Heading>Insert row</Modal.Heading>
             </Modal.Header>
-            <Modal.Body className="max-h-[60vh] overflow-y-auto">
-              <div className="grid grid-cols-2 gap-3">
-                {columns.map((c) => (
-                  <FormValueField key={c.name} column={c} value={values[c.name]} onChange={(v) => setValues((s) => ({ ...s, [c.name]: v }))} />
-                ))}
-              </div>
+            <Modal.Body className="max-h-[60vh] p-0">
+              <ScrollShadow className="max-h-[60vh] px-4 py-3">
+                <div className="grid grid-cols-2 gap-3">
+                  {columns.map((c) => (
+                    <FormValueField key={c.name} column={c} value={values[c.name]} onChange={(v) => setValues((s) => ({ ...s, [c.name]: v }))} />
+                  ))}
+                </div>
+              </ScrollShadow>
             </Modal.Body>
             <Modal.Footer>
               <Button variant="tertiary" onPress={onClose}>Cancel</Button>

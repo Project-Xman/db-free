@@ -1,6 +1,6 @@
 // SOT: tool-shell, playground-header, playground-layout, collection-options
 import { useMemo, type ReactNode } from "react";
-import { Chip } from "@heroui/react";
+import { Chip, ScrollShadow } from "@heroui/react";
 import type { Tool } from "@/lib/bindings";
 import { toolMeta } from "@/lib/objects";
 import { Icon } from "@/lib/icons";
@@ -41,7 +41,9 @@ export function useCollectionOptions(connectionId: string): { value: string; lab
 export function ToolBody({ form, children }: { form: ReactNode; children: ReactNode }) {
   return (
     <div className="flex h-full min-h-0">
-      <aside className="flex w-80 shrink-0 flex-col gap-3 overflow-y-auto border-r border-border/40 p-3">{form}</aside>
+      <aside className="flex w-80 shrink-0 border-r border-border/40">
+        <ScrollShadow hideScrollBar className="flex min-w-0 flex-1 flex-col gap-3 p-3">{form}</ScrollShadow>
+      </aside>
       <div className="min-h-0 min-w-0 flex-1">{children}</div>
     </div>
   );

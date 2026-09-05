@@ -379,9 +379,9 @@ export function ChatTab({ connectionId }: { connectionId: string }) {
                             </div>
                           </div>
 
-                          <pre className="selectable max-h-48 overflow-auto font-mono text-[11px] text-foreground whitespace-pre-wrap">
-                            {m.sql}
-                          </pre>
+                          <ScrollShadow className="max-h-48">
+                            <pre className="selectable font-mono text-[11px] text-foreground whitespace-pre-wrap">{m.sql}</pre>
+                          </ScrollShadow>
 
                           {/* Error feedback with auto-fix button */}
                           {m.runError ? (
@@ -642,7 +642,7 @@ function StatementPreview({ stmt }: { stmt: StatementResult }) {
 
   return (
     <div className="flex flex-col gap-1">
-      <div className="max-h-44 overflow-auto rounded border border-border/30 [scrollbar-width:thin]">
+      <ScrollShadow hideScrollBar className="max-h-44 overflow-x-auto rounded border border-border/30">
         <table className="w-full border-collapse font-mono text-[10.5px]">
           <thead className="sticky top-0 bg-surface-secondary/90 backdrop-blur-sm">
             <tr>
@@ -674,7 +674,7 @@ function StatementPreview({ stmt }: { stmt: StatementResult }) {
             ))}
           </tbody>
         </table>
-      </div>
+      </ScrollShadow>
       <div className="flex items-center justify-between text-[10px] text-muted px-0.5">
         <span>{formatCount(rows.length)} rows shown</span>
         {truncated ? <span>(Results capped at preview limit)</span> : null}
